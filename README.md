@@ -8,12 +8,15 @@ DiariZen is a speaker diarization toolkit driven by [AudioZen](https://github.co
 conda create --name diarizen python=3.10
 conda activate diarizen
 
+# install pytorch (CUDA 12.1 build)
+pip install torch==2.1.1 torchvision==0.16.1 torchaudio==2.1.1 \
+    --index-url https://download.pytorch.org/whl/cu121
+
 # install diarizen 
-conda install pytorch==2.1.1 torchvision==0.16.1 torchaudio==2.1.1 pytorch-cuda=12.1 "mkl<2024.1" -c pytorch -c nvidia -c defaults
 pip install -r requirements.txt && pip install -e .
 
 # install pyannote-audio
-cd pyannote-audio && pip install -e .[dev,testing]
+cd pyannote-audio && pip install -e .[dev,testing] -c ../constraints.txt && cd ..
 
 # install dscore
 git submodule init
