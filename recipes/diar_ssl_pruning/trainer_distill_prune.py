@@ -6,6 +6,7 @@ import torch
 from accelerate.logging import get_logger
 
 from diarizen.trainer_distill_prune import Trainer as BaseTrainer
+from diarizen.trainer_utils import AutoClipGradHistory, raise_for_non_finite_loss
 
 
 logger = get_logger(__name__)
@@ -17,7 +18,8 @@ class Trainer(BaseTrainer):
         self.accelerator.print(self.model)
 
         # auto GN
-        self.grad_history = []
+        self.grad_history = AutoClipGradHistory(self.gradient_history_size)
+        self.accelerator.register_for_checkpointing(self.grad_history)
 
         self.lambda1, self.lambda2 = self.get_lambda()
         self.original_num_params = sum(p.numel() for p in self.unwrap_model.teacher_model.parameters())
@@ -35,8 +37,6 @@ class Trainer(BaseTrainer):
     def auto_clip_grad_norm_(self, model):
         grad_norm = self.compute_grad_norm(model)
         self.grad_history.append(grad_norm)
-        if len(self.grad_history) > self.gradient_history_size:
-            self.grad_history.pop(0)
         clip_value = np.percentile(self.grad_history, self.gradient_percentile)
         self.accelerator.clip_grad_norm_(model.parameters(), clip_value)
 
@@ -73,10 +73,7 @@ class Trainer(BaseTrainer):
             loss_reg = torch.Tensor([0.0]).to(loss_distill.device)
 
         loss = loss_distill + loss_reg
-
-        # skip batch if something went wrong for some reason
-        if torch.isnan(loss):
-            return None
+        raise_for_non_finite_loss(loss, (self.optimizer,), batch_idx)
 
         self.accelerator.backward(loss)
 

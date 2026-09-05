@@ -5,7 +5,7 @@ set -uo pipefail
 unset CONTAINER_API_KEY JUPYTER_TOKEN OPEN_BUTTON_TOKEN
 
 recipe_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-training_config="${DIARIZEN_TRAINING_CONFIG:-$recipe_dir/conf/full_wavlm_base_plus_16gb.toml}"
+training_config="${DIARIZEN_TRAINING_CONFIG:-$recipe_dir/conf/full_wavlm_base_plus_16gb_upstream_v2.toml}"
 config_experiment_id="$(basename "$training_config" .toml)"
 experiment_id="${DIARIZEN_EXPERIMENT_ID:-$config_experiment_id}"
 if [[ ! "$experiment_id" =~ ^[A-Za-z0-9_-]+$ ]]; then
@@ -32,6 +32,12 @@ status_file="$recipe_dir/$experiment_id.status"
 experiment_dir="$recipe_dir/exp_full/$experiment_id"
 completion_marker="Training loop finished at epoch"
 max_restarts=5
+poll_seconds="${DIARIZEN_SUPERVISOR_POLL_SECONDS:-60}"
+
+if [[ ! "$poll_seconds" =~ ^[0-9]+$ ]]; then
+    echo "invalid supervisor poll interval: $poll_seconds" >&2
+    exit 2
+fi
 
 log_status() {
     printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >> "$supervisor_log"
@@ -49,7 +55,9 @@ wait_for_pipeline() {
     local pipeline_pid="$1"
 
     while kill -0 "$pipeline_pid" 2>/dev/null; do
-        sleep 60
+        if (( poll_seconds > 0 )); then
+            sleep "$poll_seconds"
+        fi
     done
 }
 
@@ -73,6 +81,25 @@ start_pipeline() {
     wait "$pipeline_pid" || true
 }
 
+evaluate_completed_pipeline() {
+    if [[ ! -f "$pipeline_log" ]] || ! grep -q "$completion_marker" "$pipeline_log"; then
+        return 1
+    fi
+
+    for ((evaluation_attempt = 1; evaluation_attempt <= 3; evaluation_attempt++)); do
+        log_status "starting evaluation attempt $evaluation_attempt"
+        if "$recipe_dir/evaluate_full.sh" >> "$evaluation_log" 2>&1; then
+            write_status "ready_to_stop"
+            log_status "evaluation complete; GPU is ready to stop"
+            return 0
+        fi
+    done
+
+    log_status "evaluation failed after 3 attempts"
+    write_status "failed"
+    return 2
+}
+
 cd "$recipe_dir" || exit 1
 write_status "running"
 if [[ -f "$pipeline_pid_file" ]]; then
@@ -84,22 +111,24 @@ if [[ -f "$pipeline_pid_file" ]]; then
 fi
 
 for ((attempt = 1; attempt <= max_restarts; attempt++)); do
-    if [[ -f "$pipeline_log" ]] && grep -q "$completion_marker" "$pipeline_log"; then
-        for ((evaluation_attempt = 1; evaluation_attempt <= 3; evaluation_attempt++)); do
-            log_status "starting evaluation attempt $evaluation_attempt"
-            if "$recipe_dir/evaluate_full.sh" >> "$evaluation_log" 2>&1; then
-                write_status "ready_to_stop"
-                log_status "evaluation complete; GPU is ready to stop"
-                exit 0
-            fi
-        done
-        log_status "evaluation failed after 3 attempts"
-        write_status "failed"
+    evaluate_completed_pipeline
+    completion_status=$?
+    if (( completion_status == 0 )); then
+        exit 0
+    elif (( completion_status == 2 )); then
         exit 1
     fi
 
     log_status "pipeline incomplete; restart attempt $attempt"
     start_pipeline
+
+    evaluate_completed_pipeline
+    completion_status=$?
+    if (( completion_status == 0 )); then
+        exit 0
+    elif (( completion_status == 2 )); then
+        exit 1
+    fi
 done
 
 log_status "pipeline failed after $max_restarts restart attempts"

@@ -8,6 +8,12 @@ from pyannote.audio.utils.loss import nll_loss
 from pyannote.audio.utils.permutation import permutate
 
 from diarizen.trainer_dual_opt import Trainer as BaseTrainer
+from diarizen.trainer_utils import (
+    AutoClipGradHistory,
+    raise_for_non_finite_loss,
+    reject_fp16_dual_optimizer,
+    scalar_to_float,
+)
 
 
 logger = get_logger(__name__)
@@ -15,11 +21,17 @@ logger = get_logger(__name__)
 
 class Trainer(BaseTrainer):
     def __init__(self, *args, **kwargs):
+        accelerator = kwargs.get("accelerator")
+        if accelerator is None and args:
+            accelerator = args[0]
+        reject_fp16_dual_optimizer(accelerator)
+
         super().__init__(*args, **kwargs)
         self.accelerator.print(self.model)
 
         # auto GN
-        self.grad_history = []
+        self.grad_history = AutoClipGradHistory(self.gradient_history_size)
+        self.accelerator.register_for_checkpointing(self.grad_history)
 
     def compute_grad_norm(self, model):
         total_norm = 0
@@ -33,8 +45,6 @@ class Trainer(BaseTrainer):
     def auto_clip_grad_norm_(self, model):
         grad_norm = self.compute_grad_norm(model)
         self.grad_history.append(grad_norm)
-        if len(self.grad_history) > self.gradient_history_size:
-            self.grad_history.pop(0)
         clip_value = np.percentile(self.grad_history, self.gradient_percentile)
         self.accelerator.clip_grad_norm_(model.parameters(), clip_value)
 
@@ -47,10 +57,7 @@ class Trainer(BaseTrainer):
         permutated_target_powerset = self.unwrap_model.powerset.to_powerset(permutated_target.float())
 
         loss = nll_loss(y_pred, torch.argmax(permutated_target_powerset, dim=-1))
-
-        # skip batch if something went wrong for some reason
-        if torch.isnan(loss):
-            return None
+        raise_for_non_finite_loss(loss, (self.optimizer_small, self.optimizer_big), batch_idx)
 
         self.accelerator.backward(loss)
 
@@ -67,7 +74,6 @@ class Trainer(BaseTrainer):
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         xs, target = batch["xs"], batch["ts"]
-        sil_all_target = torch.zeros_like(target)
 
         y_pred, _ = self.model(xs)
         # powerset
@@ -76,44 +82,35 @@ class Trainer(BaseTrainer):
         permutated_target_powerset = self.unwrap_model.powerset.to_powerset(permutated_target.float())
 
         loss = nll_loss(y_pred, torch.argmax(permutated_target_powerset, dim=-1))
-        val_metrics = self.unwrap_model.validation_metric(
+        self.unwrap_model.validation_metric.update(
             torch.transpose(multilabel, 1, 2),
             torch.transpose(target, 1, 2),
         )
 
-        if not torch.equal(target, sil_all_target):
-            val_DER = val_metrics["DiarizationErrorRate"]
-            val_FA = val_metrics["DiarizationErrorRate/FalseAlarm"]
-            val_Miss = val_metrics["DiarizationErrorRate/Miss"]
-            val_Confusion = val_metrics["DiarizationErrorRate/Confusion"]
-        else:
-            val_DER = torch.zeros_like(val_metrics["DiarizationErrorRate"])
-            val_FA = torch.zeros_like(val_metrics["DiarizationErrorRate/FalseAlarm"])
-            val_Miss = torch.zeros_like(val_metrics["DiarizationErrorRate/Miss"])
-            val_Confusion = torch.zeros_like(val_metrics["DiarizationErrorRate/Confusion"])
-
-        return {
-            "Loss": loss.detach().float(),
-            "DER": val_DER.detach().float(),
-            "FA": val_FA.detach().float(),
-            "Miss": val_Miss.detach().float(),
-            "Confusion": val_Confusion.detach().float(),
-        }
+        return {"Loss": loss.detach().float()}
 
     def validation_epoch_end(self, validation_epoch_output):
-        metric_keys = validation_epoch_output[0].keys()
-        # Compute mean loss on all loss items on a epoch
-        for key in metric_keys:
-            metric_items = [step_out[key] for step_out in validation_epoch_output]  # float
-            metric_mean = sum(metric_items) / len(metric_items)
-            if key == "Loss":
-                Loss_val = metric_mean
-            if key == "DER":
-                DER_val = metric_mean
-            self.writer.add_scalar(f"Validation_Epoch/{key}", metric_mean, self.state.epochs_trained)
-        logger.info(
-            f"Validation Loss/DER on epoch {self.state.epochs_trained}: {round(Loss_val, 3)} / {round(DER_val, 3)}"
-        )
-        # metric reset
-        self.unwrap_model.validation_metric.reset()
-        return Loss_val
+        loss_items = [step_out["Loss"] for step_out in validation_epoch_output]
+        metric_means = {"Loss": sum(map(scalar_to_float, loss_items)) / len(loss_items)}
+        try:
+            computed_metrics = self.unwrap_model.validation_metric.compute()
+            metric_means.update(
+                {
+                    "DER": scalar_to_float(computed_metrics["DiarizationErrorRate"]),
+                    "FA": scalar_to_float(computed_metrics["DiarizationErrorRate/FalseAlarm"]),
+                    "Miss": scalar_to_float(computed_metrics["DiarizationErrorRate/Miss"]),
+                    "Confusion": scalar_to_float(computed_metrics["DiarizationErrorRate/Confusion"]),
+                }
+            )
+        finally:
+            self.unwrap_model.validation_metric.reset()
+
+        if self.accelerator.is_local_main_process:
+            for key, metric_mean in metric_means.items():
+                self.writer.add_scalar(f"Validation_Epoch/{key}", metric_mean, self.state.epochs_trained)
+            logger.info(
+                f"Validation Loss/DER on epoch {self.state.epochs_trained}: "
+                f"{round(metric_means['Loss'], 3)} / {round(metric_means['DER'], 3)}"
+            )
+        # Validation loss remains the checkpoint-selection score.
+        return metric_means["Loss"]

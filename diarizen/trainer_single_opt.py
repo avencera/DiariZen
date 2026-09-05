@@ -21,7 +21,12 @@ from tqdm.auto import tqdm
 from diarizen.logger import TensorboardLogger
 from diarizen.noam_updater import get_rate
 from diarizen.optimization import get_constant_schedule_with_warmup, get_linear_schedule_with_warmup
-from diarizen.trainer_utils import TrainerState
+from diarizen.trainer_utils import (
+    TrainerState,
+    checkpoint_directory_is_complete,
+    fsync_directory,
+    seal_checkpoint_directory,
+)
 from diarizen.utils import prepare_empty_dir, print_env
 
 
@@ -144,8 +149,8 @@ class Trainer:
         if self._check_improvement(score, save_max_score=self.save_max_score):
             self.state.best_score = score
             self.state.best_score_epoch = self.state.epochs_trained
-            self._save_checkpoint(self.state.epochs_trained, is_best_epoch=True)
             self.state.patience = 0
+            self._save_checkpoint(self.state.epochs_trained, is_best_epoch=True)
             logger.info(f"Found new best score: {score:.4f}, saving checkpoint...")
         else:
             logger.info(
@@ -192,13 +197,91 @@ class Trainer:
         self.source_code_backup_dir = self.exp_dir / f"source_code__{time_now}"
         self.config_path = self.exp_dir / f"config__{time_now}.toml"
 
+    @staticmethod
+    def _remove_path(path):
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        elif path.exists() or path.is_symlink():
+            path.unlink()
+
+    @staticmethod
+    def _fsync_directory(path):
+        fsync_directory(path)
+
+    def _write_checkpoint_completion_marker(self, checkpoint_dir):
+        seal_checkpoint_directory(checkpoint_dir)
+
+    def _is_complete_checkpoint(self, checkpoint_dir):
+        return checkpoint_directory_is_complete(checkpoint_dir, ("pytorch_model.bin",))
+
+    def _recover_checkpoint_backup(self, destination, is_complete):
+        if destination.exists():
+            return
+
+        backups = sorted(destination.parent.glob(f".{destination.name}.previous*"))
+        for backup in backups:
+            if is_complete(backup):
+                backup.replace(destination)
+                self._fsync_directory(destination.parent)
+                logger.warning(f"Recovered checkpoint {destination.as_posix()} from an interrupted replacement.")
+                return
+
+    def _publish_checkpoint_directory(self, temporary, destination, is_complete=None):
+        is_complete = is_complete or self._is_complete_checkpoint
+        if not is_complete(temporary):
+            raise RuntimeError(f"Checkpoint {temporary.as_posix()} is incomplete and cannot be published.")
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        self._recover_checkpoint_backup(destination, is_complete)
+
+        backup = None
+        if destination.exists():
+            backup = destination.with_name(f".{destination.name}.previous")
+            suffix = 1
+            while backup.exists():
+                backup = destination.with_name(f".{destination.name}.previous.{suffix}")
+                suffix += 1
+            destination.replace(backup)
+
+        try:
+            temporary.replace(destination)
+        except BaseException:
+            if destination.exists():
+                self._remove_path(destination)
+            if backup is not None and backup.exists():
+                backup.replace(destination)
+            raise
+
+        self._fsync_directory(destination.parent)
+        if backup is not None and backup.exists():
+            try:
+                self._remove_path(backup)
+            except OSError as error:
+                logger.warning(f"Could not remove old checkpoint {backup.as_posix()}: {error}")
+        self._fsync_directory(destination.parent)
+
+    def _save_accelerate_checkpoint(self, destination):
+        temporary = destination.with_name(f".{destination.name}.partial")
+        if temporary.exists():
+            self._remove_path(temporary)
+        temporary.mkdir(parents=True, exist_ok=True)
+
+        self.accelerator.save_state(temporary, safe_serialization=False)
+        self._write_checkpoint_completion_marker(temporary)
+        self._publish_checkpoint_directory(temporary, destination)
+
     def _find_latest_ckpt_path(self):
         """Find the latest checkpoint path."""
+        for checkpoint in self.checkpoints_dir.glob(".epoch_*.previous*"):
+            name = checkpoint.name[1:].split(".previous", 1)[0]
+            if name.startswith("epoch_") and len(name) == 10 and name[6:].isdigit():
+                self._recover_checkpoint_backup(self.checkpoints_dir / name, self._is_complete_checkpoint)
+
         # Pick up all checkpoints with the format `epoch_*`
         checkpoints = sorted(self.checkpoints_dir.glob("epoch_" + ("[0-9]" * 4)))
 
         # Remove files that is not a checkpoint
-        checkpoints = [ckpt for ckpt in checkpoints if ckpt.is_dir()]
+        checkpoints = [ckpt for ckpt in checkpoints if self._is_complete_checkpoint(ckpt)]
 
         if len(checkpoints) == 0:
             raise FileNotFoundError(f"No checkpoints found in {self.checkpoints_dir.as_posix()}.")
@@ -216,12 +299,13 @@ class Trainer:
         """
         if ckpt_path == "best":
             ckpt_path = self.checkpoints_dir / "best"
+            self._recover_checkpoint_backup(ckpt_path, self._is_complete_checkpoint)
         elif ckpt_path == "latest":
             ckpt_path = self._find_latest_ckpt_path()
         else:
             ckpt_path = Path(ckpt_path).expanduser().absolute()
 
-        if not ckpt_path.exists():
+        if not ckpt_path.exists() or (ckpt_path.name == "best" and not self._is_complete_checkpoint(ckpt_path)):
             raise FileNotFoundError(f"Checkpoint {ckpt_path.as_posix()} not found.")
 
         self.accelerator.load_state(ckpt_path, map_location="cpu")
@@ -235,16 +319,13 @@ class Trainer:
             epoch: the current epoch.
             is_best_epoch: whether the current epoch is the best epoch.
         """
-        # Save checkpoint
         if is_best_epoch:
-            self.accelerator.save_state(self.checkpoints_dir / "best", safe_serialization=False)
+            self._save_accelerate_checkpoint(self.checkpoints_dir / "best")
         else:
-            # Regular checkpoint
-            ckpt_path = self.checkpoints_dir / f"epoch_{str(epoch).zfill(4)}"
-            self.accelerator.save_state(ckpt_path.as_posix(), safe_serialization=False)
+            self._save_accelerate_checkpoint(self.checkpoints_dir / f"epoch_{str(epoch).zfill(4)}")
 
         # Find all regular checkpoints and only keep the latest `max_num_checkpoints` regular checkpoints
-        checkpoints = sorted(self.checkpoints_dir.glob("epoch_*"))
+        checkpoints = self._complete_checkpoint_paths()
 
         if epoch <= len(checkpoints):
             logger.warning(
@@ -257,9 +338,14 @@ class Trainer:
             logger.info(
                 f"Found {len(checkpoints)} checkpoints, only keeping the latest {self.max_num_checkpoints} checkpoints."
             )
-            for checkpoint_dir in checkpoints[: -self.max_num_checkpoints]:
-                shutil.rmtree(checkpoint_dir.as_posix())
+            number_to_remove = len(checkpoints) - self.max_num_checkpoints
+            for checkpoint_dir in checkpoints[:number_to_remove]:
+                self._remove_path(checkpoint_dir)
                 logger.info(f"Checkpoint {checkpoint_dir.as_posix()} is removed.")
+
+    def _complete_checkpoint_paths(self):
+        checkpoints = sorted(self.checkpoints_dir.glob("epoch_" + ("[0-9]" * 4)))
+        return [checkpoint for checkpoint in checkpoints if self._is_complete_checkpoint(checkpoint)]
 
     @staticmethod
     def get_warmup_steps(warmup_steps, max_steps, warmup_ratio):
@@ -396,13 +482,17 @@ class Trainer:
         # Resume
         if self.resume:
             self._load_checkpoint(ckpt_path="latest")
+            if self.state.training_complete:
+                logger.info(f"Training loop finished at epoch {self.state.epochs_trained}.")
+                return
 
         # validation 0 epoch performance
-        if self.validation_before_training:
+        if self.validation_before_training and not self.resume:
             with torch.no_grad():
                 logger.info("Validation on ZERO epoch...")
                 score = self.validate(validation_dataloader)
             if self.accelerator.is_local_main_process:
+                self._run_early_stop_check(score)
                 self._save_checkpoint(epoch=0, is_best_epoch=False)
 
         for epoch in range(self.state.epochs_trained + 1, max_epochs + 1):
@@ -448,10 +538,8 @@ class Trainer:
             self.state.epochs_trained += 1
             self.training_epoch_end(training_epoch_output)
 
-            # Should save, evaluate, and early stop?
-            if self.accelerator.is_local_main_process and epoch % self.save_ckpt_interval == 0:
-                self._save_checkpoint(epoch, is_best_epoch=False)
-
+            # validation updates the trainer state before the resumable checkpoint is captured
+            should_stop = False
             if epoch % self.validation_interval == 0:
                 with torch.no_grad():
                     logger.info("Training finished, begin validation...")
@@ -466,6 +554,11 @@ class Trainer:
                             early_stop_mark += 1
 
                     logger.info("Validation finished.")
+
+            if self.accelerator.is_local_main_process:
+                self.state.training_complete = should_stop or epoch >= max_epochs
+                if epoch % self.save_ckpt_interval == 0 or self.state.training_complete:
+                    self._save_checkpoint(epoch, is_best_epoch=False)
 
             self.accelerator.wait_for_everyone()
 
@@ -520,12 +613,10 @@ class Trainer:
 
         logger.info("Validation inference finished, begin validation epoch end...")
 
-        if self.accelerator.is_local_main_process:
-            # only the main process will run validation_epoch_end
-            score = self.validation_epoch_end(validation_output)
-            return score
-        else:
-            return None
+        # metric implementations may synchronize during epoch-end computation,
+        # so every process must enter the hook
+        score = self.validation_epoch_end(validation_output)
+        return score if self.accelerator.is_local_main_process else None
 
     def _check_improvement(self, score, save_max_score=True):
         """Check if the current model got the best metric score"""
