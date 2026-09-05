@@ -10,6 +10,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
+
+import numpy as np
 
 
 RECIPE_DIR = Path(__file__).resolve().parents[2] / "diar_ssl"
@@ -42,6 +45,29 @@ class InferenceRunManifestTest(unittest.TestCase):
             INFERENCE_MODULE.initialize_run_directory(output_dir, manifest)
             (output_dir / "session.rttm").write_text("SPEAKER session 1 0 1 <NA> <NA> spk <NA> <NA>\n")
             INFERENCE_MODULE.initialize_run_directory(output_dir, manifest)
+
+    def test_empty_rttm_marker_can_resume(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            manifest = {"version": 1, "model": "first"}
+            rttm_path = output_dir / "session.rttm"
+
+            INFERENCE_MODULE.initialize_run_directory(output_dir, manifest)
+            INFERENCE_MODULE.write_rttm_atomically(rttm_path, "")
+            INFERENCE_MODULE.initialize_run_directory(output_dir, manifest)
+
+            self.assertEqual(rttm_path.read_text(), "")
+            self.assertTrue(INFERENCE_MODULE.is_completed_rttm(rttm_path))
+            self.assertTrue(INFERENCE_MODULE.rttm_completion_marker(rttm_path).is_file())
+
+    def test_empty_rttm_without_manifest_is_rejected_after_atomic_publish(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            rttm_path = output_dir / "session.rttm"
+            INFERENCE_MODULE.write_rttm_atomically(rttm_path, "")
+
+            with self.assertRaisesRegex(ValueError, "Cannot validate 1 existing RTTM"):
+                INFERENCE_MODULE.initialize_run_directory(output_dir, {"version": 1, "model": "first"})
 
     def test_changed_manifest_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -95,8 +121,34 @@ class InferenceRunManifestTest(unittest.TestCase):
             audio.write_bytes(b"other audio")
             second_manifest = INFERENCE_MODULE.build_run_manifest(args, config, model.as_posix())
 
-            self.assertEqual(first_manifest["version"], 2)
+            self.assertEqual(first_manifest["version"], 3)
             self.assertNotEqual(first_manifest["input"], second_manifest["input"])
+
+    def test_silent_session_returns_empty_annotation_without_embeddings(self):
+        class SilentSegmentations:
+            data = np.zeros((1, 4, 2), dtype=np.uint8)
+
+        class SilentPipeline:
+            def get_segmentations(self, unused_file, soft):
+                return SilentSegmentations()
+
+            def speaker_count(self, unused_segmentations, unused_receptive_field, warm_up):
+                raise AssertionError("silent segmentation must not reach speaker counting")
+
+            def get_embeddings(self, *unused_args, **unused_kwargs):
+                raise AssertionError("silent segmentation must not extract embeddings")
+
+        waveform = INFERENCE_MODULE.torch.zeros((1, 32))
+        with patch.object(INFERENCE_MODULE.torchaudio, "load", return_value=(waveform, 16000)):
+            result = INFERENCE_MODULE.diarize_session(
+                sess_name="silent",
+                in_wav="silent.wav",
+                pipeline=SilentPipeline(),
+                apply_median_filtering=False,
+            )
+
+        self.assertEqual(result.uri, "silent")
+        self.assertEqual(result.to_rttm(), "")
 
     def test_wav_scp_rejects_duplicate_sessions(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

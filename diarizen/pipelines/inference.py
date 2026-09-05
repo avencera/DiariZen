@@ -8,19 +8,49 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-import toml
 import numpy as np
+import toml
 import torch
 import torchaudio
-
-from scipy.ndimage import median_filter
-
-from huggingface_hub import snapshot_download, hf_hub_download
+from huggingface_hub import hf_hub_download, snapshot_download
 from pyannote.audio.pipelines import SpeakerDiarization as SpeakerDiarizationPipeline
 from pyannote.audio.utils.signal import Binarize
+from pyannote.core import Annotation
 from pyannote.database.protocol.protocol import ProtocolFile
+from scipy.ndimage import median_filter
 
 from diarizen.pipelines.utils import scp2path
+
+
+RTTM_COMPLETION_MARKER_SUFFIX = ".complete"
+
+
+def rttm_completion_marker(rttm_path: Path) -> Path:
+    """Return the completion marker path associated with an RTTM file."""
+
+    return rttm_path.with_name(rttm_path.name + RTTM_COMPLETION_MARKER_SUFFIX)
+
+
+def write_rttm_atomically(rttm_path: Path, rttm: str) -> None:
+    """Publish an RTTM and mark empty output complete after the publish."""
+
+    temporary_rttm = rttm_path.with_suffix(".partial.rttm")
+    temporary_rttm.write_text(rttm)
+
+    completion_marker = rttm_completion_marker(rttm_path)
+    completion_marker.unlink(missing_ok=True)
+    temporary_rttm.replace(rttm_path)
+
+    if not rttm.strip():
+        temporary_marker = completion_marker.with_name(completion_marker.name + ".partial")
+        temporary_marker.write_text("complete\n")
+        temporary_marker.replace(completion_marker)
+
+
+def _has_activity(data: np.ndarray) -> bool:
+    """Return whether segmentation or speaker-count data contains activity."""
+
+    return bool(np.any(np.nan_to_num(data, nan=0.0) > 0))
 
 
 class DiariZenPipeline(SpeakerDiarizationPipeline):
@@ -35,14 +65,14 @@ class DiariZenPipeline(SpeakerDiarizationPipeline):
         config = toml.load(config_path.as_posix())
 
         if config_parse is not None:
-            print('Overriding with parsed config.')
+            print("Overriding with parsed config.")
             config["inference"]["args"] = config_parse["inference"]["args"]
             config["clustering"]["args"] = config_parse["clustering"]["args"]
 
         inference_config = config["inference"]["args"]
         clustering_config = config["clustering"]["args"]
 
-        print(f'Loaded configuration: {config}')
+        print(f"Loaded configuration: {config}")
 
         super().__init__(
             config=config,
@@ -54,7 +84,7 @@ class DiariZenPipeline(SpeakerDiarizationPipeline):
             clustering=clustering_config["method"],
             embedding_batch_size=inference_config["batch_size"],
             segmentation_batch_size=inference_config["batch_size"],
-            device=torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+            device=torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu"),
         )
 
         self.apply_median_filtering = inference_config["apply_median_filtering"]
@@ -99,40 +129,42 @@ class DiariZenPipeline(SpeakerDiarizationPipeline):
         cache_dir: str = None,
         rttm_out_dir: str = None,
     ) -> "DiariZenPipeline":
-        diarizen_hub = snapshot_download(
-            repo_id=repo_id,
-            cache_dir=cache_dir,
-            local_files_only=cache_dir is not None
-        )
+        diarizen_hub = snapshot_download(repo_id=repo_id, cache_dir=cache_dir, local_files_only=cache_dir is not None)
 
         embedding_model = hf_hub_download(
             repo_id="pyannote/wespeaker-voxceleb-resnet34-LM",
             filename="pytorch_model.bin",
             cache_dir=cache_dir,
-            local_files_only=cache_dir is not None
+            local_files_only=cache_dir is not None,
         )
 
         return cls(
             diarizen_hub=Path(diarizen_hub).expanduser().absolute(),
             embedding_model=embedding_model,
-            rttm_out_dir=rttm_out_dir
+            rttm_out_dir=rttm_out_dir,
         )
 
     def __call__(self, in_wav, sess_name=None):
-        assert isinstance(in_wav, (str, BytesIO, ProtocolFile)), \
+        assert isinstance(in_wav, (str, BytesIO, ProtocolFile)), (
             f"input must be either a str, BytesIO or a ProtocolFile; there was {type(in_wav)}"
-        in_wav = in_wav if not isinstance(in_wav, ProtocolFile) else in_wav['audio']
+        )
+        in_wav = in_wav if not isinstance(in_wav, ProtocolFile) else in_wav["audio"]
 
-        print('Extracting segmentations.')
+        print("Extracting segmentations.")
         waveform, sample_rate = torchaudio.load(in_wav)
-        waveform = torch.unsqueeze(waveform[0], 0)      # force to use the SDM data
+        waveform = torch.unsqueeze(waveform[0], 0)  # force to use the SDM data
         segmentations = self.get_segmentations({"waveform": waveform, "sample_rate": sample_rate}, soft=False)
 
         if self.apply_median_filtering:
-            segmentations.data = median_filter(segmentations.data, size=(1, 11, 1), mode='reflect')
+            segmentations.data = median_filter(segmentations.data, size=(1, 11, 1), mode="reflect")
 
         # binarize segmentation
-        binarized_segmentations = segmentations     # powerset
+        binarized_segmentations = segmentations  # powerset
+
+        if not _has_activity(binarized_segmentations.data):
+            result = Annotation(uri=sess_name)
+            self._write_rttm(sess_name, result)
+            return result
 
         # estimate frame-level number of instantaneous speakers
         count = self.speaker_count(
@@ -140,6 +172,11 @@ class DiariZenPipeline(SpeakerDiarizationPipeline):
             self._segmentation.model._receptive_field,
             warm_up=(0.0, 0.0),
         )
+
+        if not _has_activity(count.data):
+            result = Annotation(uri=sess_name)
+            self._write_rttm(sess_name, result)
+            return result
 
         print("Extracting Embeddings.")
         embeddings = self.get_embeddings(
@@ -154,7 +191,7 @@ class DiariZenPipeline(SpeakerDiarizationPipeline):
             embeddings=embeddings,
             segmentations=binarized_segmentations,
             min_clusters=self.min_speakers,
-            max_clusters=self.max_speakers
+            max_clusters=self.max_speakers,
         )
 
         # during counting, we could possibly overcount the number of instantaneous
@@ -175,24 +212,25 @@ class DiariZenPipeline(SpeakerDiarizationPipeline):
         )
 
         # convert to annotation
-        to_annotation = Binarize(
-            onset=0.5,
-            offset=0.5,
-            min_duration_on=0.0,
-            min_duration_off=0.0
-        )
+        to_annotation = Binarize(onset=0.5, offset=0.5, min_duration_on=0.0, min_duration_off=0.0)
         result = to_annotation(discrete_diarization)
         result.uri = sess_name
 
-        if self.rttm_out_dir is not None:
-            assert sess_name is not None
-            rttm_out = os.path.join(self.rttm_out_dir, sess_name + ".rttm")
-            with open(rttm_out, "w") as f:
-                f.write(result.to_rttm())
+        self._write_rttm(sess_name, result)
         return result
 
+    def _write_rttm(self, sess_name, result: Annotation) -> None:
+        """Write one result to the configured output directory, when enabled."""
 
-if __name__ == '__main__':
+        if self.rttm_out_dir is None:
+            return
+
+        assert sess_name is not None
+        rttm_out = Path(self.rttm_out_dir) / f"{sess_name}.rttm"
+        write_rttm_atomically(rttm_out, result.to_rttm())
+
+
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         "This script performs diarization using DiariZen pipeline ",
         add_help=True,
@@ -200,24 +238,9 @@ if __name__ == '__main__':
     )
 
     # Required paths
-    parser.add_argument(
-        "--in_wav_scp",
-        type=str,
-        required=True,
-        help="Path to wav.scp."
-    )
-    parser.add_argument(
-        "--diarizen_hub",
-        type=str,
-        required=True,
-        help="Path to DiariZen model hub directory."
-    )
-    parser.add_argument(
-        "--embedding_model",
-        type=str,
-        required=True,
-        help="Path to pretrained embedding model."
-    )
+    parser.add_argument("--in_wav_scp", type=str, required=True, help="Path to wav.scp.")
+    parser.add_argument("--diarizen_hub", type=str, required=True, help="Path to DiariZen model hub directory.")
+    parser.add_argument("--embedding_model", type=str, required=True, help="Path to pretrained embedding model.")
 
     # inference parameters
     parser.add_argument(
@@ -324,45 +347,41 @@ if __name__ == '__main__':
         "seg_duration": args.seg_duration,
         "segmentation_step": args.segmentation_step,
         "batch_size": args.batch_size,
-        "apply_median_filtering": args.apply_median_filtering
+        "apply_median_filtering": args.apply_median_filtering,
     }
 
     clustering_config = {
         "method": args.clustering_method,
         "min_speakers": args.min_speakers,
-        "max_speakers": args.max_speakers
+        "max_speakers": args.max_speakers,
     }
     if args.clustering_method == "AgglomerativeClustering":
-        clustering_config.update({
-            "ahc_threshold": args.ahc_threshold,
-            "min_cluster_size": args.min_cluster_size
-        })
+        clustering_config.update({"ahc_threshold": args.ahc_threshold, "min_cluster_size": args.min_cluster_size})
     elif args.clustering_method == "VBxClustering":
-        clustering_config.update({
-            "ahc_criterion": args.ahc_criterion,
-            "ahc_threshold": args.ahc_threshold,
-            "Fa": args.Fa,
-            "Fb": args.Fb,
-            "lda_dim": args.lda_dim,
-            "max_iters": args.max_iters
-        })
+        clustering_config.update(
+            {
+                "ahc_criterion": args.ahc_criterion,
+                "ahc_threshold": args.ahc_threshold,
+                "Fa": args.Fa,
+                "Fb": args.Fb,
+                "lda_dim": args.lda_dim,
+                "max_iters": args.max_iters,
+            }
+        )
     else:
         raise ValueError(f"Unsupported clustering method: {args.clustering_method}")
 
-    config_parse = {
-        "inference": {"args": inference_config},
-        "clustering": {"args": clustering_config}
-    }
+    config_parse = {"inference": {"args": inference_config}, "clustering": {"args": clustering_config}}
 
     diarizen_pipeline = DiariZenPipeline(
         diarizen_hub=Path(args.diarizen_hub),
         embedding_model=args.embedding_model,
         config_parse=config_parse,
-        rttm_out_dir=args.rttm_out_dir
+        rttm_out_dir=args.rttm_out_dir,
     )
 
     audio_f = scp2path(args.in_wav_scp)
     for audio_file in audio_f:
-        sess_name = Path(audio_file).stem.split('.')[0]
-        print(f'Prosessing: {sess_name}')
+        sess_name = Path(audio_file).stem.split(".")[0]
+        print(f"Prosessing: {sess_name}")
         diarizen_pipeline(audio_file, sess_name=sess_name)

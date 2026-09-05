@@ -16,6 +16,7 @@ import torchaudio
 from pyannote.audio.core.task import Problem, Resolution, Specifications
 from pyannote.audio.pipelines import SpeakerDiarization as SpeakerDiarizationPipeline
 from pyannote.audio.utils.signal import Binarize
+from pyannote.core import Annotation
 from scipy.ndimage import median_filter
 from torch.torch_version import TorchVersion
 
@@ -27,6 +28,8 @@ torch.serialization.add_safe_globals([TorchVersion, Problem, Resolution, Specifi
 
 
 RUN_MANIFEST_FILENAME = "run_manifest.json"
+RUN_MANIFEST_VERSION = 3
+RTTM_COMPLETION_MARKER_SUFFIX = ".complete"
 
 
 def sha256_file(path: Path) -> str:
@@ -97,7 +100,7 @@ def build_run_manifest(args, config_path: Path, segmentation) -> dict[str, Any]:
 
     embedding_model = Path(args.embedding_model).expanduser().resolve(strict=True)
     return {
-        "version": 2,
+        "version": RUN_MANIFEST_VERSION,
         "script_sha256": sha256_file(Path(__file__).resolve()),
         "input": describe_audio_inputs(Path(args.in_wav_scp)),
         "configuration": describe_file(config_path),
@@ -124,6 +127,37 @@ def build_run_manifest(args, config_path: Path, segmentation) -> dict[str, Any]:
     }
 
 
+def rttm_completion_marker(rttm_path: Path) -> Path:
+    """Return the completion marker path associated with an RTTM file."""
+
+    return rttm_path.with_name(rttm_path.name + RTTM_COMPLETION_MARKER_SUFFIX)
+
+
+def is_completed_rttm(rttm_path: Path) -> bool:
+    """Return whether an RTTM file is complete, including an empty result."""
+
+    if not rttm_path.is_file():
+        return False
+
+    return rttm_path.stat().st_size > 0 or rttm_completion_marker(rttm_path).is_file()
+
+
+def write_rttm_atomically(rttm_path: Path, rttm: str) -> None:
+    """Publish an RTTM and mark empty output complete after the publish."""
+
+    temporary_rttm = rttm_path.with_suffix(".partial.rttm")
+    temporary_rttm.write_text(rttm)
+
+    completion_marker = rttm_completion_marker(rttm_path)
+    completion_marker.unlink(missing_ok=True)
+    temporary_rttm.replace(rttm_path)
+
+    if not rttm.strip():
+        temporary_marker = completion_marker.with_name(completion_marker.name + ".partial")
+        temporary_marker.write_text("complete\n")
+        temporary_marker.replace(completion_marker)
+
+
 def initialize_run_directory(output_dir: Path, manifest: dict[str, Any]) -> None:
     """Create or validate the identity of a resumable inference directory."""
 
@@ -132,7 +166,7 @@ def initialize_run_directory(output_dir: Path, manifest: dict[str, Any]) -> None
     completed_rttms = [
         path
         for path in output_dir.glob("*.rttm")
-        if not path.name.endswith(".partial.rttm") and path.stat().st_size > 0
+        if not path.name.endswith(".partial.rttm") and is_completed_rttm(path)
     ]
 
     if manifest_path.exists():
@@ -195,6 +229,12 @@ def load_scp(scp_file: str) -> dict[str, str]:
     return recordings
 
 
+def _has_activity(data: np.ndarray) -> bool:
+    """Return whether segmentation or speaker-count data contains activity."""
+
+    return bool(np.any(np.nan_to_num(data, nan=0.0) > 0))
+
+
 def diarize_session(sess_name, in_wav, pipeline, min_speakers=1, max_speakers=20, apply_median_filtering=True):
     print("Extracting segmentations...")
     waveform, sample_rate = torchaudio.load(in_wav)
@@ -207,12 +247,18 @@ def diarize_session(sess_name, in_wav, pipeline, min_speakers=1, max_speakers=20
     # binarize segmentation
     binarized_segmentations = segmentations  # powerset
 
+    if not _has_activity(binarized_segmentations.data):
+        return Annotation(uri=sess_name)
+
     # estimate frame-level number of instantaneous speakers
     count = pipeline.speaker_count(
         binarized_segmentations,
         pipeline._segmentation.model._receptive_field,
         warm_up=(0.0, 0.0),
     )
+
+    if not _has_activity(count.data):
+        return Annotation(uri=sess_name)
 
     print("Extracting Embeddings.")
     embeddings = pipeline.get_embeddings(
@@ -494,7 +540,7 @@ if __name__ == "__main__":
 
     for sess, in_wav in audio_dict.items():
         rttm_out = output_dir / f"{sess}.rttm"
-        if rttm_out.is_file() and rttm_out.stat().st_size > 0:
+        if is_completed_rttm(rttm_out):
             print(f"Reusing completed session: {sess}")
             continue
         print(f"Diarizing Session: {sess}")
@@ -506,6 +552,4 @@ if __name__ == "__main__":
             max_speakers=args.max_speakers,
             apply_median_filtering=args.apply_median_filtering,
         )
-        temporary_rttm = rttm_out.with_suffix(".partial.rttm")
-        temporary_rttm.write_text(diar_result.to_rttm())
-        temporary_rttm.replace(rttm_out)
+        write_rttm_atomically(rttm_out, diar_result.to_rttm())
