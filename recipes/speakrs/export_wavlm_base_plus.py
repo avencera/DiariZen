@@ -27,6 +27,8 @@ def sha256(path: Path) -> str:
 def convert_state_dict(state_dict: dict[str, torch.Tensor], layer_count: int) -> dict[str, torch.Tensor]:
     """Convert torchaudio attention parameters to the DiariZen layout."""
     converted = dict(state_dict)
+    if converted and all(key.startswith("model.") for key in converted):
+        converted = {key[len("model.") :]: value for key, value in converted.items()}
     converted["feature_extractor.dummy_weight"] = torch.ones(512)
 
     for layer in range(layer_count):

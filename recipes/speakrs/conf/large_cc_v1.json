@@ -1,0 +1,61 @@
+{
+  "schema": "speakrs-large",
+  "schema_version": 1,
+  "run_id": "large_cc_v1",
+  "release_root": "recipes/speakrs/data/large_cc_v1",
+  "artifacts_root": "recipes/speakrs/artifacts",
+  "ghcr_package": "ghcr.io/praveenperera/diarizen-speakrs-wavlm-large",
+  "relocation": {
+    "audio_root": "/Volumes/CacheDisk/dev-cache/wavlm-large-pre-rental/audio",
+    "backup_root": "/Volumes/CacheDisk/dev-cache/wavlm-large-pre-rental/backup",
+    "source_cache": "/Volumes/CacheDisk/dev-cache/wavlm-large-pre-rental/source",
+    "evidence_root": "/Users/praveen/code/research/_scratch/wavlm-large-pre-rental/evidence"
+  },
+  "budget": {
+    "total_usd": 150,
+    "boundary_policy": "pause_for_extension",
+    "qualification_usd": 5,
+    "training_usd": 120,
+    "scoring_usd": 20,
+    "reserve_usd": 5
+  },
+  "model": {
+    "wavlm_blocks": 24,
+    "wavlm_representations": 25,
+    "wavlm_width": 1024,
+    "wavlm_heads": 16,
+    "powerset_classes": 11,
+    "chunk_seconds": 8,
+    "sample_rate": 16000,
+    "output_frames": 399,
+    "normalize_waveform": true,
+    "strict_load": true
+  },
+  "mixture": {
+    "quotas": {
+      "AMI": 0.18,
+      "AliMeeting": 0.14,
+      "AISHELL4": 0.14,
+      "VoxConverse": 0.12,
+      "NOTSOFAR_real": 0.10,
+      "ICSI": 0.08,
+      "LOTUSDIS": 0.04,
+      "NOTSOFAR_sim": 0.15,
+      "dynamic": 0.05
+    },
+    "cycle_examples": 128000,
+    "effective_batch": 64,
+    "updates_per_cycle": 2000,
+    "seed": 3407
+  },
+  "required_corpora": [
+    "AMI",
+    "AliMeeting",
+    "AISHELL4",
+    "VoxConverse",
+    "NOTSOFAR_real",
+    "ICSI",
+    "LOTUSDIS",
+    "NOTSOFAR_sim"
+  ]
+}

@@ -146,6 +146,12 @@ class GradientAccumulationTest(unittest.TestCase):
                 self.assertTrue(zero_grad_lines)
                 self.assertGreater(min(zero_grad_lines), max(step_lines))
 
+    def test_partial_final_accumulation_still_updates_both_optimizers(self):
+        scale, offset = self.run_training_steps(values=(1.0, 2.0, 3.0), accumulation_steps=2)
+
+        self.assertNotEqual(scale, 1.0)
+        self.assertNotEqual(offset, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,15 @@
+# Recipe-owned runtime pins for WavLM Large. Do not use the root constraints.txt
+# Torch 2.1.1 lock for this run.
+numpy==1.26.4
+accelerate==1.6.0
+torchmetrics==1.9.0
+torch==2.11.0
+torchaudio==2.11.0
+torchcodec==0.13.0
+toml
+soundfile
+scipy
+pandas
+tqdm
+einops
+pytest

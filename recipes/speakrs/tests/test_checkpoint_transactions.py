@@ -220,6 +220,19 @@ class TransactionalCheckpointTest(unittest.TestCase):
             self.assertFalse((root / "checkpoints" / ".epoch_0002.partial").exists())
             self.assertEqual(successful_accelerator.save_state_paths, [root / "checkpoints" / ".epoch_0002.partial"])
 
+    def test_incomplete_update_generation_is_not_resumed(self):
+        module = load_trainer_module("dual")
+        with TemporaryDirectory() as temporary:
+            trainer = trainer_for(module, Path(temporary))
+            complete = trainer.checkpoints_dir / "update_00000250"
+            complete.mkdir()
+            (complete / "pytorch_model.bin").write_bytes(b"complete")
+            (complete / CHECKPOINT_COMPLETE_MARKER).write_text("complete\n")
+            incomplete = trainer.checkpoints_dir / "update_00000500"
+            incomplete.mkdir()
+            (incomplete / "pytorch_model.bin").write_bytes(b"partial")
+            self.assertEqual(trainer._find_latest_ckpt_path(), complete)
+
     def test_best_replacement_keeps_previous_checkpoint_on_save_failure(self):
         module = load_trainer_module("single")
         with TemporaryDirectory() as temporary:

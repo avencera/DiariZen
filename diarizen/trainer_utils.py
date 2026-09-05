@@ -207,6 +207,11 @@ class TrainerState:
 
         self.best_score = -np.inf if save_max_score else np.inf
         self.best_score_epoch = 0
+        self.updates_trained = 0
+        self.cycles_trained = 0
+        self.scoring_phase = "idle"
+        self.stop_reason = None
+        self.recipe_state = {}
 
     def load_state_dict(self, state_dict: dict) -> None:
         self.epochs_trained = state_dict["epochs_trained"]
@@ -217,6 +222,11 @@ class TrainerState:
         self.best_score_epoch = state_dict["best_score_epoch"]
 
         self.patience = state_dict["patience"]
+        self.updates_trained = int(state_dict.get("updates_trained", 0))
+        self.cycles_trained = int(state_dict.get("cycles_trained", 0))
+        self.scoring_phase = str(state_dict.get("scoring_phase", "idle"))
+        self.stop_reason = state_dict.get("stop_reason")
+        self.recipe_state = dict(state_dict.get("recipe_state") or {})
 
     def state_dict(self) -> dict:
         return {
@@ -226,4 +236,9 @@ class TrainerState:
             "patience": self.patience,
             "best_score": self.best_score,
             "best_score_epoch": self.best_score_epoch,
+            "updates_trained": self.updates_trained,
+            "cycles_trained": self.cycles_trained,
+            "scoring_phase": self.scoring_phase,
+            "stop_reason": self.stop_reason,
+            "recipe_state": dict(self.recipe_state),
         }

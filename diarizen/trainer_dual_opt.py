@@ -6,6 +6,7 @@ import json
 import math
 import os
 import shutil
+import signal
 import sys
 import time
 from pathlib import Path
@@ -120,6 +121,8 @@ class Trainer:
         # Trainer states
         self.state = TrainerState(save_max_score=self.save_max_score)
         self.accelerator.register_for_checkpointing(self.state)  # Register accelerate objects
+        self.run_hooks = None
+        self._stop_signal = None
 
         # Others
         pd.set_option("display.float_format", lambda x: "%.3f" % x)
@@ -266,6 +269,24 @@ class Trainer:
                 logger.warning(f"Could not remove old checkpoint {backup.as_posix()}: {error}")
         self._fsync_directory(destination.parent)
 
+    def _install_stop_signals(self) -> None:
+        """Pause at the next update boundary when the worker receives SIGTERM or SIGINT."""
+
+        def handler(signum, _frame):
+            self._stop_signal = signal.Signals(signum).name.lower()
+
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            try:
+                signal.signal(signum, handler)
+            except (ValueError, OSError):
+                continue
+
+    def _save_update_checkpoint(self, updates: int) -> None:
+        """Publish a complete recovery generation at an optimizer-update boundary."""
+
+        destination = self.checkpoints_dir / f"update_{int(updates):08d}"
+        self._save_accelerate_checkpoint(destination)
+
     def _save_accelerate_checkpoint(self, destination):
         temporary = destination.with_name(f".{destination.name}.partial")
         if temporary.exists():
@@ -309,6 +330,10 @@ class Trainer:
 
         # Remove files that is not a checkpoint
         checkpoints = [ckpt for ckpt in checkpoints if self._is_complete_checkpoint(ckpt)]
+        update_checkpoints = sorted(self.checkpoints_dir.glob("update_" + ("[0-9]" * 8)))
+        update_checkpoints = [ckpt for ckpt in update_checkpoints if self._is_complete_checkpoint(ckpt)]
+        if update_checkpoints:
+            return update_checkpoints[-1]
 
         if len(checkpoints) == 0:
             raise FileNotFoundError(f"No checkpoints found in {self.checkpoints_dir.as_posix()}.")
@@ -580,8 +605,25 @@ class Trainer:
         # Resume
         if self.resume:
             self._load_checkpoint(ckpt_path="latest")
-            if self.state.training_complete:
+            run_hooks = getattr(self, "run_hooks", None)
+            if run_hooks is not None and getattr(self.state, "recipe_state", None):
+                self.run_hooks = run_hooks.from_state_dict(
+                    self.state.recipe_state,
+                    run_hooks.sampler,
+                    run_hooks.ledger,
+                )
+            if self.state.training_complete or getattr(self.state, "stop_reason", None) in {
+                "completed",
+                "failed",
+                "destroyed",
+                "deadline",
+                "safety_stop",
+                "terminal",
+            }:
                 logger.info(f"Training loop finished at epoch {self.state.epochs_trained}.")
+                return
+            if run_hooks is not None and not run_hooks.can_train():
+                logger.info("Training resume is blocked by budget or terminal state.")
                 return
 
         # # validation 0 epoch performance
@@ -617,6 +659,7 @@ class Trainer:
                 leave=True,
             )
 
+            self._install_stop_signals()
             for batch_idx, batch in enumerate(dataloader_bar):
                 # accumulate() will automatically skip synchronization if applicable loss is linearly scaled with the optimizer.grad
                 # accumulate() will automatically divide the loss in backward by the number of gradient accumulation steps
@@ -626,15 +669,45 @@ class Trainer:
                     loss_dict = self.training_step(batch, batch_idx)
                     training_epoch_output.append(loss_dict)
 
-                    if not self.accelerator.optimizer_step_was_skipped:
+                    optimizer_updated = (
+                        bool(self.accelerator.sync_gradients) and not self.accelerator.optimizer_step_was_skipped
+                    )
+                    run_hooks = getattr(self, "run_hooks", None)
+                    if optimizer_updated:
+                        self.state.updates_trained = getattr(self.state, "updates_trained", 0) + 1
+                        if run_hooks is not None:
+                            weight = run_hooks.example_loss_weight(batch)
+                            valid = "Loss" in loss_dict
+                            run_hooks.acknowledge_update(
+                                batch,
+                                optimizer_updated=True,
+                                loss_weight=weight,
+                                valid=valid,
+                            )
+                            self.state.recipe_state = run_hooks.state_dict()
+                            if run_hooks.should_snapshot(self.state.updates_trained):
+                                self._save_update_checkpoint(self.state.updates_trained)
+                                run_hooks.mark_snapshot(self.state.updates_trained)
                         if self.warmup_steps > 0:
                             self.lr_scheduler_step()
 
                         if self.use_one_cycle_lr:
                             self.lr_one_cycle_scheduler_small.step()
                             self.lr_one_cycle_scheduler_big.step()
+                    elif run_hooks is not None:
+                        run_hooks.acknowledge_update(
+                            batch,
+                            optimizer_updated=False,
+                            loss_weight=run_hooks.example_loss_weight(batch),
+                            valid=False,
+                        )
 
                 self.state.steps_trained += 1
+                if getattr(self, "_stop_signal", None):
+                    self.state.stop_reason = self._stop_signal
+                    if self.accelerator.is_local_main_process:
+                        self._save_update_checkpoint(self.state.updates_trained)
+                    break
             self.state.epochs_trained += 1
             self.training_epoch_end(training_epoch_output)
 
@@ -651,6 +724,10 @@ class Trainer:
                             self.lr_decay_scheduler_big.step(score)
 
                         should_stop = self._run_early_stop_check(score)
+                        run_hooks = getattr(self, "run_hooks", None)
+                        if should_stop and run_hooks is not None and not run_hooks.coverage_complete():
+                            logger.info("Patience expired before full recording coverage; continuing.")
+                            should_stop = False
                         self._save_ranked_checkpoint(epoch=epoch, score=score)
                         if should_stop:
                             early_stop_mark += 1

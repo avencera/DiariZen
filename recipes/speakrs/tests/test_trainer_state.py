@@ -13,8 +13,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from accelerate import Accelerator
 
-from diarizen.trainer_utils import (
+
+Accelerator(cpu=True)
+
+from diarizen.trainer_utils import (  # noqa: E402
     AutoClipGradHistory,
     TrainerState,
     checkpoint_directory_is_complete,
@@ -138,6 +142,9 @@ class TrainerStateTest(unittest.TestCase):
         self.assertTrue(restored.training_complete)
 
     def test_resume_of_terminal_checkpoint_runs_no_training_batches(self):
+        from accelerate import Accelerator
+
+        Accelerator(cpu=True)
         module = load_dual_optimizer_trainer()
         trainer = module.Trainer.__new__(module.Trainer)
         trainer.device = torch.device("cpu")
@@ -187,6 +194,9 @@ class TrainerStateTest(unittest.TestCase):
                 self.assertIn("register_for_checkpointing(self.grad_history)", source)
 
     def test_validation_uses_aggregate_der_and_keeps_silent_false_alarm(self):
+        from accelerate import Accelerator
+
+        Accelerator(cpu=True)
         module = load_dual_optimizer_trainer()
         metric = AccumulatingDERMetric()
 
@@ -219,6 +229,22 @@ class TrainerStateTest(unittest.TestCase):
         self.assertEqual(metric.update_calls, 2)
         self.assertEqual(metric.reset_calls, 1)
         self.assertEqual(metric.speech_total, 0.0)
+
+    def test_legacy_state_dict_defaults_large_fields(self):
+        state = TrainerState(save_max_score=False)
+        state.load_state_dict(
+            {
+                "epochs_trained": 4,
+                "steps_trained": 8,
+                "training_complete": False,
+                "patience": 0,
+                "best_score": 0.4,
+                "best_score_epoch": 3,
+            }
+        )
+        self.assertEqual(state.updates_trained, 0)
+        self.assertEqual(state.cycles_trained, 0)
+        self.assertEqual(state.recipe_state, {})
 
 
 if __name__ == "__main__":

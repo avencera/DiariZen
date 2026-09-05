@@ -241,5 +241,41 @@ class PrepareFullCorpusTest(unittest.TestCase):
                 self.assertAlmostEqual(samples[20 + channel * 10], impulse / channel_count, delta=2)
 
 
+class LargeReleaseRejectionTest(unittest.TestCase):
+    def test_large_seal_rejects_missing_corpus(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+        from recipes.speakrs.large.contracts import parse_spec
+        from recipes.speakrs.large.errors import PreparationError
+        from recipes.speakrs.large.prepare import seal_release
+
+        spec = parse_spec(json.loads((Path(__file__).parents[1] / "conf" / "large_cc_v1.json").read_text()))
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(PreparationError):
+                seal_release(
+                    spec,
+                    Path(temporary) / "release",
+                    [
+                        {
+                            "recording_id": "AMI-0",
+                            "parent_id": "AMI-0",
+                            "corpus": "AMI",
+                            "split": "train",
+                            "device_view": "canonical",
+                            "label_tier": "gold",
+                            "licence": "accepted_cc",
+                            "audio_sha256": "a" * 64,
+                            "label_sha256": "b" * 64,
+                            "sample_count": 16000,
+                            "rejected": False,
+                            "rejection_reason": None,
+                            "language": "en",
+                            "transformations": [],
+                        }
+                    ],
+                    {"AMI": {"train": ["AMI-0"], "dev": [], "test": []}},
+                    [],
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

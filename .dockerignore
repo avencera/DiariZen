@@ -1,0 +1,16 @@
+.git
+**/.git
+**/.venv*
+**/__pycache__
+**/*.pyc
+recipes/speakrs/data
+recipes/speakrs/artifacts
+recipes/speakrs/exp*
+**/*.flac
+**/*.wav
+**/*.pt
+**/*.ckpt
+**/*.bin
+**/.env
+**/credentials.json
+**/*id_rsa*
