@@ -28,7 +28,16 @@ from .contracts import (
 )
 from .errors import PreparationError
 from .hashing import sha256_file, sha256_json
-from .inventory import ICSI_MIX_URL, PEAK_GIB_ESTIMATE, SOURCES
+from .inventory import (
+    ICSI_MIX_URL,
+    LOTUSDIS_FULL_MEETING_BYTES,
+    LOTUSDIS_FULL_MEETING_ID,
+    NOTSOFAR_HF_DATASET,
+    NOTSOFAR_SIM_HF_PREFIX,
+    NOTSOFAR_SIM_PREFIX,
+    PEAK_GIB_ESTIMATE,
+    SOURCES,
+)
 from .jsonio import atomic_write_text, write_json
 from .sampler import coverage_plan
 from .storage import probe_writable_root, require_free_gib, write_resource_plan
@@ -694,9 +703,16 @@ def prepare_notsofar_sim(spec) -> dict[str, Any]:
 
     cache = spec.relocation.source_cache / "notsofar-sim"
     cache.mkdir(parents=True, exist_ok=True)
-    listing = _azure_list(
-        "https://notsofarsa.blob.core.windows.net/css-datasets?restype=container&comp=list&prefix=v1.5/1000hrs/train/"
-    )
+    source_url = NOTSOFAR_SIM_PREFIX
+    try:
+        listing = _azure_list(
+            "https://notsofarsa.blob.core.windows.net/css-datasets"
+            "?restype=container&comp=list&prefix=v1.5/1000hrs/train/"
+        )
+    except PreparationError:
+        # Official Microsoft helper now pulls the same v1.5/1000hrs/train tree from Hugging Face.
+        listing = _huggingface_sim_list(cache)
+        source_url = f"https://huggingface.co/datasets/{NOTSOFAR_HF_DATASET}/{NOTSOFAR_SIM_HF_PREFIX}"
     parents = sorted(listing)
     if not parents:
         raise PreparationError("NOTSOFAR simulated train listing is empty")
@@ -709,7 +725,7 @@ def prepare_notsofar_sim(spec) -> dict[str, Any]:
         "sources": [
             {
                 "name": "notsofar-sim-v1.5-1000hrs-train",
-                "url": "https://notsofarsa.blob.core.windows.net/css-datasets/v1.5/1000hrs/train",
+                "url": source_url,
             }
         ],
     }
@@ -801,15 +817,29 @@ def prepare_lotusdis(spec) -> dict[str, Any]:
             )
     if not rows:
         raise PreparationError("LOTUSDIS produced no parent meetings")
+    meeting_zip = cache / "wav.zip"
+    if not meeting_zip.is_file() or meeting_zip.stat().st_size != LOTUSDIS_FULL_MEETING_BYTES:
+        _gdrive_range_download(
+            LOTUSDIS_FULL_MEETING_ID,
+            meeting_zip,
+            LOTUSDIS_FULL_MEETING_BYTES,
+            cookies=cache / "gdrive.cookies",
+        )
+    sources = [
+        {
+            "name": "lotusdis-csv",
+            "obtained_sha256": sha256_file(archive) if archive.is_file() else sha256_file(legacy_csv),
+        },
+        {
+            "name": "lotusdis-full-meeting",
+            "obtained_sha256": sha256_file(meeting_zip),
+            "bytes": meeting_zip.stat().st_size,
+        },
+    ]
     return {
         "recordings": rows,
         "splits": {"LOTUSDIS": {split: list(ids) for split, ids in parts.items()}},
-        "sources": [
-            {
-                "name": "lotusdis-csv",
-                "obtained_sha256": sha256_file(archive) if archive.is_file() else sha256_file(legacy_csv),
-            }
-        ],
+        "sources": sources,
     }
 
 
@@ -826,6 +856,213 @@ def _gdown(file_id: str, destination: Path) -> None:
     completed = subprocess.run(command, env=scrubbed_environment(), check=False)
     if completed.returncode != 0:
         raise PreparationError("gdown failed", {"file_id": file_id, "code": completed.returncode})
+
+
+def _file_starts_with_html(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+    head = path.read_bytes()[:20].lower()
+    return head.startswith(b"<!doctype") or head.startswith(b"<html")
+
+
+def _parse_tar_utterances_map(data: bytes) -> list[str]:
+    """Read utterance IDs from the first member of a CSS dataset tar."""
+
+    if len(data) < 512:
+        raise PreparationError("utterances.map tar header is truncated")
+    name = data[0:100].split(b"\x00", 1)[0]
+    if name != b"utterances.map":
+        raise PreparationError(
+            "expected utterances.map as first tar member",
+            {"name": name.decode("utf-8", "replace")},
+        )
+    size_field = data[124:136].split(b"\x00", 1)[0].decode("ascii", "replace").strip()
+    try:
+        size = int(size_field, 8)
+    except ValueError as error:
+        raise PreparationError("utterances.map size is not octal") from error
+    payload = data[512 : 512 + size]
+    if len(payload) < size:
+        raise PreparationError(
+            "utterances.map is truncated",
+            {"got": len(payload), "expected": size},
+        )
+    try:
+        mapping = json.loads(payload.decode("utf-8"))
+    except json.JSONDecodeError as error:
+        raise PreparationError("utterances.map is not JSON") from error
+    if not isinstance(mapping, dict) or not mapping:
+        raise PreparationError("utterances.map has no utterance ids")
+    return sorted(mapping)
+
+
+def _huggingface_sim_list(cache: Path) -> list[str]:
+    """List v1.5/1000hrs/train utterance IDs from official Hugging Face tars."""
+
+    index_path = cache / "hf-train-maps.jsonl"
+    if index_path.is_file():
+        ids: list[str] = []
+        for line in index_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                ids.extend(json.loads(line)["ids"])
+        if ids:
+            return sorted(set(ids))
+    listing = _huggingface_list(NOTSOFAR_HF_DATASET, NOTSOFAR_SIM_HF_PREFIX)
+    tar_names = [name for name in listing if name.endswith(".tar")]
+    if len(tar_names) < 800:
+        raise PreparationError(
+            "Hugging Face simulated train listing is incomplete",
+            {"count": len(tar_names)},
+        )
+    resolve = f"https://huggingface.co/datasets/{NOTSOFAR_HF_DATASET}/resolve/main/{NOTSOFAR_SIM_HF_PREFIX}"
+    rows = []
+    for name in tar_names:
+        dest = cache / f"{name}.map.bin"
+        completed = subprocess.run(
+            [
+                "curl",
+                "--fail",
+                "--silent",
+                "--location",
+                "--max-time",
+                "90",
+                "-r",
+                "0-65535",
+                "--output",
+                str(dest),
+                f"{resolve}/{name}",
+            ],
+            env=scrubbed_environment(),
+            check=False,
+            capture_output=True,
+        )
+        if completed.returncode != 0 or not dest.is_file():
+            dest.unlink(missing_ok=True)
+            raise PreparationError("Hugging Face simulated tar map download failed", {"name": name})
+        data = dest.read_bytes()
+        dest.unlink(missing_ok=True)
+        ids = _parse_tar_utterances_map(data)
+        rows.append({"name": name, "count": len(ids), "ids": ids})
+    atomic_write_text(
+        index_path,
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+    )
+    parents = sorted({utterance_id for row in rows for utterance_id in row["ids"]})
+    if not parents:
+        raise PreparationError("Hugging Face simulated train listing is empty")
+    return parents
+
+
+def _gdrive_confirm_uuid(file_id: str, cookies: Path) -> str:
+    cookies.parent.mkdir(parents=True, exist_ok=True)
+    if not cookies.is_file():
+        cookies.write_text("", encoding="utf-8")
+    html_path = cookies.with_name("gdrive-confirm.html")
+    completed = subprocess.run(
+        [
+            "curl",
+            "--silent",
+            "--location",
+            "-A",
+            "Mozilla/5.0",
+            "-b",
+            str(cookies),
+            "-c",
+            str(cookies),
+            "--max-time",
+            "30",
+            "--output",
+            str(html_path),
+            f"https://drive.google.com/uc?export=download&id={file_id}",
+        ],
+        env=scrubbed_environment(),
+        check=False,
+    )
+    text = html_path.read_text(errors="replace") if html_path.is_file() else ""
+    if "Too many users" in text and "uuid" not in text:
+        raise PreparationError("Google Drive quota blocked the confirm page", {"file_id": file_id})
+    match = re.search(r'name="uuid" value="([^"]+)"', text)
+    if completed.returncode != 0 or match is None:
+        raise PreparationError("Google Drive confirm page is missing uuid", {"file_id": file_id})
+    return match.group(1)
+
+
+def _gdrive_range_download(file_id: str, destination: Path, expected_bytes: int, *, cookies: Path) -> None:
+    """Download a large Drive file with Range chunks. A Range-less GET hits quota HTML."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    cookies.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_file() and destination.stat().st_size == expected_bytes:
+        if _file_starts_with_html(destination):
+            destination.unlink()
+        else:
+            return
+    partial = destination.with_name(destination.name + ".partial")
+    offset = partial.stat().st_size if partial.is_file() else 0
+    if offset and _file_starts_with_html(partial):
+        partial.unlink()
+        offset = 0
+    chunk = 32 * 1024 * 1024
+    uuid = _gdrive_confirm_uuid(file_id, cookies)
+    failures = 0
+    while offset < expected_bytes:
+        end = min(offset + chunk, expected_bytes) - 1
+        tmp = partial.with_name(f"{partial.name}.chunk-{offset}")
+        url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t&uuid={uuid}"
+        completed = subprocess.run(
+            [
+                "curl",
+                "--silent",
+                "--location",
+                "-A",
+                "Mozilla/5.0",
+                "-b",
+                str(cookies),
+                "-c",
+                str(cookies),
+                "--max-time",
+                "180",
+                "-r",
+                f"{offset}-{end}",
+                "--output",
+                str(tmp),
+                url,
+            ],
+            env=scrubbed_environment(),
+            check=False,
+        )
+        expected = end - offset + 1
+        bad = (
+            completed.returncode != 0
+            or not tmp.is_file()
+            or tmp.stat().st_size != expected
+            or _file_starts_with_html(tmp)
+        )
+        if bad:
+            failures += 1
+            tmp.unlink(missing_ok=True)
+            if failures >= 8:
+                raise PreparationError(
+                    "Google Drive range download failed",
+                    {"file_id": file_id, "offset": offset},
+                )
+            uuid = _gdrive_confirm_uuid(file_id, cookies)
+            continue
+        failures = 0
+        if offset == 0 and tmp.read_bytes()[:2] != b"PK":
+            tmp.unlink(missing_ok=True)
+            raise PreparationError("Google Drive range download is not a zip", {"file_id": file_id})
+        with partial.open("ab") as dest, tmp.open("rb") as src:
+            dest.write(src.read())
+            dest.flush()
+        tmp.unlink(missing_ok=True)
+        offset = partial.stat().st_size
+    if partial.stat().st_size != expected_bytes:
+        raise PreparationError(
+            "Google Drive range download size mismatch",
+            {"got": partial.stat().st_size, "expected": expected_bytes},
+        )
+    partial.replace(destination)
 
 
 def _lotusdis_parent_id(path_value: str) -> str | None:

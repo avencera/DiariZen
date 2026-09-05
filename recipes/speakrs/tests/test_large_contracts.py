@@ -148,6 +148,42 @@ class LotusdisParentTest(unittest.TestCase):
         )
 
 
+class NotsofarSimMapTest(unittest.TestCase):
+    def test_parse_utterances_map_and_cached_listing(self):
+        import io
+        import tarfile
+
+        from recipes.speakrs.large.prepare import (
+            _file_starts_with_html,
+            _huggingface_sim_list,
+            _parse_tar_utterances_map,
+        )
+
+        buffer = io.BytesIO()
+        payload = json.dumps({"utt-b": 2, "utt-a": 1}).encode("utf-8")
+        with tarfile.open(fileobj=buffer, mode="w") as tar:
+            info = tarfile.TarInfo("utterances.map")
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
+        self.assertEqual(_parse_tar_utterances_map(buffer.getvalue()), ["utt-a", "utt-b"])
+        with self.assertRaises(PreparationError):
+            _parse_tar_utterances_map(b"short")
+        with tempfile.TemporaryDirectory() as temporary:
+            html = Path(temporary) / "quota.html"
+            html.write_bytes(b"<!DOCTYPE html><html>quota")
+            self.assertTrue(_file_starts_with_html(html))
+            cache = Path(temporary) / "sim"
+            cache.mkdir()
+            (cache / "hf-train-maps.jsonl").write_text(
+                json.dumps({"ids": ["u1", "u2"], "count": 2})
+                + "\n"
+                + json.dumps({"ids": ["u2", "u3"], "count": 2})
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(_huggingface_sim_list(cache), ["u1", "u2", "u3"])
+
+
 class PrepareRejectionTest(unittest.TestCase):
     def test_incomplete_release_is_rejected(self):
         spec = parse_spec(json.loads(SPEC_PATH.read_text(encoding="utf-8")))

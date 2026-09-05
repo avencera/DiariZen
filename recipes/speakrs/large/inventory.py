@@ -51,9 +51,11 @@ NOTSOFAR_REAL_TRAIN = "benchmark-datasets/train_set/240825.1_train"
 NOTSOFAR_REAL_DEV1 = "benchmark-datasets/dev_set/240825.1_dev1"
 NOTSOFAR_REAL_EVAL = "benchmark-datasets/eval_set/240825.1_eval_full_with_GT"
 NOTSOFAR_SIM_PREFIX = "https://notsofarsa.blob.core.windows.net/css-datasets/v1.5/1000hrs/train"
+NOTSOFAR_SIM_HF_PREFIX = "css-datasets/v1.5/1000hrs/train"
 LOTUSDIS_FULL_MEETING_ID = "1ofw99Y5W1p8f1DSaIbJkS0xWtuTI2Hrc"
 LOTUSDIS_TEXTGRID_ID = "14fMv_X_8sGDPGbnU-hpJ85Mug43AHlgO"
 LOTUSDIS_CSV_ID = "1ut44pgT1tJRd30clNp-IPx6nJiW7co-z"
+LOTUSDIS_FULL_MEETING_BYTES = 57_975_721_710
 LOTUSDIS_FULL_MEETING_URL = f"https://drive.google.com/uc?id={LOTUSDIS_FULL_MEETING_ID}&export=download"
 LOTUSDIS_TEXTGRID_URL = f"https://drive.google.com/uc?id={LOTUSDIS_TEXTGRID_ID}&export=download"
 LOTUSDIS_CSV_URL = f"https://drive.google.com/uc?id={LOTUSDIS_CSV_ID}&export=download"
@@ -126,7 +128,8 @@ SOURCES: tuple[SourceSpec, ...] = (
         "CC BY 4.0",
         "https://github.com/microsoft/NOTSOFAR1-Challenge",
         None,
-        "v1.5 1000hrs train only; val stays out; labels from source activity",
+        "v1.5 1000hrs train only; val stays out; labels from source activity; "
+        "Hugging Face css-datasets/v1.5/1000hrs/train is the official packaging when Azure listing is blocked",
         120.0,
     ),
     SourceSpec(
