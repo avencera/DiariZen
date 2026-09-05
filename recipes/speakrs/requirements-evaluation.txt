@@ -1,0 +1,5 @@
+# torchaudio 2.11 delegates audio loading to TorchCodec
+torchcodec==0.13.0
+
+# dscore runtime dependency
+intervaltree>=3,<4
