@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -72,6 +74,9 @@ RELEASE_FILES = (
     "coverage-plan.json",
     "relocation.json",
 )
+LOTUSDIS_VIEW_PREFERENCE = ("jbl", "bt3m", "bt10m", "con123")
+NOTSOFAR_SIM_MIXTURE_CHANNELS = 7
+NOTSOFAR_SIM_SAMPLE_RATE = 16000
 
 
 def _load_module(name: str, path: Path):
@@ -488,6 +493,15 @@ def verify_release(release_root: Path) -> dict[str, object]:
     }
 
 
+def _transcode_stream(stream, dest: Path) -> None:
+    """Write one audio stream as mono 16 kHz FLAC through the shared transcoder."""
+
+    module = _load_module("prepare_full_corpus", RECIPE_DIR / "prepare_full_corpus.py")
+    if module.audio_ready(dest, module.ChannelPolicy.FIRST):
+        return
+    module.transcode(stream, dest, module.ChannelPolicy.FIRST)
+
+
 def _stream_transcode(url: str, dest: Path) -> None:
     """Download one remote audio URL and write mono 16 kHz FLAC."""
 
@@ -510,6 +524,128 @@ def _stream_transcode(url: str, dest: Path) -> None:
         raise PreparationError("audio download failed", {"url": url, "dest": dest.as_posix()})
 
 
+def _pcm_s16le_wav(pcm: bytes, sample_rate: int = NOTSOFAR_SIM_SAMPLE_RATE) -> bytes:
+    """Wrap mono little-endian PCM16 in a WAV header."""
+
+    if len(pcm) % 2:
+        raise PreparationError("pcm16 length is odd", {"bytes": len(pcm)})
+    data_bytes = len(pcm)
+    return (
+        struct.pack(
+            "<4sI4s4sIHHIIHH4sI",
+            b"RIFF",
+            36 + data_bytes,
+            b"WAVE",
+            b"fmt ",
+            16,
+            1,
+            1,
+            sample_rate,
+            sample_rate * 2,
+            2,
+            16,
+            b"data",
+            data_bytes,
+        )
+        + pcm
+    )
+
+
+def _interleaved_s16le_channel0(pcm: bytes, channels: int) -> bytes:
+    """Keep the first mixture microphone from interleaved int16 frames."""
+
+    if channels < 1:
+        raise PreparationError("mixture channel count is invalid", {"channels": channels})
+    frame = 2 * channels
+    if len(pcm) % frame:
+        raise PreparationError(
+            "mixture pcm length is not aligned",
+            {"bytes": len(pcm), "channels": channels},
+        )
+    if channels == 1:
+        return pcm
+    frames = len(pcm) // frame
+    out = bytearray(frames * 2)
+    for index in range(frames):
+        src = index * frame
+        out[index * 2 : index * 2 + 2] = pcm[src : src + 2]
+    return bytes(out)
+
+
+def _lotusdis_member_identity(name: str) -> tuple[str, str] | None:
+    path = Path(name)
+    if path.suffix.lower() != ".wav":
+        return None
+    match = re.match(r"(Hijack_S\d+_T\d+)_(.+)$", path.stem, re.IGNORECASE)
+    if match is None:
+        return None
+    return match.group(1), match.group(2).lower()
+
+
+def _lotusdis_select_view(members: Iterable[str], parent_id: str) -> str:
+    """Pick jbl, then bt3m, bt10m, con123, then the first non-lavalier view."""
+
+    by_device: dict[str, str] = {}
+    for member in members:
+        parsed = _lotusdis_member_identity(member)
+        if parsed is None:
+            continue
+        meeting, device = parsed
+        if meeting != parent_id:
+            continue
+        by_device[device] = member
+    if not by_device:
+        raise PreparationError("LOTUSDIS parent has no audio", {"parent_id": parent_id})
+    for preferred in LOTUSDIS_VIEW_PREFERENCE:
+        if preferred in by_device:
+            return by_device[preferred]
+    eligible = sorted(device for device in by_device if not device.startswith("lav"))
+    if not eligible:
+        raise PreparationError("LOTUSDIS parent has only lavalier views", {"parent_id": parent_id})
+    return by_device[eligible[0]]
+
+
+def _extract_sim_tar(archive: Path, audio_root: Path) -> list[str]:
+    """Write mixture-channel-0 FLACs from one official CSS train tar."""
+
+    audio_root.mkdir(parents=True, exist_ok=True)
+    written: list[str] = []
+    pending_id = None
+    pending_channels = NOTSOFAR_SIM_MIXTURE_CHANNELS
+    with tarfile.open(archive) as tar:
+        for member in tar:
+            name = member.name
+            if member.isfile() and name.endswith(".json") and not name.endswith("utterances.map"):
+                handle = tar.extractfile(member)
+                if handle is None:
+                    raise PreparationError("simulated json member is unreadable", {"name": name})
+                payload = json.loads(handle.read().decode("utf-8"))
+                pending_id = Path(name).stem
+                shape = payload.get("columns", {}).get("mixture", {}).get("shape") or [
+                    0,
+                    NOTSOFAR_SIM_MIXTURE_CHANNELS,
+                ]
+                pending_channels = int(shape[1]) if len(shape) > 1 else NOTSOFAR_SIM_MIXTURE_CHANNELS
+                continue
+            if not (member.isfile() and name.endswith(".mixture")):
+                continue
+            utterance_id = Path(name).stem
+            dest = audio_root / f"{utterance_id}.flac"
+            if dest.is_file():
+                written.append(utterance_id)
+                continue
+            handle = tar.extractfile(member)
+            if handle is None:
+                raise PreparationError("simulated mixture member is unreadable", {"name": name})
+            channels = pending_channels if pending_id == utterance_id else NOTSOFAR_SIM_MIXTURE_CHANNELS
+            pcm = _interleaved_s16le_channel0(handle.read(), channels)
+            _transcode_stream(io.BytesIO(_pcm_s16le_wav(pcm)), dest)
+            written.append(utterance_id)
+    if not written:
+        raise PreparationError("simulated tar produced no mixture audio", {"archive": archive.as_posix()})
+    return written
+
+
 def _flac_sample_count(path: Path) -> int:
     result = subprocess.run(
         [
@@ -521,7 +657,7 @@ def _flac_sample_count(path: Path) -> int:
             "-show_entries",
             "stream=duration,sample_rate",
             "-of",
-            "default=noprint_wrappers=1:nokey=1",
+            "default=noprint_wrappers=1",
             path.as_posix(),
         ],
         check=False,
@@ -529,12 +665,16 @@ def _flac_sample_count(path: Path) -> int:
         text=True,
         env=scrubbed_environment(),
     )
-    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    if result.returncode != 0 or len(lines) < 2:
+    fields = {}
+    for line in result.stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            fields[key.strip()] = value.strip()
+    if result.returncode != 0 or "duration" not in fields or "sample_rate" not in fields:
         raise PreparationError(
             "cannot probe prepared audio", {"path": path.as_posix(), "stderr": result.stderr[-200:]}
         )
-    duration, rate = float(lines[0]), int(float(lines[1]))
+    duration, rate = float(fields["duration"]), int(float(fields["sample_rate"]))
     return int(round(duration * rate))
 
 
@@ -716,9 +856,7 @@ def prepare_notsofar_sim(spec) -> dict[str, Any]:
     parents = sorted(listing)
     if not parents:
         raise PreparationError("NOTSOFAR simulated train listing is empty")
-    rows = [
-        _fixture_row("NOTSOFAR_sim", "train", parent_id, label_tier="bronze", language="en") for parent_id in parents
-    ]
+    rows = _materialize_notsofar_sim_audio(spec, cache, parents)
     return {
         "recordings": rows,
         "splits": {"NOTSOFAR_sim": {"train": parents, "dev": [], "test": []}},
@@ -729,6 +867,57 @@ def prepare_notsofar_sim(spec) -> dict[str, Any]:
             }
         ],
     }
+
+
+def _materialize_notsofar_sim_audio(spec, cache: Path, parents: list[str]) -> list[dict[str, Any]]:
+    """Download official tars one at a time and keep mixture channel 0 only."""
+
+    audio_root = spec.relocation.audio_root / "NOTSOFAR_sim"
+    audio_root.mkdir(parents=True, exist_ok=True)
+    resolve = f"https://huggingface.co/datasets/{NOTSOFAR_HF_DATASET}/resolve/main/{NOTSOFAR_SIM_HF_PREFIX}"
+    index_path = cache / "hf-train-maps.jsonl"
+    tar_items = []
+    if index_path.is_file():
+        for line in index_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                tar_items.append(json.loads(line))
+    if not tar_items:
+        raise PreparationError("simulated tar map index is missing", {"path": index_path.as_posix()})
+    rows_by_id: dict[str, dict[str, Any]] = {}
+    for item in sorted(tar_items, key=lambda row: int(row.get("index", 0))):
+        ids = list(item.get("ids") or [])
+        tar_name = item.get("name") or f"dataset-{int(item['index']):06d}.tar"
+        missing = [utterance_id for utterance_id in ids if not (audio_root / f"{utterance_id}.flac").is_file()]
+        if missing:
+            tar_path = cache / tar_name
+            if not tar_path.is_file():
+                _curl(f"{resolve}/{tar_name}", tar_path)
+            _extract_sim_tar(tar_path, audio_root)
+            tar_path.unlink(missing_ok=True)
+        for utterance_id in ids:
+            dest = audio_root / f"{utterance_id}.flac"
+            if not dest.is_file():
+                raise PreparationError(
+                    "simulated utterance audio is missing after extract",
+                    {"id": utterance_id, "tar": tar_name},
+                )
+            rows_by_id[utterance_id] = _row_from_audio(
+                "NOTSOFAR_sim",
+                "train",
+                utterance_id,
+                dest,
+                label_tier="bronze",
+                language="en",
+                device_view="mixture_ch0",
+                transformations=["css_mixture_channel0", "mono_16k_flac"],
+            )
+    missing_parents = [parent_id for parent_id in parents if parent_id not in rows_by_id]
+    if missing_parents:
+        raise PreparationError(
+            "simulated train listing is missing prepared audio",
+            {"count": len(missing_parents), "examples": missing_parents[:10]},
+        )
+    return [rows_by_id[parent_id] for parent_id in parents]
 
 
 def prepare_icsi(spec) -> dict[str, Any]:
@@ -803,19 +992,7 @@ def prepare_lotusdis(spec) -> dict[str, Any]:
             zipped.extractall(cache / "extracted")
     rows_meta = _parse_lotusdis_csv(csv_dir)
     parts = _lotusdis_reconcile(rows_meta)
-    rows = []
-    for split, ids in parts.items():
-        for parent_id in ids:
-            rows.append(
-                _fixture_row(
-                    "LOTUSDIS",
-                    split,
-                    parent_id,
-                    device_view="jbl",
-                    language="th",
-                )
-            )
-    if not rows:
+    if not any(parts.values()):
         raise PreparationError("LOTUSDIS produced no parent meetings")
     meeting_zip = cache / "wav.zip"
     if not meeting_zip.is_file() or meeting_zip.stat().st_size != LOTUSDIS_FULL_MEETING_BYTES:
@@ -825,6 +1002,7 @@ def prepare_lotusdis(spec) -> dict[str, Any]:
             LOTUSDIS_FULL_MEETING_BYTES,
             cookies=cache / "gdrive.cookies",
         )
+    rows = _materialize_lotusdis_audio(spec, meeting_zip, parts)
     sources = [
         {
             "name": "lotusdis-csv",
@@ -841,6 +1019,38 @@ def prepare_lotusdis(spec) -> dict[str, Any]:
         "splits": {"LOTUSDIS": {split: list(ids) for split, ids in parts.items()}},
         "sources": sources,
     }
+
+
+def _materialize_lotusdis_audio(spec, meeting_zip: Path, parts: dict[str, tuple[str, ...]]) -> list[dict[str, Any]]:
+    """Transcode the preferred device view for every parent meeting."""
+
+    audio_root = spec.relocation.audio_root / "LOTUSDIS"
+    audio_root.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(meeting_zip) as zipped:
+        members = zipped.namelist()
+        rows = []
+        for split, ids in parts.items():
+            for parent_id in ids:
+                member = _lotusdis_select_view(members, parent_id)
+                identity = _lotusdis_member_identity(member)
+                if identity is None:
+                    raise PreparationError("LOTUSDIS member is not a parent view", {"member": member})
+                dest = audio_root / f"{parent_id}.flac"
+                if not dest.is_file():
+                    with zipped.open(member) as handle:
+                        _transcode_stream(handle, dest)
+                rows.append(
+                    _row_from_audio(
+                        "LOTUSDIS",
+                        split,
+                        parent_id,
+                        dest,
+                        device_view=identity[1],
+                        language="th",
+                        transformations=["preferred_device_view", "mono_16k_flac"],
+                    )
+                )
+    return rows
 
 
 def _gdown(file_id: str, destination: Path) -> None:

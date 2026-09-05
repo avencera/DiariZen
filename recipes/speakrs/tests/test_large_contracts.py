@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -146,6 +147,116 @@ class LotusdisParentTest(unittest.TestCase):
             {(row["parent_id"], row["split"]) for row in rows},
             {("Hijack_S001_T057", "train"), ("Hijack_S081_T069", "dev"), ("Hijack_S010_T038", "test")},
         )
+
+
+class LotusdisViewTest(unittest.TestCase):
+    def test_prefers_jbl_then_rejects_lavalier_only(self):
+        import zipfile
+        from dataclasses import replace
+
+        from recipes.speakrs.large.prepare import (
+            _flac_sample_count,
+            _lotusdis_select_view,
+            _materialize_lotusdis_audio,
+            _pcm_s16le_wav,
+        )
+
+        members = [
+            "wav/Hijack_S001_T057/Hijack_S001_T057_Lav1.wav",
+            "wav/Hijack_S001_T057/Hijack_S001_T057_Bt3m.wav",
+            "wav/Hijack_S001_T057/Hijack_S001_T057_Jbl.wav",
+            "wav/Hijack_S002_T001/Hijack_S002_T001_Con123.wav",
+        ]
+        self.assertTrue(_lotusdis_select_view(members, "Hijack_S001_T057").endswith("Jbl.wav"))
+        self.assertTrue(_lotusdis_select_view(members, "Hijack_S002_T001").endswith("Con123.wav"))
+        with self.assertRaises(PreparationError):
+            _lotusdis_select_view(
+                ["wav/Hijack_S003_T001/Hijack_S003_T001_Lav1.wav"],
+                "Hijack_S003_T001",
+            )
+        wav = _pcm_s16le_wav((1000).to_bytes(2, "little", signed=True) * 160)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "wav.zip"
+            with zipfile.ZipFile(archive, "w") as zipped:
+                zipped.writestr("wav/Hijack_S001_T057/Hijack_S001_T057_Lav1.wav", wav)
+                zipped.writestr("wav/Hijack_S001_T057/Hijack_S001_T057_Jbl.wav", wav)
+            base = parse_spec(json.loads(SPEC_PATH.read_text(encoding="utf-8")))
+            spec = replace(base, relocation=replace(base.relocation, audio_root=root / "audio"))
+            rows = _materialize_lotusdis_audio(
+                spec,
+                archive,
+                {"train": ("Hijack_S001_T057",), "dev": (), "test": ()},
+            )
+            self.assertEqual(rows[0]["device_view"], "jbl")
+            self.assertEqual(_flac_sample_count(root / "audio" / "LOTUSDIS" / "Hijack_S001_T057.flac"), 160)
+
+
+class NotsofarSimExtractTest(unittest.TestCase):
+    def test_extracts_mixture_channel0_through_shared_transcode(self):
+        import io
+        import tarfile
+
+        from recipes.speakrs.large.prepare import (
+            _extract_sim_tar,
+            _flac_sample_count,
+            _interleaved_s16le_channel0,
+            _pcm_s16le_wav,
+        )
+
+        frames = 160
+        channels = 7
+        pcm = b""
+        for _ in range(frames):
+            pcm += (1000).to_bytes(2, "little", signed=True)
+            pcm += b"\x00\x00" * (channels - 1)
+        self.assertEqual(
+            _interleaved_s16le_channel0(pcm, channels),
+            (1000).to_bytes(2, "little", signed=True) * frames,
+        )
+        payload = json.dumps({"columns": {"mixture": {"dtype": "int16", "shape": [frames, channels]}}}).encode("utf-8")
+        mapping = json.dumps({"utt-ch0": frames}).encode("utf-8")
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "dataset-000000.tar"
+            audio_root = Path(temporary) / "audio"
+            with tarfile.open(archive, "w") as tar:
+                map_info = tarfile.TarInfo("utterances.map")
+                map_info.size = len(mapping)
+                tar.addfile(map_info, io.BytesIO(mapping))
+                json_info = tarfile.TarInfo("utt-ch0.json")
+                json_info.size = len(payload)
+                tar.addfile(json_info, io.BytesIO(payload))
+                mix_info = tarfile.TarInfo("utt-ch0.mixture")
+                mix_info.size = len(pcm)
+                tar.addfile(mix_info, io.BytesIO(pcm))
+            written = _extract_sim_tar(archive, audio_root)
+            dest = audio_root / "utt-ch0.flac"
+            self.assertEqual(written, ["utt-ch0"])
+            self.assertTrue(dest.is_file())
+            self.assertEqual(_flac_sample_count(dest), frames)
+            self.assertGreater(len(_pcm_s16le_wav(pcm[:2])), 44)
+            from dataclasses import replace
+
+            from recipes.speakrs.large.prepare import _materialize_notsofar_sim_audio
+
+            cache = Path(temporary) / "cache"
+            cache.mkdir()
+            shutil.copy2(archive, cache / "dataset-000000.tar")
+            (cache / "hf-train-maps.jsonl").write_text(
+                json.dumps({"index": 0, "name": "dataset-000000.tar", "ids": ["utt-ch0"]}) + "\n",
+                encoding="utf-8",
+            )
+            base = parse_spec(json.loads(SPEC_PATH.read_text(encoding="utf-8")))
+            spec = replace(
+                base,
+                relocation=replace(base.relocation, audio_root=Path(temporary) / "prepared", source_cache=cache),
+            )
+            rows = _materialize_notsofar_sim_audio(spec, cache, ["utt-ch0"])
+            self.assertEqual(rows[0]["device_view"], "mixture_ch0")
+            self.assertEqual(
+                _flac_sample_count(Path(temporary) / "prepared" / "NOTSOFAR_sim" / "utt-ch0.flac"), frames
+            )
+            self.assertFalse((cache / "dataset-000000.tar").exists())
 
 
 class NotsofarSimMapTest(unittest.TestCase):
