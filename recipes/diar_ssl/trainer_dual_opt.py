@@ -1,23 +1,25 @@
 # Licensed under the MIT license.
 # Copyright 2024 Brno University of Technology (author: Jiangyu Han, ihan@fit.vut.cz)
 
-import torch
+import json
+
 import numpy as np
-
+import torch
 from accelerate.logging import get_logger
-
-from pyannote.audio.utils.permutation import permutate
 from pyannote.audio.utils.loss import nll_loss
+from pyannote.audio.utils.permutation import permutate
 
 from diarizen.trainer_dual_opt import Trainer as BaseTrainer
 
+
 logger = get_logger(__name__)
+
 
 class Trainer(BaseTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.accelerator.print(self.model)
-        
+
         # auto GN
         self.grad_history = []
 
@@ -27,8 +29,8 @@ class Trainer(BaseTrainer):
             if p.grad is not None:
                 param_norm = p.grad.data.norm(2)
                 total_norm += param_norm.item() ** 2
-        total_norm = total_norm ** (1. / 2)
-        return total_norm 
+        total_norm = total_norm ** (1.0 / 2)
+        return total_norm
 
     def auto_clip_grad_norm_(self, model):
         grad_norm = self.compute_grad_norm(model)
@@ -36,71 +38,63 @@ class Trainer(BaseTrainer):
         if len(self.grad_history) > self.gradient_history_size:
             self.grad_history.pop(0)
         clip_value = np.percentile(self.grad_history, self.gradient_percentile)
-        self.accelerator.clip_grad_norm_(model.parameters(), clip_value)  
+        self.accelerator.clip_grad_norm_(model.parameters(), clip_value)
 
     def training_step(self, batch, batch_idx):
-        self.optimizer_small.zero_grad()
-        self.optimizer_big.zero_grad()
-
-        xs, target = batch['xs'], batch['ts'] 
+        xs, target = batch["xs"], batch["ts"]
         y_pred = self.model(xs)
         # powerset
         multilabel = self.unwrap_model.powerset.to_multilabel(y_pred)
         permutated_target, _ = permutate(multilabel, target)
-        permutated_target_powerset = self.unwrap_model.powerset.to_powerset(
-            permutated_target.float()
-        )
-       
-        loss = nll_loss(
-            y_pred,
-            torch.argmax(permutated_target_powerset, dim=-1)
-        )
-        
+        permutated_target_powerset = self.unwrap_model.powerset.to_powerset(permutated_target.float())
+
+        loss = nll_loss(y_pred, torch.argmax(permutated_target_powerset, dim=-1))
+
         # skip batch if something went wrong for some reason
         if torch.isnan(loss):
             return None
-        
+
         self.accelerator.backward(loss)
 
         if self.accelerator.sync_gradients:
             # The gradients are added across all processes in this cumulative gradient accumulation step.
             self.auto_clip_grad_norm_(self.model)
-                               
+
         self.optimizer_small.step()
         self.optimizer_big.step()
-        
+        # accelerate defers these calls until the synchronized optimizer step
+        # clearing at the start of that step discards earlier micro-batch gradients
+        self.optimizer_small.zero_grad()
+        self.optimizer_big.zero_grad()
+
         return {"Loss": loss.detach().float()}
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        xs, target = batch['xs'], batch['ts'] 
+        xs, target = batch["xs"], batch["ts"]
         sil_all_target = torch.zeros_like(target)
 
         y_pred = self.model(xs)
         # powerset
         multilabel = self.unwrap_model.powerset.to_multilabel(y_pred)
         permutated_target, _ = permutate(multilabel, target)
-        permutated_target_powerset = self.unwrap_model.powerset.to_powerset(
-            permutated_target.float()
-        )
+        permutated_target_powerset = self.unwrap_model.powerset.to_powerset(permutated_target.float())
 
-        loss = nll_loss(y_pred,
-            torch.argmax(permutated_target_powerset, dim=-1)
-        )
+        loss = nll_loss(y_pred, torch.argmax(permutated_target_powerset, dim=-1))
         val_metrics = self.unwrap_model.validation_metric(
             torch.transpose(multilabel, 1, 2),
             torch.transpose(target, 1, 2),
         )
 
         if not torch.equal(target, sil_all_target):
-            val_DER = val_metrics['DiarizationErrorRate']
-            val_FA = val_metrics['DiarizationErrorRate/FalseAlarm']
-            val_Miss = val_metrics['DiarizationErrorRate/Miss']
-            val_Confusion = val_metrics['DiarizationErrorRate/Confusion']
+            val_DER = val_metrics["DiarizationErrorRate"]
+            val_FA = val_metrics["DiarizationErrorRate/FalseAlarm"]
+            val_Miss = val_metrics["DiarizationErrorRate/Miss"]
+            val_Confusion = val_metrics["DiarizationErrorRate/Confusion"]
         else:
-            val_DER = torch.zeros_like(val_metrics['DiarizationErrorRate'])
-            val_FA = torch.zeros_like(val_metrics['DiarizationErrorRate/FalseAlarm'])
-            val_Miss = torch.zeros_like(val_metrics['DiarizationErrorRate/Miss'])
-            val_Confusion = torch.zeros_like(val_metrics['DiarizationErrorRate/Confusion'])
+            val_DER = torch.zeros_like(val_metrics["DiarizationErrorRate"])
+            val_FA = torch.zeros_like(val_metrics["DiarizationErrorRate/FalseAlarm"])
+            val_Miss = torch.zeros_like(val_metrics["DiarizationErrorRate/Miss"])
+            val_Confusion = torch.zeros_like(val_metrics["DiarizationErrorRate/Confusion"])
 
         return {
             "Loss": loss.detach().float(),
@@ -112,16 +106,42 @@ class Trainer(BaseTrainer):
 
     def validation_epoch_end(self, validation_epoch_output):
         metric_keys = validation_epoch_output[0].keys()
+        metric_means = {}
         # Compute mean loss on all loss items on a epoch
         for key in metric_keys:
             metric_items = [step_out[key] for step_out in validation_epoch_output]  # float
             metric_mean = sum(metric_items) / len(metric_items)
-            if key == "Loss":
-                Loss_val = metric_mean
-            if key == "DER":
-                DER_val = metric_mean
+            metric_means[key] = metric_mean
             self.writer.add_scalar(f"Validation_Epoch/{key}", metric_mean, self.state.epochs_trained)
-        logger.info(f"Validation Loss/DER on epoch {self.state.epochs_trained}: {round(Loss_val, 3)} / {round(DER_val, 3)}")
+        logger.info(
+            "Validation metrics on epoch %d: Loss=%.6f DER=%.6f FA=%.6f Miss=%.6f Confusion=%.6f",
+            self.state.epochs_trained,
+            metric_means["Loss"],
+            metric_means["DER"],
+            metric_means["FA"],
+            metric_means["Miss"],
+            metric_means["Confusion"],
+        )
+        logger.info(
+            f"Validation Loss/DER on epoch {self.state.epochs_trained}: "
+            f"{round(metric_means['Loss'], 3)} / {round(metric_means['DER'], 3)}"
+        )
+        self._write_validation_metrics(metric_means)
         # metric reset
         self.unwrap_model.validation_metric.reset()
-        return Loss_val
+        return metric_means["Loss"]
+
+    def _write_validation_metrics(self, metric_means):
+        """Write one convergent machine-readable validation record."""
+        path = self.exp_dir / "validation_metrics.json"
+        if path.exists():
+            records = json.loads(path.read_text())
+        else:
+            records = []
+        epoch = self.state.epochs_trained
+        records = [record for record in records if record["epoch"] != epoch]
+        records.append({"epoch": epoch, **metric_means})
+        records.sort(key=lambda record: record["epoch"])
+        temporary = path.with_suffix(".partial.json")
+        temporary.write_text(json.dumps(records, indent=2) + "\n")
+        temporary.replace(path)
