@@ -70,6 +70,8 @@ def _load_module(name: str, path: Path):
     if spec is None or spec.loader is None:
         raise PreparationError(f"cannot load {path}")
     module = importlib.util.module_from_spec(spec)
+    # Dataclasses in the loaded file look up the module in sys.modules.
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 

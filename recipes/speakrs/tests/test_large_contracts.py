@@ -108,6 +108,16 @@ class SpecContractTest(unittest.TestCase):
             parse_kinded_lock({"kind": LAUNCH_KIND}, LAUNCH_KIND)
 
 
+class PublishedCorpusLoaderTest(unittest.TestCase):
+    def test_load_module_registers_dataclasses(self):
+        from recipes.speakrs.large.prepare import _load_published_three_corpus
+
+        published = _load_published_three_corpus()
+        self.assertEqual(len(published["AMI"]["train"]), 134)
+        self.assertEqual(len(published["AliMeeting"]["train"]), 209)
+        self.assertEqual(len(published["AISHELL4"]["train"]), 173)
+
+
 class LotusdisParentTest(unittest.TestCase):
     def test_chunk_path_maps_to_parent_session(self):
         from recipes.speakrs.large.prepare import _lotusdis_parent_id, _parse_lotusdis_csv
