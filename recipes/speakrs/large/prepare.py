@@ -522,7 +522,9 @@ def _flac_sample_count(path: Path) -> int:
     )
     lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     if result.returncode != 0 or len(lines) < 2:
-        raise PreparationError("cannot probe prepared audio", {"path": path.as_posix(), "stderr": result.stderr[-200:]})
+        raise PreparationError(
+            "cannot probe prepared audio", {"path": path.as_posix(), "stderr": result.stderr[-200:]}
+        )
     duration, rate = float(lines[0]), int(float(lines[1]))
     return int(round(duration * rate))
 
@@ -856,7 +858,9 @@ def _parse_lotusdis_csv(path: Path) -> list[dict[str, str]]:
                 parent_id = _lotusdis_parent_id(lowered.get("path") or lowered.get("filename") or "")
                 if parent_id is None:
                     parent_id = lowered.get("session") or lowered.get("meeting") or lowered.get("parent")
-                split = split_from_name if split_from_name in {"train", "dev", "test"} else lowered.get("split") or "train"
+                split = (
+                    split_from_name if split_from_name in {"train", "dev", "test"} else lowered.get("split") or "train"
+                )
                 if not parent_id:
                     continue
                 if split in {"valid"}:
