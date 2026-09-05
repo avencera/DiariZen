@@ -2,34 +2,29 @@
 # Copyright 2024 Hong Kong Polytechnic University (author: Xiang Hao, haoxiangsnr@gmail.com)
 # Copyright 2024 Brno University of Technology (author: Jiangyu Han, ihan@fit.vut.cz)
 
+import json
 import math
 import shutil
 import sys
 import time
-from functools import partial
 from pathlib import Path
 
-import json
-from os.path import join
-
-import librosa
 import pandas as pd
 import toml
 import torch
 from accelerate import Accelerator
 from accelerate.logging import get_logger
+from torch.optim.lr_scheduler import OneCycleLR, ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from torchinfo import summary
 from tqdm.auto import tqdm
 
 from diarizen.logger import TensorboardLogger
+from diarizen.noam_updater import get_rate
 from diarizen.optimization import get_constant_schedule_with_warmup, get_linear_schedule_with_warmup
 from diarizen.trainer_utils import TrainerState
 from diarizen.utils import prepare_empty_dir, print_env
 
-from diarizen.noam_updater import get_rate
-
-from torch.optim.lr_scheduler import ReduceLROnPlateau, OneCycleLR
 
 logger = get_logger(__name__)
 
@@ -77,6 +72,7 @@ class Trainer:
         self.plot_lr = self.trainer_config.get("plot_lr", False)
         self.validation_interval = self.trainer_config.get("validation_interval", 1)
         self.max_num_checkpoints = self.trainer_config.get("max_num_checkpoints", 10)
+        self.ranked_checkpoint_count = self.trainer_config.get("ranked_checkpoint_count", 0)
         self.scheduler_name = self.trainer_config.get("scheduler_name", "constant_schedule_with_warmup")
         self.warmup_steps = self.trainer_config.get("warmup_steps", 0)
         self.warmup_ratio = self.trainer_config.get("warmup_ratio", 0.0)
@@ -94,10 +90,10 @@ class Trainer:
 
         # wavlm
         self.freeze_wavlm = self.trainer_config.get("freeze_wavlm", False)
-        # wavlm 
+        # wavlm
         if self.freeze_wavlm:
             logger.info("Freeze WavLM...")
-            self.unwrap_model.freeze_by_name('wavlm_model')
+            self.unwrap_model.freeze_by_name("wavlm_model")
 
         # Dataset
         self.dataset_config = config["train_dataset"]["args"]
@@ -192,6 +188,7 @@ class Trainer:
         self.exp_dir = self.save_dir / config["meta"]["exp_id"]
 
         self.checkpoints_dir = self.exp_dir / "checkpoints"
+        self.ranked_checkpoints_dir = self.exp_dir / "ranked_checkpoints"
         self.tb_log_dir = self.exp_dir / "tb_log"
 
         # Each run will have a unique source code, config, and log file.
@@ -269,6 +266,40 @@ class Trainer:
                 shutil.rmtree(checkpoint_dir.as_posix())
                 logger.info(f"Checkpoint {checkpoint_dir.as_posix()} is removed.")
 
+    def _save_ranked_checkpoint(self, epoch: int, score: float) -> None:
+        """Keep model-only checkpoints for the best validation scores."""
+        if self.ranked_checkpoint_count <= 0:
+            return
+
+        self.ranked_checkpoints_dir.mkdir(parents=True, exist_ok=True)
+        index_path = self.ranked_checkpoints_dir / "index.json"
+        if index_path.exists():
+            records = json.loads(index_path.read_text())
+        else:
+            records = []
+        records = [record for record in records if record["epoch"] != epoch]
+        records.append({"epoch": epoch, "score": float(score)})
+        records.sort(key=lambda record: record["score"], reverse=self.save_max_score)
+
+        retained = records[: self.ranked_checkpoint_count]
+        retained_epochs = {record["epoch"] for record in retained}
+        checkpoint_dir = self.ranked_checkpoints_dir / f"epoch_{epoch:04d}"
+        if epoch in retained_epochs:
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            temporary = checkpoint_dir / "pytorch_model.partial.bin"
+            target = checkpoint_dir / "pytorch_model.bin"
+            state_dict = self.accelerator.get_state_dict(self.model)
+            self.accelerator.save(state_dict, temporary)
+            temporary.replace(target)
+
+        for record in records[self.ranked_checkpoint_count :]:
+            discarded = self.ranked_checkpoints_dir / f"epoch_{record['epoch']:04d}"
+            if discarded.exists():
+                shutil.rmtree(discarded)
+
+        temporary_index = index_path.with_suffix(".partial.json")
+        temporary_index.write_text(json.dumps(retained, indent=2) + "\n")
+        temporary_index.replace(index_path)
 
     @staticmethod
     def get_warmup_steps(warmup_steps, max_steps, warmup_ratio):
@@ -302,7 +333,9 @@ class Trainer:
         self.lr_scheduler_big = self.create_warmup_scheduler(
             optimizer=self.optimizer_big, scheduler_name=self.scheduler_name, max_steps=max_steps
         )
-        self.lr_scheduler_small, self.lr_scheduler_big = self.accelerator.prepare(self.lr_scheduler_small, self.lr_scheduler_big)
+        self.lr_scheduler_small, self.lr_scheduler_big = self.accelerator.prepare(
+            self.lr_scheduler_small, self.lr_scheduler_big
+        )
 
     def set_models_to_train_mode(self):
         """Set models to train mode.
@@ -316,7 +349,7 @@ class Trainer:
         self.model.eval()
 
     def get_optimizer_lr(self, optimizer):
-        return optimizer.state_dict()['param_groups'][0]['lr']
+        return optimizer.state_dict()["param_groups"][0]["lr"]
 
     def lr_scheduler_step(self):
         """Step the lr scheduler.
@@ -329,18 +362,10 @@ class Trainer:
 
     def create_lr_decay_scheduler(self):
         self.lr_decay_scheduler_small = ReduceLROnPlateau(
-            optimizer=self.optimizer_small,
-            mode='min',
-            factor=0.95,
-            patience=self.lr_decay_patience,
-            min_lr=1e-8
+            optimizer=self.optimizer_small, mode="min", factor=0.95, patience=self.lr_decay_patience, min_lr=1e-8
         )
         self.lr_decay_scheduler_big = ReduceLROnPlateau(
-            optimizer=self.optimizer_big,
-            mode='min',
-            factor=0.95,
-            patience=self.lr_decay_patience,
-            min_lr=1e-8
+            optimizer=self.optimizer_big, mode="min", factor=0.95, patience=self.lr_decay_patience, min_lr=1e-8
         )
         self.lr_decay_scheduler_small, self.lr_decay_scheduler_big = self.accelerator.prepare(
             self.lr_decay_scheduler_small, self.lr_decay_scheduler_big
@@ -348,14 +373,10 @@ class Trainer:
 
     def create_lr_one_cycle_scheduler(self, max_steps):
         self.lr_one_cycle_scheduler_small = OneCycleLR(
-            optimizer=self.optimizer_small,
-            max_lr=self.get_optimizer_lr(self.optimizer_small),
-            total_steps=max_steps
+            optimizer=self.optimizer_small, max_lr=self.get_optimizer_lr(self.optimizer_small), total_steps=max_steps
         )
         self.lr_one_cycle_scheduler_big = OneCycleLR(
-            optimizer=self.optimizer_big,
-            max_lr=self.get_optimizer_lr(self.optimizer_big),
-            total_steps=max_steps
+            optimizer=self.optimizer_big, max_lr=self.get_optimizer_lr(self.optimizer_big), total_steps=max_steps
         )
         self.lr_one_cycle_scheduler_small, self.lr_one_cycle_scheduler_big = self.accelerator.prepare(
             self.lr_one_cycle_scheduler_small, self.lr_one_cycle_scheduler_big
@@ -365,7 +386,7 @@ class Trainer:
         bar_desc = ""
         for k, v in loss_dict.items():
             bar_desc += f"{k}: {(v):.4f}, "
-        bar_desc += f"norm: {norm:.4f}, " f"lr: {self.lr_scheduler.get_last_lr()[-1]:.10f}"
+        bar_desc += f"norm: {norm:.4f}, lr: {self.lr_scheduler.get_last_lr()[-1]:.10f}"
 
         # plot norm
         if self.plot_norm:
@@ -392,10 +413,10 @@ class Trainer:
 
             .. code-block:: python
 
-                    self.optimizer.zero_grad()
                     loss = training_step(batch, batch_idx)
                     self.accelerator.backward(loss)
                     self.optimizer.step()
+                    self.optimizer.zero_grad()
 
                     return {
                         "loss": loss,
@@ -433,12 +454,14 @@ class Trainer:
             self._load_checkpoint(ckpt_path="latest")
 
         # # validation 0 epoch performance
-        if self.validation_before_training:
+        if self.validation_before_training and not self.resume:
             with torch.no_grad():
                 logger.info("Validation on ZERO epoch...")
                 score = self.validate(validation_dataloader)
             if self.accelerator.is_local_main_process:
                 self._save_checkpoint(epoch=0, is_best_epoch=False)
+                self._save_ranked_checkpoint(epoch=0, score=score)
+                self._run_early_stop_check(score)
 
         for epoch in range(self.state.epochs_trained + 1, max_epochs + 1):
             logger.info(f"{'=' * 9} Epoch {epoch} out of {max_epochs} {'=' * 9}")
@@ -477,8 +500,8 @@ class Trainer:
                             self.lr_scheduler_step()
 
                         if self.use_one_cycle_lr:
-                            self.lr_one_cycle_scheduler_small.step() 
-                            self.lr_one_cycle_scheduler_big.step() 
+                            self.lr_one_cycle_scheduler_small.step()
+                            self.lr_one_cycle_scheduler_big.step()
 
                 self.state.steps_trained += 1
             self.state.epochs_trained += 1
@@ -487,22 +510,22 @@ class Trainer:
             # Should save, evaluate, and early stop?
             if self.accelerator.is_local_main_process and epoch % self.save_ckpt_interval == 0:
                 self._save_checkpoint(epoch, is_best_epoch=False)
-    
+
             if epoch % self.validation_interval == 0:
                 with torch.no_grad():
                     logger.info("Training finished, begin validation...")
                     score = self.validate(validation_dataloader)
 
                     if self.accelerator.is_local_main_process:
-
                         if self.lr_decay:
                             self.lr_decay_scheduler_small.step(score)
                             self.lr_decay_scheduler_big.step(score)
 
+                        self._save_ranked_checkpoint(epoch=epoch, score=score)
                         should_stop = self._run_early_stop_check(score)
                         if should_stop:
                             early_stop_mark += 1
-                    
+
                     logger.info("Validation finished.")
 
             self.accelerator.wait_for_everyone()
@@ -514,7 +537,8 @@ class Trainer:
             # If any process triggers early stopping, stop training
             if reduced_early_stop_mark != 0:
                 break
-        
+
+        logger.info(f"Training loop finished at epoch {self.state.epochs_trained}.")
 
     @torch.no_grad()
     def validate(self, dataloader):
@@ -553,8 +577,7 @@ class Trainer:
             }
             """
             gathered_step_output = {
-                k: self.accelerator.gather_for_metrics(v).mean().item()
-                for k, v in step_output.items()
+                k: self.accelerator.gather_for_metrics(v).mean().item() for k, v in step_output.items()
             }
             validation_output.append(gathered_step_output)
 
@@ -657,8 +680,10 @@ class Trainer:
             if self.accelerator.is_local_main_process:
                 logger.info(f"Training Loss '{key}' on epoch {self.state.epochs_trained}: {loss_mean}")
                 self.writer.add_scalar(f"Train_Epoch/{key}", loss_mean, self.state.epochs_trained)
-                self.writer.add_scalar(f"Train_Epoch/lr_small", get_rate(self.optimizer_small), self.state.epochs_trained)
-                self.writer.add_scalar(f"Train_Epoch/lr_big", get_rate(self.optimizer_big), self.state.epochs_trained)
+                self.writer.add_scalar(
+                    "Train_Epoch/lr_small", get_rate(self.optimizer_small), self.state.epochs_trained
+                )
+                self.writer.add_scalar("Train_Epoch/lr_big", get_rate(self.optimizer_big), self.state.epochs_trained)
 
     def validation_step(self, batch, batch_idx):
         """Implement a validation step for validating a model on all processes.

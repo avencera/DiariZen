@@ -42,6 +42,7 @@ class Model(BaseModel):
         num_channels: int = 8,
         selected_channel: int = 0,
         sample_rate: int = 16000,
+        strict_wavlm_load: bool = False,
     ):
         super().__init__(
             num_channels=num_channels,
@@ -55,7 +56,7 @@ class Model(BaseModel):
         self.selected_channel = selected_channel
 
         # wavlm 
-        self.wavlm_model = self.load_wavlm(wavlm_src)
+        self.wavlm_model = self.load_wavlm(wavlm_src, strict=strict_wavlm_load)
         self.weight_sum = nn.Linear(wavlm_layer_num, 1, bias=False)
 
         self.proj = nn.Linear(wavlm_feat_dim, attention_in)
@@ -189,7 +190,7 @@ class Model(BaseModel):
         step=receptive_field_step / self.sample_rate
         return num_frames, duration, step
 
-    def load_wavlm(self, source: str):
+    def load_wavlm(self, source: str, strict: bool = False):
         """
         Load a WavLM model from either a config name or a checkpoint file.
 
@@ -218,7 +219,7 @@ class Model(BaseModel):
                     raise ValueError(f"Pruning must be disabled. Found: {k}={v}")
 
             model = wavlm_model(**ckpt["config"])
-            model.load_state_dict(ckpt["state_dict"], strict=False)
+            model.load_state_dict(ckpt["state_dict"], strict=strict)
 
         else:
             # Load from predefined config

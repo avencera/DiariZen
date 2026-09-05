@@ -23,7 +23,7 @@
 import itertools
 import math
 import random
-from typing import Dict, Sequence, Union
+from typing import Dict, NamedTuple, Sequence, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -31,9 +31,21 @@ import torch
 from pyannote.database.protocol.protocol import Scope, Subset
 from pytorch_lightning.loggers import MLFlowLogger, TensorBoardLogger
 from torch.utils.data._utils.collate import default_collate
-from torchaudio import AudioMetaData
 from torchmetrics import Metric
 from torchmetrics.classification import BinaryAUROC, MulticlassAUROC, MultilabelAUROC
+
+try:
+    from torchaudio import AudioMetaData
+except ImportError:
+
+    class AudioMetaData(NamedTuple):
+        """Compatibility metadata for torchaudio versions without AudioMetaData."""
+
+        sample_rate: int
+        num_frames: int
+        num_channels: int
+        bits_per_sample: int
+        encoding: str
 
 from pyannote.audio.core.task import Problem, Task, get_dtype
 from pyannote.audio.utils.random import create_rng_for_worker

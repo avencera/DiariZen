@@ -6,30 +6,24 @@ import math
 import shutil
 import sys
 import time
-from functools import partial
 from pathlib import Path
 
-import json
-from os.path import join
-
-import librosa
 import pandas as pd
 import toml
 import torch
 from accelerate import Accelerator
 from accelerate.logging import get_logger
+from torch.optim.lr_scheduler import OneCycleLR, ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from torchinfo import summary
 from tqdm.auto import tqdm
 
 from diarizen.logger import TensorboardLogger
+from diarizen.noam_updater import get_rate
 from diarizen.optimization import get_constant_schedule_with_warmup, get_linear_schedule_with_warmup
 from diarizen.trainer_utils import TrainerState
 from diarizen.utils import prepare_empty_dir, print_env
 
-from diarizen.noam_updater import get_rate
-
-from torch.optim.lr_scheduler import ReduceLROnPlateau, OneCycleLR
 
 logger = get_logger(__name__)
 
@@ -107,10 +101,10 @@ class Trainer:
 
         # wavlm
         self.freeze_wavlm = self.trainer_config.get("freeze_wavlm", False)
-        # wavlm 
+        # wavlm
         if self.freeze_wavlm:
             logger.info("Freeze WavLM...")
-            self.unwrap_model.freeze_by_name('wavlm_model')
+            self.unwrap_model.freeze_by_name("wavlm_model")
 
         # Dataset
         self.dataset_config = config["train_dataset"]["args"]
@@ -282,7 +276,6 @@ class Trainer:
                 shutil.rmtree(checkpoint_dir.as_posix())
                 logger.info(f"Checkpoint {checkpoint_dir.as_posix()} is removed.")
 
-
     @staticmethod
     def get_warmup_steps(warmup_steps, max_steps, warmup_ratio):
         if warmup_steps > 0:
@@ -326,7 +319,7 @@ class Trainer:
         self.model.eval()
 
     def get_optimizer_lr(self, optimizer):
-        return optimizer.state_dict()['param_groups'][0]['lr']
+        return optimizer.state_dict()["param_groups"][0]["lr"]
 
     def lr_scheduler_step(self):
         """Step the lr scheduler.
@@ -338,19 +331,13 @@ class Trainer:
 
     def create_lr_decay_scheduler(self):
         self.lr_decay_scheduler = ReduceLROnPlateau(
-            optimizer=self.optimizer,
-            mode='min',
-            factor=0.95,
-            patience=self.lr_decay_patience,
-            min_lr=1e-8
+            optimizer=self.optimizer, mode="min", factor=0.95, patience=self.lr_decay_patience, min_lr=1e-8
         )
         self.lr_decay_scheduler = self.accelerator.prepare(self.lr_decay_scheduler)
 
     def create_lr_one_cycle_scheduler(self, max_steps):
         self.lr_one_cycle_scheduler = OneCycleLR(
-            optimizer=self.optimizer,
-            max_lr=self.get_optimizer_lr(self.optimizer),
-            total_steps=max_steps
+            optimizer=self.optimizer, max_lr=self.get_optimizer_lr(self.optimizer), total_steps=max_steps
         )
         self.lr_one_cycle_scheduler = self.accelerator.prepare(self.lr_one_cycle_scheduler)
 
@@ -358,7 +345,7 @@ class Trainer:
         bar_desc = ""
         for k, v in loss_dict.items():
             bar_desc += f"{k}: {(v):.4f}, "
-        bar_desc += f"norm: {norm:.4f}, " f"lr: {self.lr_scheduler.get_last_lr()[-1]:.10f}"
+        bar_desc += f"norm: {norm:.4f}, lr: {self.lr_scheduler.get_last_lr()[-1]:.10f}"
 
         # plot norm
         if self.plot_norm:
@@ -385,10 +372,10 @@ class Trainer:
 
             .. code-block:: python
 
-                    self.optimizer.zero_grad()
                     loss = training_step(batch, batch_idx)
                     self.accelerator.backward(loss)
                     self.optimizer.step()
+                    self.optimizer.zero_grad()
 
                     return {
                         "loss": loss,
@@ -400,7 +387,7 @@ class Trainer:
         steps_per_epoch = len(train_dataloader)
         update_steps_per_epoch = steps_per_epoch // self.gradient_accumulation_steps
         update_steps_per_epoch = max(update_steps_per_epoch, 1)
-        
+
         self.update_steps_per_epoch = update_steps_per_epoch
         self.pre_train_steps = self.pre_train_epochs * update_steps_per_epoch
         self.sparsity_warmup_updates = self.sparsity_warmup_epochs * update_steps_per_epoch
@@ -477,7 +464,7 @@ class Trainer:
                             self.lr_scheduler_step()
 
                         if self.use_one_cycle_lr:
-                            self.lr_one_cycle_scheduler.step() 
+                            self.lr_one_cycle_scheduler.step()
 
                 self.state.steps_trained += 1
             self.state.epochs_trained += 1
@@ -489,14 +476,13 @@ class Trainer:
             # Should save, evaluate, and early stop?
             if self.accelerator.is_local_main_process and epoch % self.save_ckpt_interval == 0:
                 self._save_checkpoint(epoch, is_best_epoch=False)
-    
+
             if epoch % self.validation_interval == 0:
                 with torch.no_grad():
                     logger.info("Training finished, begin validation...")
                     score = self.validate(validation_dataloader)
 
                     if self.accelerator.is_local_main_process:
-
                         if self.lr_decay:
                             self.lr_decay_scheduler.step(score)
 
@@ -516,7 +502,6 @@ class Trainer:
             # If any process triggers early stopping, stop training
             if reduced_early_stop_mark != 0:
                 break
-        
 
     @torch.no_grad()
     def validate(self, dataloader):
@@ -556,8 +541,7 @@ class Trainer:
             }
             """
             gathered_step_output = {
-                k: self.accelerator.gather_for_metrics(v).mean().item()
-                for k, v in step_output.items()
+                k: self.accelerator.gather_for_metrics(v).mean().item() for k, v in step_output.items()
             }
             validation_output.append(gathered_step_output)
 
@@ -660,10 +644,12 @@ class Trainer:
             if self.accelerator.is_local_main_process:
                 logger.info(f"Training Loss '{key}' on epoch {self.state.epochs_trained}: {loss_mean}")
                 self.writer.add_scalar(f"Train_Epoch/{key}", loss_mean, self.state.epochs_trained)
-                self.writer.add_scalar(f"Train_Epoch/lr", get_rate(self.optimizer), self.state.epochs_trained)
-                
+                self.writer.add_scalar("Train_Epoch/lr", get_rate(self.optimizer), self.state.epochs_trained)
+
         if not self.further_distill:
-            logger.info(f"Sparsity - Target: {self.target_sparsity_cur_epoch} | Expected: {self.expected_sparsity_cur_epoch}")
+            logger.info(
+                f"Sparsity - Target: {self.target_sparsity_cur_epoch} | Expected: {self.expected_sparsity_cur_epoch}"
+            )
 
     def validation_step(self, batch, batch_idx):
         """Implement a validation step for validating a model on all processes.

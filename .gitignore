@@ -1,6 +1,10 @@
 # Custom
-exp*
-*.log 
+exp*/
+recipes/speakrs/artifacts/
+recipes/speakrs/data/
+recipes/speakrs/*.pid
+recipes/speakrs/*.status
+*.log
 *sge*
 *.err
 *.out
