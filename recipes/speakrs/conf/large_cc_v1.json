@@ -4,7 +4,7 @@
   "run_id": "large_cc_v1",
   "release_root": "recipes/speakrs/data/large_cc_v1",
   "artifacts_root": "recipes/speakrs/artifacts",
-  "ghcr_package": "ghcr.io/praveenperera/diarizen-speakrs-wavlm-large",
+  "ghcr_package": "docker.io/praveenperera/diarizen-speakrs-wavlm-large",
   "relocation": {
     "audio_root": "/Volumes/CacheDisk/dev-cache/wavlm-large-pre-rental/audio",
     "backup_root": "/Volumes/CacheDisk/dev-cache/wavlm-large-pre-rental/backup",
