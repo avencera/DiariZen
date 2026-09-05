@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import zipfile
 from collections import defaultdict
@@ -27,7 +28,7 @@ from .contracts import (
 )
 from .errors import PreparationError
 from .hashing import sha256_file, sha256_json
-from .inventory import PEAK_GIB_ESTIMATE, SOURCES
+from .inventory import ICSI_MIX_URL, PEAK_GIB_ESTIMATE, SOURCES
 from .jsonio import atomic_write_text, write_json
 from .sampler import coverage_plan
 from .storage import probe_writable_root, require_free_gib, write_resource_plan
@@ -476,6 +477,61 @@ def verify_release(release_root: Path) -> dict[str, object]:
     }
 
 
+def _stream_transcode(url: str, dest: Path) -> None:
+    """Download one remote audio URL and write mono 16 kHz FLAC."""
+
+    module = _load_module("prepare_full_corpus", RECIPE_DIR / "prepare_full_corpus.py")
+    if module.audio_ready(dest, module.ChannelPolicy.FIRST):
+        return
+    curl = module.curl_stream(url)
+    assert curl.stdout is not None
+    try:
+        module.transcode(curl.stdout, dest, module.ChannelPolicy.FIRST)
+    except BaseException:
+        curl.terminate()
+        curl.wait()
+        dest.unlink(missing_ok=True)
+        raise
+    finally:
+        curl.stdout.close()
+    if curl.wait() != 0:
+        dest.unlink(missing_ok=True)
+        raise PreparationError("audio download failed", {"url": url, "dest": dest.as_posix()})
+
+
+def _flac_sample_count(path: Path) -> int:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=duration,sample_rate",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            path.as_posix(),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=scrubbed_environment(),
+    )
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if result.returncode != 0 or len(lines) < 2:
+        raise PreparationError("cannot probe prepared audio", {"path": path.as_posix(), "stderr": result.stderr[-200:]})
+    duration, rate = float(lines[0]), int(float(lines[1]))
+    return int(round(duration * rate))
+
+
+def _row_from_audio(corpus: str, split: str, parent_id: str, audio: Path, **extra: Any) -> dict[str, Any]:
+    extra = dict(extra)
+    extra["audio_sha256"] = sha256_file(audio)
+    extra["sample_count"] = _flac_sample_count(audio)
+    return _fixture_row(corpus, split, parent_id, **extra)
+
+
 def _fixture_row(corpus: str, split: str, parent_id: str, **extra: Any) -> dict[str, Any]:
     row = {
         "recording_id": parent_id,
@@ -602,9 +658,9 @@ def prepare_notsofar_real(spec) -> dict[str, Any]:
     rows = []
     splits = {"NOTSOFAR_real": {"train": [], "dev": [], "test": []}}
     mapping = {
-        "train": "benchmark-datasets/train_set/240825.1_train",
-        "dev": "benchmark-datasets/dev_set/240825.1_dev1",
-        "test": "benchmark-datasets/eval_set/240825.1_eval_full_with_GT",
+        "train": "benchmark-datasets/train_set/240825.1_train/MTG",
+        "dev": "benchmark-datasets/dev_set/240825.1_dev1/MTG",
+        "test": "benchmark-datasets/eval_set/240825.1_eval_full_with_GT/MTG",
     }
     for split, prefix in mapping.items():
         listing = _huggingface_list("microsoft/NOTSOFAR", prefix)
@@ -681,10 +737,24 @@ def prepare_icsi(spec) -> dict[str, Any]:
     if len(meetings) < 50:
         raise PreparationError("ICSI annotation meeting list is too small", {"count": len(meetings)})
     parts = _icsi_split(meetings, frozen_test=())
+    audio_root = spec.relocation.audio_root / "ICSI"
+    audio_root.mkdir(parents=True, exist_ok=True)
     rows = []
     for split, ids in parts.items():
         for meeting_id in ids:
-            rows.append(_fixture_row("ICSI", split, meeting_id, device_view="equal_gain_headset_mix", language="en"))
+            dest = audio_root / f"{meeting_id}.flac"
+            _stream_transcode(ICSI_MIX_URL.format(session_id=meeting_id), dest)
+            rows.append(
+                _row_from_audio(
+                    "ICSI",
+                    split,
+                    meeting_id,
+                    dest,
+                    device_view="mix_headset_nxt",
+                    language="en",
+                    transformations=["nxt_interaction_mix_headset", "mono_16k_flac"],
+                )
+            )
     return {
         "recordings": rows,
         "splits": {"ICSI": {split: list(ids) for split, ids in parts.items()}},
@@ -697,10 +767,21 @@ def prepare_lotusdis(spec) -> dict[str, Any]:
 
     cache = spec.relocation.source_cache / "lotusdis"
     cache.mkdir(parents=True, exist_ok=True)
-    csv_path = cache / "annotations.csv"
-    if not csv_path.is_file():
-        _gdown("1ut44pgT1tJRd30clNp-IPx6nJiW7co-z", csv_path)
-    rows_meta = _parse_lotusdis_csv(csv_path)
+    archive = cache / "annotations.zip"
+    legacy_csv = cache / "annotations.csv"
+    csv_dir = cache / "extracted" / "annotation"
+    if not (csv_dir / "train.csv").is_file():
+        if not archive.is_file() and legacy_csv.is_file() and zipfile.is_zipfile(legacy_csv):
+            archive = legacy_csv
+        if not archive.is_file() and not zipfile.is_zipfile(legacy_csv if legacy_csv.is_file() else archive):
+            # The published Drive file is a zip even when named .csv.
+            _gdown("1ut44pgT1tJRd30clNp-IPx6nJiW7co-z", archive)
+        if zipfile.is_zipfile(legacy_csv) and not zipfile.is_zipfile(archive):
+            archive = legacy_csv
+        csv_dir.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(archive) as zipped:
+            zipped.extractall(cache / "extracted")
+    rows_meta = _parse_lotusdis_csv(csv_dir)
     parts = _lotusdis_reconcile(rows_meta)
     rows = []
     for split, ids in parts.items():
@@ -720,40 +801,71 @@ def prepare_lotusdis(spec) -> dict[str, Any]:
         "recordings": rows,
         "splits": {"LOTUSDIS": {split: list(ids) for split, ids in parts.items()}},
         "sources": [
-            {"name": "lotusdis-csv", "obtained_sha256": sha256_file(csv_path) if csv_path.is_file() else None}
+            {
+                "name": "lotusdis-csv",
+                "obtained_sha256": sha256_file(archive) if archive.is_file() else sha256_file(legacy_csv),
+            }
         ],
     }
 
 
 def _gdown(file_id: str, destination: Path) -> None:
-    command = ["gdown", "--fuzzy", f"https://drive.google.com/uc?id={file_id}", "-O", str(destination)]
+    command = [
+        sys.executable,
+        "-m",
+        "gdown",
+        "--continue",
+        f"https://drive.google.com/uc?id={file_id}",
+        "-O",
+        str(destination),
+    ]
     completed = subprocess.run(command, env=scrubbed_environment(), check=False)
     if completed.returncode != 0:
         raise PreparationError("gdown failed", {"file_id": file_id, "code": completed.returncode})
 
 
+def _lotusdis_parent_id(path_value: str) -> str | None:
+    name = Path(path_value).name
+    match = re.match(r"(.+)_chunk\d+\.(?:wav|flac)$", name, re.IGNORECASE)
+    stem = match.group(1) if match else Path(name).stem
+    parts = stem.split("_")
+    if len(parts) < 3:
+        return None
+    return "_".join(parts[:-1])
+
+
 def _parse_lotusdis_csv(path: Path) -> list[dict[str, str]]:
-    text = path.read_text(encoding="utf-8", errors="replace")
-    lines = [line for line in text.splitlines() if line.strip()]
-    if not lines:
+    import csv
+
+    files = []
+    if path.is_dir():
+        files = [path / name for name in ("train.csv", "dev.csv", "test.csv") if (path / name).is_file()]
+    elif path.is_file():
+        files = [path]
+    if not files:
         raise PreparationError("LOTUSDIS CSV is empty")
-    header = [item.strip().lower() for item in lines[0].split(",")]
     rows = []
-    for line in lines[1:]:
-        fields = [item.strip() for item in line.split(",")]
-        record = dict(zip(header, fields))
-        parent_id = record.get("session") or record.get("meeting") or record.get("parent") or record.get("filename")
-        split = record.get("split") or record.get("set") or "train"
-        if not parent_id:
-            continue
-        split = split.lower()
-        if split not in {"train", "dev", "test", "valid", "evaluation"}:
-            continue
-        if split in {"valid"}:
-            split = "dev"
-        if split == "evaluation":
-            split = "test"
-        rows.append({"parent_id": Path(parent_id).stem, "split": split})
+    for csv_path in files:
+        split_from_name = csv_path.stem.lower()
+        with csv_path.open(encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for record in reader:
+                lowered = {str(key).strip().lower(): (value or "").strip() for key, value in record.items()}
+                parent_id = _lotusdis_parent_id(lowered.get("path") or lowered.get("filename") or "")
+                if parent_id is None:
+                    parent_id = lowered.get("session") or lowered.get("meeting") or lowered.get("parent")
+                split = split_from_name if split_from_name in {"train", "dev", "test"} else lowered.get("split") or "train"
+                if not parent_id:
+                    continue
+                if split in {"valid"}:
+                    split = "dev"
+                if split == "evaluation":
+                    split = "test"
+                if split not in {"train", "dev", "test"}:
+                    continue
+                rows.append({"parent_id": parent_id, "split": split})
+    if not rows:
+        raise PreparationError("LOTUSDIS CSV is empty")
     return rows
 
 
@@ -776,7 +888,10 @@ def _huggingface_list(dataset: str, prefix: str) -> list[str]:
     for item in payload:
         path = item.get("path") or item.get("name") or ""
         relative = path.split(prefix.rstrip("/") + "/")[-1]
-        names.append(relative.split("/")[0])
+        name = relative.split("/")[0]
+        if not name or name in {"logs", "MTG"}:
+            continue
+        names.append(name)
     return sorted({name for name in names if name})
 
 
@@ -788,8 +903,15 @@ def _azure_list(url: str) -> list[str]:
         capture_output=True,
         text=True,
     )
-    if completed.returncode != 0:
-        raise PreparationError("Azure listing failed", {"url": url, "stderr": completed.stderr[-400:]})
+    if completed.returncode != 0 or "AuthorizationFailure" in completed.stdout:
+        raise PreparationError(
+            "Azure listing failed",
+            {
+                "url": url,
+                "stderr": (completed.stderr or completed.stdout)[-400:],
+                "blocker": "notsofarsa.blob.core.windows.net network security perimeter",
+            },
+        )
     names = re.findall(r"<Name>([^<]+)</Name>", completed.stdout)
     parents = []
     for name in names:

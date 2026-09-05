@@ -22,9 +22,8 @@ class SourceSpec:
 AMI_AUDIO_URL = (
     "https://groups.inf.ed.ac.uk/ami/AMICorpusMirror/amicorpus/{session_id}/audio/{session_id}.Array1-01.wav"
 )
-ICSI_MIX_URL = (
-    "https://groups.inf.ed.ac.uk/ami/ICSIcorpusMirror/icsicorpus/{session_id}/audio/{session_id}.Mix-Headset.wav"
-)
+# Official Mix-Headset NXT files from the ICSI chooser wget script, not the 404 ICSIcorpusMirror path.
+ICSI_MIX_URL = "https://groups.inf.ed.ac.uk/ami/ICSIsignals/NXT/{session_id}.interaction.wav"
 ICSI_CHANNEL_URL = (
     "https://groups.inf.ed.ac.uk/ami/ICSIcorpusMirror/icsicorpus/{session_id}/audio/{session_id}.{channel}.sph"
 )

@@ -108,6 +108,35 @@ class SpecContractTest(unittest.TestCase):
             parse_kinded_lock({"kind": LAUNCH_KIND}, LAUNCH_KIND)
 
 
+class LotusdisParentTest(unittest.TestCase):
+    def test_chunk_path_maps_to_parent_session(self):
+        from recipes.speakrs.large.prepare import _lotusdis_parent_id, _parse_lotusdis_csv
+
+        self.assertEqual(
+            _lotusdis_parent_id("lotus_dis_ult/audio/jbl/Hijack_S001_T057_Jbl_chunk1.wav"),
+            "Hijack_S001_T057",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / "train.csv").write_text(
+                "path,sentence\nlotus_dis_ult/audio/jbl/Hijack_S001_T057_Jbl_chunk1.wav,x\n",
+                encoding="utf-8",
+            )
+            (directory / "dev.csv").write_text(
+                "path,sentence\nlotus_dis_ult/audio/jbl/Hijack_S081_T069_Jbl_chunk1.wav,x\n",
+                encoding="utf-8",
+            )
+            (directory / "test.csv").write_text(
+                "path,sentence\nlotus_dis_ult/audio/jbl/Hijack_S010_T038_Jbl_chunk1.wav,x\n",
+                encoding="utf-8",
+            )
+            rows = _parse_lotusdis_csv(directory)
+        self.assertEqual(
+            {(row["parent_id"], row["split"]) for row in rows},
+            {("Hijack_S001_T057", "train"), ("Hijack_S081_T069", "dev"), ("Hijack_S010_T038", "test")},
+        )
+
+
 class PrepareRejectionTest(unittest.TestCase):
     def test_incomplete_release_is_rejected(self):
         spec = parse_spec(json.loads(SPEC_PATH.read_text(encoding="utf-8")))
