@@ -34,6 +34,7 @@ from recipes.speakrs.large.controller import (  # noqa: E402
     scrubbed_worker_environment,
 )
 from recipes.speakrs.large.errors import ContractError, PreparationError, RuntimeGateError  # noqa: E402
+from recipes.speakrs.large.handoff import package_handoff  # noqa: E402
 from recipes.speakrs.large.prepare import seal_release  # noqa: E402
 from recipes.speakrs.large.sampler import MixtureSampler  # noqa: E402
 from recipes.speakrs.large.selection import (  # noqa: E402
@@ -284,6 +285,36 @@ class BudgetControllerTest(unittest.TestCase):
         parse_kinded_lock(lease, QUALIFICATION_LEASE_KIND)
         with self.assertRaises(ContractError):
             parse_kinded_lock(lease, LAUNCH_KIND)
+
+
+class HandoffPackageTest(unittest.TestCase):
+    def test_package_handoff_does_not_fabricate_qualification_or_launch(self):
+        spec = parse_spec(json.loads(SPEC_PATH.read_text(encoding="utf-8")))
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            result = package_handoff(
+                spec,
+                {
+                    "pre_rental_work_complete": False,
+                    "gpu_qualification_status": "not_run",
+                    "checks": {
+                        "external-controls": {
+                            "rental_gate_status": "blocked_external_control",
+                            "missing": ["corrected Base+ G0"],
+                        }
+                    },
+                },
+                output,
+            )
+            self.assertFalse(result["pre_rental_work_complete"])
+            self.assertEqual(result["gpu_qualification_status"], "not_run")
+            self.assertEqual(result["rental_gate_status"], "blocked_external_control")
+            self.assertFalse((output / "launch.lock.json").exists())
+            self.assertFalse((output / "qualification.json").exists())
+            readiness = json.loads((output / "readiness.json").read_text(encoding="utf-8"))
+            self.assertEqual(readiness["gpu_qualification_status"], "not_run")
+            self.assertTrue((output / "SHA256SUMS").is_file())
+            self.assertTrue((output / "preparation.lock.json").is_file())
 
 
 class SelectionTest(unittest.TestCase):
