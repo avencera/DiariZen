@@ -1,8 +1,11 @@
 import importlib.util
+import json
 import sys
 import unittest
 import zipfile
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 
 MODULE_PATH = Path(__file__).parents[1] / "prepare_voxconverse.py"
@@ -47,6 +50,79 @@ class PrepareVoxConverseTest(unittest.TestCase):
             prepare.manifest_ids(addition),
             {"abjxc"},
         )
+
+    def test_manifest_rebuild_replaces_stale_rows(self):
+        with TemporaryDirectory() as temporary_directory:
+            destination = Path(temporary_directory) / "wav.scp"
+            destination.write_text(
+                "AMI001 /audio/AMI001.flac\nabjxc /stale/abjxc.flac\n",
+                encoding="utf-8",
+            )
+
+            prepare.replace_training_manifest_records(destination, "abjxc /audio/abjxc.flac\n")
+
+            self.assertEqual(
+                destination.read_text(encoding="utf-8"),
+                "AMI001 /audio/AMI001.flac\nabjxc /audio/abjxc.flac\n",
+            )
+
+    def test_verification_rejects_stale_marker_after_base_manifest_rebuild(self):
+        sources = (
+            prepare.SourceSplit(prepare.Split.DEV, "https://example.test/dev.zip", "a" * 64, 1),
+            prepare.SourceSplit(prepare.Split.TEST, "https://example.test/test.zip", "b" * 64, 1),
+        )
+        with TemporaryDirectory() as temporary_directory:
+            output_root = Path(temporary_directory)
+            for path in prepare.manifest_paths(output_root):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if path.parent == output_root / "train":
+                    recording_ids = ("AMI001", "abcde")
+                elif path.parent == output_root / "test" / "VoxConverse":
+                    recording_ids = ("fghij",)
+                else:
+                    recording_ids = (path.parent.name,)
+                id_column = 1 if path.name == "rttm" else 0
+                lines = [
+                    f"ROW {recording_id}" if id_column == 1 else f"{recording_id} value"
+                    for recording_id in recording_ids
+                ]
+                path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            provenance = {
+                "annotation_commit": prepare.VOXCONVERSE_COMMIT,
+                "annotation_url": prepare.ANNOTATION_URL,
+                "annotation_sha256": prepare.ANNOTATION_SHA256,
+                "audio": {
+                    source.split.value: {
+                        "url": source.audio_url,
+                        "sha256": source.audio_sha256,
+                        "recordings": source.expected_recordings,
+                    }
+                    for source in sources
+                },
+                "manifest_provenance_version": prepare.MANIFEST_PROVENANCE_VERSION,
+                "recording_ids": {"dev": ["abcde"], "test": ["fghij"]},
+                "manifests": prepare.describe_manifests(output_root),
+            }
+            (output_root / "provenance.voxconverse.json").write_text(
+                json.dumps(provenance),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(prepare, "SOURCES", sources),
+                patch.object(prepare, "TRAIN_RECORDINGS", 2),
+                patch.object(prepare, "probe_audio", return_value=True),
+            ):
+                prepare.verify_materialized_data(output_root)
+
+                for name in prepare.MANIFEST_NAMES:
+                    path = output_root / "train" / name
+                    row = "ROW AMI001" if name == "rttm" else "AMI001 value"
+                    path.write_text(row + "\n", encoding="utf-8")
+
+                with self.assertRaisesRegex(RuntimeError, "do not match"):
+                    prepare.verify_materialized_data(output_root)
 
 
 if __name__ == "__main__":

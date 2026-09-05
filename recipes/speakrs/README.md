@@ -37,18 +37,23 @@ preparation, use:
 ./run_full.sh --resume
 ```
 
-Set `DIARIZEN_TRAINING_CONFIG` to start or resume a different configuration.
-The corrected accumulation run uses:
+The default configuration is
+`conf/full_wavlm_base_plus_16gb_upstream_v2.toml`. It includes the corrected
+gradient accumulation path and the current upstream-equivalent AISHELL audio
+policy. Set `DIARIZEN_TRAINING_CONFIG` to start or resume a different
+configuration. The configuration file name also defines the experiment name.
+
+To select the default configuration explicitly, use:
 
 ```bash
-DIARIZEN_TRAINING_CONFIG="$PWD/conf/full_wavlm_base_plus_16gb_accumulation_fix.toml" \
+DIARIZEN_TRAINING_CONFIG="$PWD/conf/full_wavlm_base_plus_16gb_upstream_v2.toml" \
     ./run_full.sh
 ```
 
 Use the same environment variable with the unattended supervisor:
 
 ```bash
-DIARIZEN_TRAINING_CONFIG="$PWD/conf/full_wavlm_base_plus_16gb_accumulation_fix.toml" \
+DIARIZEN_TRAINING_CONFIG="$PWD/conf/full_wavlm_base_plus_16gb_upstream_v2.toml" \
     ./supervise_full.sh
 ```
 
@@ -62,7 +67,8 @@ Neither model download needs a secret token.
 Each inference directory contains a run manifest. The evaluator reuses a
 partial result only when its audio inputs, configuration, model checkpoints,
 embedding, and inference settings match. Set `DIARIZEN_EXPERIMENT_ID` when
-evaluating an experiment other than `full_wavlm_base_plus_16gb`.
+evaluating an experiment other than
+`full_wavlm_base_plus_16gb_upstream_v2`.
 
 Run `evaluate_official_control.sh` to check the complete evaluation path with
 the published `diarizen-meeting-base` checkpoint before comparing a trained
@@ -70,9 +76,15 @@ checkpoint. The script requires the official `config.toml` and
 `pytorch_model.bin` under `artifacts/diarizen-meeting-base`. Each corpus must
 match its published collar-zero DER within one point.
 
-AISHELL-4 is mixed to one channel, as required by its standard preparation.
-AliMeeting uses its first far-field channel because the model selects channel
-zero. AMI uses Array1 microphone 1.
+AISHELL-4 uses an equal arithmetic mean of all eight microphones, which matches
+the upstream SoX mono conversion. A versioned sidecar binds each prepared file
+to this policy and prevents reuse of audio from an older downmix. AliMeeting
+uses its first far-field channel because the model selects channel zero. AMI
+uses Array1 microphone 1. `run_full.sh` verifies the complete preparation
+identity and the exact 732-recording training manifest before it starts
+training. After rebuilding the standard corpora, use
+`prepare_voxconverse.py --reuse-prepared-audio` to restore and seal the
+combined manifests without downloading the two audio archives again.
 
 The training data excludes RAMC, MSDWild, and DIHARD-3 because their terms do
 not permit commercial use. AMI and the VoxConverse data are CC BY 4.0.

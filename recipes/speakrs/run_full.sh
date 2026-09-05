@@ -6,7 +6,7 @@ unset CONTAINER_API_KEY JUPYTER_TOKEN OPEN_BUTTON_TOKEN
 
 recipe_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 venv_path="${DIARIZEN_VENV:-/root/code/diarizen-venv}"
-training_config="${DIARIZEN_TRAINING_CONFIG:-$recipe_dir/conf/full_wavlm_base_plus_16gb.toml}"
+training_config="${DIARIZEN_TRAINING_CONFIG:-$recipe_dir/conf/full_wavlm_base_plus_16gb_upstream_v2.toml}"
 resume_args=()
 
 source "$recipe_dir/nvidia_driver_compat.sh"
@@ -15,6 +15,9 @@ if [[ ! -f "$recipe_dir/data/full/provenance.voxconverse.json" ]]; then
     echo "VoxConverse preparation is incomplete" >&2
     exit 1
 fi
+
+"$venv_path/bin/python" -B "$recipe_dir/prepare_full_corpus.py" --verify
+"$venv_path/bin/python" -B "$recipe_dir/prepare_voxconverse.py" --verify
 
 if [[ ! -f "$training_config" ]]; then
     echo "training configuration not found: $training_config" >&2

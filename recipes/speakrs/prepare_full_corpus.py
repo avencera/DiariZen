@@ -29,6 +29,14 @@ SENSITIVE_ENVIRONMENT_NAMES = (
     "OPEN_BUTTON_TOKEN",
 )
 RECIPE_DIR = Path(__file__).resolve().parent
+AUDIO_PROVENANCE_SCHEMA = "speakrs-audio-provenance"
+AUDIO_PROVENANCE_SCHEMA_VERSION = 1
+AUDIO_PROVENANCE_SUFFIX = ".provenance.json"
+PREPARATION_POLICY_NAME = "full-corpus-audio"
+# version 2 records the correction from ffmpeg's layout-aware downmix to an
+# explicit equal mean for AISHELL-4
+PREPARATION_POLICY_VERSION = 2
+AISHELL_INPUT_CHANNELS = 8
 
 
 class Corpus(str, Enum):
@@ -54,6 +62,36 @@ class ChannelPolicy(str, Enum):
     MIX = "mix"
 
 
+def channel_policy_name(channel_policy: ChannelPolicy) -> str:
+    """Return the stable provenance name for a channel policy."""
+
+    if channel_policy is ChannelPolicy.FIRST:
+        return "first_channel"
+    if channel_policy is ChannelPolicy.MIX:
+        return "equal_mean"
+    raise ValueError(f"Unknown channel policy: {channel_policy}")
+
+
+def channel_policy_version(channel_policy: ChannelPolicy) -> int:
+    """Return the version of a channel policy's audio operation."""
+
+    if channel_policy is ChannelPolicy.FIRST:
+        return 1
+    if channel_policy is ChannelPolicy.MIX:
+        return 2
+    raise ValueError(f"Unknown channel policy: {channel_policy}")
+
+
+def channel_policy_description(channel_policy: ChannelPolicy) -> str:
+    """Return a reader-facing description of a channel policy."""
+
+    if channel_policy is ChannelPolicy.FIRST:
+        return "first decoded input channel"
+    if channel_policy is ChannelPolicy.MIX:
+        return "equal arithmetic mean of every input channel"
+    raise ValueError(f"Unknown channel policy: {channel_policy}")
+
+
 @dataclass(frozen=True)
 class Recording:
     """A validated recording required by a DiariZen manifest."""
@@ -72,6 +110,7 @@ class Archive:
     corpus: Corpus
     channel_policy: ChannelPolicy
     session_ids: frozenset[str]
+    input_channels: int | None = None
 
 
 @dataclass(frozen=True)
@@ -226,12 +265,11 @@ def build_archives(recordings: Iterable[Recording]) -> tuple[Archive, ...]:
     for (corpus, name), session_ids in sorted(grouped.items(), key=lambda item: (item[0][0].value, item[0][1])):
         if corpus is Corpus.AISHELL4:
             url = AISHELL_ARCHIVE_URLS[name]
-            channel_policy = ChannelPolicy.MIX
         else:
             split = Split(name)
             url = ALI_ARCHIVE_URLS[split]
-            channel_policy = ChannelPolicy.FIRST
-        archives.append(Archive(name, url, corpus, channel_policy, frozenset(session_ids)))
+        channel_policy, input_channels = expected_audio_policy(corpus)
+        archives.append(Archive(name, url, corpus, channel_policy, frozenset(session_ids), input_channels))
 
     return tuple(archives)
 
@@ -242,8 +280,155 @@ def audio_path(output_root: Path, recording: Recording) -> Path:
     return output_root / "audio" / recording.corpus.value / f"{recording.session_id}.flac"
 
 
-def probe_audio(path: Path) -> bool:
-    """Return true when an output file is mono, 16 kHz, and readable."""
+def audio_provenance_path(path: Path) -> Path:
+    """Return the sidecar path that records how one audio file was prepared."""
+
+    return path.with_name(path.name + AUDIO_PROVENANCE_SUFFIX)
+
+
+def expected_audio_policy(corpus: Corpus) -> tuple[ChannelPolicy, int | None]:
+    """Return the channel policy and known input count for one corpus."""
+
+    if corpus is Corpus.AISHELL4:
+        return ChannelPolicy.MIX, AISHELL_INPUT_CHANNELS
+    return ChannelPolicy.FIRST, None
+
+
+def audio_provenance(channel_policy: ChannelPolicy, input_channels: int | None = None) -> dict[str, object]:
+    """Return the current provenance record for one normalized audio file."""
+
+    if channel_policy is ChannelPolicy.MIX:
+        if input_channels is None:
+            input_channels = AISHELL_INPUT_CHANNELS
+        if input_channels <= 0:
+            raise ValueError("Mixed audio must have a positive input channel count")
+    else:
+        input_channels = None
+
+    return {
+        "schema": AUDIO_PROVENANCE_SCHEMA,
+        "schema_version": AUDIO_PROVENANCE_SCHEMA_VERSION,
+        "preparation_policy": PREPARATION_POLICY_NAME,
+        "preparation_policy_version": PREPARATION_POLICY_VERSION,
+        "format": "mono FLAC at 16 kHz",
+        "channel_policy": channel_policy_name(channel_policy),
+        "channel_policy_version": channel_policy_version(channel_policy),
+        "channel_policy_description": channel_policy_description(channel_policy),
+        "input_channels": input_channels,
+    }
+
+
+def audio_matches_policy(
+    path: Path,
+    channel_policy: ChannelPolicy,
+    input_channels: int | None = None,
+) -> bool:
+    """Return true only when audio and its sidecar match the current policy."""
+
+    if not probe_audio(path):
+        return False
+
+    try:
+        metadata = json.loads(audio_provenance_path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+
+    expected = audio_provenance(channel_policy, input_channels)
+    return isinstance(metadata, dict) and all(metadata.get(key) == value for key, value in expected.items())
+
+
+def write_audio_provenance(path: Path, channel_policy: ChannelPolicy, input_channels: int | None = None) -> None:
+    """Write one audio file's policy sidecar atomically."""
+
+    atomic_write(
+        audio_provenance_path(path),
+        json.dumps(audio_provenance(channel_policy, input_channels), indent=2) + "\n",
+    )
+
+
+def audio_ready(
+    path: Path,
+    channel_policy: ChannelPolicy,
+    input_channels: int | None = None,
+) -> bool:
+    """Return true when audio matches policy, adopting legacy first-channel output."""
+
+    if audio_matches_policy(path, channel_policy, input_channels):
+        return True
+    if channel_policy is not ChannelPolicy.FIRST or audio_provenance_path(path).exists() or not probe_audio(path):
+        return False
+
+    write_audio_provenance(path, channel_policy, input_channels)
+    return True
+
+
+def preparation_policy_provenance() -> dict[str, object]:
+    """Return the current global preparation policy record."""
+
+    return {
+        "name": PREPARATION_POLICY_NAME,
+        "version": PREPARATION_POLICY_VERSION,
+        "audio_sidecar": {
+            "suffix": AUDIO_PROVENANCE_SUFFIX,
+            "schema": AUDIO_PROVENANCE_SCHEMA,
+            "schema_version": AUDIO_PROVENANCE_SCHEMA_VERSION,
+        },
+        "channel_policies": {
+            corpus.value: {
+                "name": channel_policy_name(channel_policy),
+                "version": channel_policy_version(channel_policy),
+                "description": channel_policy_description(channel_policy),
+                "input_channels": input_channels,
+            }
+            for corpus in Corpus
+            for channel_policy, input_channels in (expected_audio_policy(corpus),)
+        },
+    }
+
+
+def verify_provenance(path: Path) -> None:
+    """Verify that the global provenance names the current preparation policy."""
+
+    try:
+        provenance = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Cannot read provenance: {path}: {error}") from error
+
+    policy = provenance.get("preparation_policy") if isinstance(provenance, dict) else None
+    expected = preparation_policy_provenance()
+    if (
+        not isinstance(policy, dict)
+        or policy.get("name") != expected["name"]
+        or policy.get("version") != expected["version"]
+    ):
+        raise RuntimeError(
+            f"Provenance does not match preparation policy {PREPARATION_POLICY_NAME} v{PREPARATION_POLICY_VERSION}: {path}"
+        )
+
+
+def verify_prepared_corpus(manifests: Iterable[ManifestSet], output_root: Path) -> None:
+    """Verify all required audio and provenance without changing the output tree."""
+
+    verify_provenance(output_root / "provenance.json")
+    invalid: list[Path] = []
+    for manifest in manifests:
+        for recording in manifest.recordings:
+            channel_policy, input_channels = expected_audio_policy(recording.corpus)
+            output = audio_path(output_root, recording)
+            if not audio_matches_policy(output, channel_policy, input_channels):
+                invalid.append(output)
+
+    if invalid:
+        paths = ", ".join(path.as_posix() for path in invalid)
+        raise RuntimeError(f"Audio is absent, invalid, or has stale policy provenance: {paths}")
+
+
+def probe_audio(
+    path: Path,
+    channel_policy: ChannelPolicy | None = None,
+    input_channels: int | None = None,
+) -> bool:
+    """Return true when audio has the required header and optional policy provenance."""
 
     if not path.is_file() or path.stat().st_size == 0:
         return False
@@ -265,16 +450,41 @@ def probe_audio(path: Path) -> bool:
         text=True,
         env=scrubbed_environment(),
     )
-    return result.returncode == 0 and result.stdout.strip() == "16000x1"
+    if result.returncode != 0 or result.stdout.strip() != "16000x1":
+        return False
+    if channel_policy is None:
+        return True
+    return audio_matches_policy(path, channel_policy, input_channels)
 
 
-def transcode(stream: BinaryIO, output: Path, channel_policy: ChannelPolicy) -> None:
+def equal_mean_filter(input_channels: int) -> str:
+    """Return an ffmpeg filter that averages every input channel equally."""
+
+    if input_channels <= 0:
+        raise ValueError("Equal mean requires a positive input channel count")
+    coefficient = 1 / input_channels
+    terms = "+".join(f"{coefficient:.12g}*c{channel}" for channel in range(input_channels))
+    return f"pan=mono|c0={terms}"
+
+
+def transcode(
+    stream: BinaryIO,
+    output: Path,
+    channel_policy: ChannelPolicy,
+    input_channels: int | None = None,
+) -> None:
     """Transcode one input stream to an atomic mono 16 kHz FLAC file."""
 
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(".partial.flac")
     temporary.unlink(missing_ok=True)
-    channel_args = ["-af", "pan=mono|c0=c0"] if channel_policy is ChannelPolicy.FIRST else ["-ac", "1"]
+    if channel_policy is ChannelPolicy.FIRST:
+        input_channels = None
+        channel_args = ["-af", "pan=mono|c0=c0"]
+    else:
+        if input_channels is None:
+            input_channels = AISHELL_INPUT_CHANNELS
+        channel_args = ["-af", equal_mean_filter(input_channels)]
     command = [
         "ffmpeg",
         "-nostdin",
@@ -318,7 +528,22 @@ def transcode(stream: BinaryIO, output: Path, channel_policy: ChannelPolicy) -> 
     if not probe_audio(temporary):
         temporary.unlink(missing_ok=True)
         raise RuntimeError(f"Invalid transcoded audio: {output}")
-    temporary.replace(output)
+
+    sidecar = audio_provenance_path(output)
+    sidecar_temporary = sidecar.with_suffix(sidecar.suffix + ".partial")
+    sidecar_temporary.unlink(missing_ok=True)
+    try:
+        sidecar_temporary.write_text(
+            json.dumps(audio_provenance(channel_policy, input_channels), indent=2) + "\n",
+            encoding="utf-8",
+        )
+        # publish audio before its sidecar so a crash cannot make stale audio look current
+        temporary.replace(output)
+        sidecar_temporary.replace(sidecar)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        sidecar_temporary.unlink(missing_ok=True)
+        raise
 
 
 def curl_stream(url: str) -> subprocess.Popen[bytes]:
@@ -345,7 +570,7 @@ def download_ami(recording: Recording, output_root: Path) -> None:
     """Download and normalize one AMI single distant-microphone recording."""
 
     output = audio_path(output_root, recording)
-    if probe_audio(output):
+    if audio_ready(output, ChannelPolicy.FIRST):
         return
     url = AMI_AUDIO_URL.format(session_id=recording.session_id)
     print(f"AMI {recording.session_id}", flush=True)
@@ -387,7 +612,11 @@ def extract_archive(archive: Archive, output_root: Path) -> None:
     pending = {
         session_id
         for session_id in archive.session_ids
-        if not probe_audio(output_root / "audio" / archive.corpus.value / f"{session_id}.flac")
+        if not audio_ready(
+            output_root / "audio" / archive.corpus.value / f"{session_id}.flac",
+            archive.channel_policy,
+            archive.input_channels,
+        )
     }
     if not pending:
         return
@@ -407,7 +636,7 @@ def extract_archive(archive: Archive, output_root: Path) -> None:
                 output = output_root / "audio" / archive.corpus.value / f"{session_id}.flac"
                 print(f"  {session_id}", flush=True)
                 with member_stream:
-                    transcode(member_stream, output, archive.channel_policy)
+                    transcode(member_stream, output, archive.channel_policy, archive.input_channels)
                 pending.remove(session_id)
                 if not pending:
                     break
@@ -450,7 +679,7 @@ def atomic_write(path: Path, content: str) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".partial")
-    temporary.write_text(content)
+    temporary.write_text(content, encoding="utf-8")
     temporary.replace(path)
 
 
@@ -464,7 +693,8 @@ def write_manifests(
     for manifest in manifests:
         for recording in manifest.recordings:
             output = audio_path(output_root, recording)
-            if not probe_audio(output):
+            channel_policy, input_channels = expected_audio_policy(recording.corpus)
+            if not audio_ready(output, channel_policy, input_channels):
                 raise RuntimeError(f"Required audio is absent or invalid: {output}")
         wav_lines = [
             f"{recording.session_id} "
@@ -512,6 +742,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--minimum-free-gib", type=float, default=30.0)
     parser.add_argument("--plan", action="store_true")
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="verify prepared audio and provenance without downloading or writing",
+    )
     return parser.parse_args()
 
 
@@ -525,12 +760,19 @@ def main() -> None:
     recordings = tuple(recording for manifest in manifests for recording in manifest.recordings)
     archives = build_archives(recordings)
     print_plan(manifests, archives)
+    if args.plan and args.verify:
+        raise ValueError("--plan and --verify cannot be combined")
     if args.plan:
+        return
+
+    require_executable("ffprobe")
+    if args.verify:
+        verify_prepared_corpus(manifests, output_root)
+        print("Full corpus verification passed", flush=True)
         return
 
     require_executable("curl")
     require_executable("ffmpeg")
-    require_executable("ffprobe")
     output_root.mkdir(parents=True, exist_ok=True)
     free_gib = shutil.disk_usage(output_root).free / 1024**3
     if free_gib < args.minimum_free_gib:
@@ -552,12 +794,16 @@ def main() -> None:
     write_manifests(manifests, output_root, args.manifest_audio_prefix)
     provenance = {
         "format": "mono FLAC at 16 kHz",
+        "preparation_policy": preparation_policy_provenance(),
         "archives": [
             {
                 "corpus": archive.corpus.value,
                 "name": archive.name,
                 "url": archive.url,
                 "recordings": len(archive.session_ids),
+                "channel_policy": channel_policy_name(archive.channel_policy),
+                "channel_policy_version": channel_policy_version(archive.channel_policy),
+                "input_channels": archive.input_channels,
             }
             for archive in archives
         ],

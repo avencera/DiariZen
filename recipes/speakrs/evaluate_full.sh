@@ -6,7 +6,7 @@ unset CONTAINER_API_KEY JUPYTER_TOKEN OPEN_BUTTON_TOKEN
 
 recipe_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 venv_path="${DIARIZEN_VENV:-/root/code/diarizen-venv}"
-experiment_id="${DIARIZEN_EXPERIMENT_ID:-full_wavlm_base_plus_16gb}"
+experiment_id="${DIARIZEN_EXPERIMENT_ID:-full_wavlm_base_plus_16gb_upstream_v2}"
 if [[ ! "$experiment_id" =~ ^[A-Za-z0-9_-]+$ ]]; then
     echo "invalid experiment ID: $experiment_id" >&2
     exit 2
