@@ -5,10 +5,12 @@
 from __future__ import annotations
 
 import copy
+import random
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import numpy as np
 import torch
 from accelerate import Accelerator
 
@@ -78,6 +80,18 @@ class DualOptimizerCheckpointRoundtripTest(unittest.TestCase):
             self.assertTrue((destination / "custom_checkpoint_0.pkl").is_file())
             self.assertTrue((destination / "custom_checkpoint_1.pkl").is_file())
 
+            expected_python_random = random.random()
+            expected_numpy_random = np.random.random(4)
+            expected_torch_random = torch.rand(4)
+            expected_batch_order = torch.randperm(32)
+            next_loss = model(inputs).square().mean()
+            accelerator.backward(next_loss)
+            optimizer_small.step()
+            optimizer_big.step()
+            optimizer_small.zero_grad()
+            optimizer_big.zero_grad()
+            expected_next_parameters = [parameter.detach().clone() for parameter in model.parameters()]
+
             with torch.no_grad():
                 next(model.parameters()).add_(10)
             state.epochs_trained = 99
@@ -90,12 +104,24 @@ class DualOptimizerCheckpointRoundtripTest(unittest.TestCase):
 
             accelerator.load_state(destination, map_location="cpu")
 
+            self.assertEqual(random.random(), expected_python_random)
+            np.testing.assert_array_equal(np.random.random(4), expected_numpy_random)
+            torch.testing.assert_close(torch.rand(4), expected_torch_random, rtol=0, atol=0)
+            torch.testing.assert_close(torch.randperm(32), expected_batch_order, rtol=0, atol=0)
+
         torch.testing.assert_close(next(model.parameters()), original_parameter)
         self.assertEqual(state.epochs_trained, 3)
         self.assertEqual(state.patience, 2)
         self.assertEqual(history, [1.0, 2.0, 3.0])
         self.assert_optimizer_state_equal(optimizer_small.state_dict(), original_small_state)
         self.assert_optimizer_state_equal(optimizer_big.state_dict(), original_big_state)
+
+        resumed_loss = model(inputs).square().mean()
+        accelerator.backward(resumed_loss)
+        optimizer_small.step()
+        optimizer_big.step()
+        for actual, expected in zip(model.parameters(), expected_next_parameters):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
