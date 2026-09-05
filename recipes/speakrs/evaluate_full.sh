@@ -16,7 +16,7 @@ experiment_dir="$recipe_dir/exp_full/$experiment_id"
 ranked_index="$experiment_dir/ranked_checkpoints/index.json"
 embedding_model="$recipe_dir/artifacts/wespeaker-voxceleb-resnet34-LM-pyannote.bin"
 dscore_dir="${DSCORE_DIR:-/root/code/dscore}"
-inference_profile="upstream-constrained-ahc-v2-input-bound"
+inference_profile="upstream-constrained-ahc-v3-engine-bound"
 config_file="$(find "$experiment_dir" -maxdepth 1 -name 'config__*.toml' -print | sort | tail -n 1)"
 
 source "$recipe_dir/nvidia_driver_compat.sh"

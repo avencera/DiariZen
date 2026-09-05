@@ -77,6 +77,16 @@ class InferenceRunManifestTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "use a new output directory"):
                 INFERENCE_MODULE.initialize_run_directory(output_dir, {"version": 1, "model": "second"})
 
+    def test_changed_engine_identity_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            first_manifest = {"version": 4, "engine": {"dependency": "first"}}
+            changed_manifest = {"version": 4, "engine": {"dependency": "changed"}}
+            INFERENCE_MODULE.initialize_run_directory(output_dir, first_manifest)
+
+            with self.assertRaisesRegex(ValueError, "use a new output directory"):
+                INFERENCE_MODULE.initialize_run_directory(output_dir, changed_manifest)
+
     def test_legacy_rttm_directory_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             output_dir = Path(temporary_directory)
@@ -117,11 +127,12 @@ class InferenceRunManifestTest(unittest.TestCase):
                 max_iters=20,
             )
 
-            first_manifest = INFERENCE_MODULE.build_run_manifest(args, config, model.as_posix())
-            audio.write_bytes(b"other audio")
-            second_manifest = INFERENCE_MODULE.build_run_manifest(args, config, model.as_posix())
+            with patch.object(INFERENCE_MODULE, "build_engine_identity", return_value={"fixture": "engine-v1"}):
+                first_manifest = INFERENCE_MODULE.build_run_manifest(args, config, model.as_posix())
+                audio.write_bytes(b"other audio")
+                second_manifest = INFERENCE_MODULE.build_run_manifest(args, config, model.as_posix())
 
-            self.assertEqual(first_manifest["version"], 3)
+            self.assertEqual(first_manifest["version"], 4)
             self.assertNotEqual(first_manifest["input"], second_manifest["input"])
 
     def test_silent_session_returns_empty_annotation_without_embeddings(self):

@@ -61,6 +61,14 @@ wait_for_pipeline() {
     done
 }
 
+pipeline_log_offset() {
+    if [[ -f "$pipeline_log" ]]; then
+        wc -c < "$pipeline_log"
+    else
+        printf '0\n'
+    fi
+}
+
 start_pipeline() {
     local -a command
 
@@ -73,6 +81,8 @@ start_pipeline() {
         command=("$recipe_dir/run_full.sh")
     fi
 
+    # a prior completed run can remain in the append-only log
+    pipeline_start_offset="$(pipeline_log_offset)"
     "${command[@]}" >> "$pipeline_log" 2>&1 &
     local pipeline_pid=$!
     printf '%s\n' "$pipeline_pid" > "$pipeline_pid_file"
@@ -82,7 +92,11 @@ start_pipeline() {
 }
 
 evaluate_completed_pipeline() {
-    if [[ ! -f "$pipeline_log" ]] || ! grep -q "$completion_marker" "$pipeline_log"; then
+    if [[ ! -f "$pipeline_log" ]]; then
+        return 1
+    fi
+    if ! tail -c +$((pipeline_start_offset + 1)) "$pipeline_log" \
+        | grep -F -- "$completion_marker" > /dev/null; then
         return 1
     fi
 
@@ -102,6 +116,7 @@ evaluate_completed_pipeline() {
 
 cd "$recipe_dir" || exit 1
 write_status "running"
+pipeline_start_offset="$(pipeline_log_offset)"
 if [[ -f "$pipeline_pid_file" ]]; then
     initial_pid="$(cat "$pipeline_pid_file")"
     if [[ "$initial_pid" =~ ^[0-9]+$ ]] && kill -0 "$initial_pid" 2>/dev/null; then

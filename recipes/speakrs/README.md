@@ -29,6 +29,9 @@ held-out evaluation after a clean training completion, and writes
 `<experiment>.status` as `ready_to_stop` only after every score succeeds. The
 supervisor derives the experiment name from `DIARIZEN_TRAINING_CONFIG` and
 rejects a conflicting `DIARIZEN_EXPERIMENT_ID`.
+Completion must appear in output from the current monitored attempt. Old log
+lines do not skip training; resuming a terminal checkpoint confirms completion
+without another training epoch.
 
 The full pipeline is resumable. If training is interrupted after data
 preparation, use:
@@ -66,7 +69,9 @@ Neither model download needs a secret token.
 
 Each inference directory contains a run manifest. The evaluator reuses a
 partial result only when its audio inputs, configuration, model checkpoints,
-embedding, and inference settings match. Set `DIARIZEN_EXPERIMENT_ID` when
+embedding, inference settings, installed engine source, and dependency versions
+match. VBx runs also bind the PLDA asset contents. Engine-bound results use a
+new output profile, so earlier results remain intact. Set `DIARIZEN_EXPERIMENT_ID` when
 evaluating an experiment other than
 `full_wavlm_base_plus_16gb_upstream_v2`.
 

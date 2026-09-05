@@ -17,12 +17,14 @@ SUPERVISOR_PATH = Path(__file__).resolve().parents[1] / "supervise_full.sh"
 class SupervisorStateMachineTest(unittest.TestCase):
     """Check completion detection after the restart budget is exhausted."""
 
-    def run_supervisor(self, success_on):
+    def run_supervisor(self, success_on, stale_completion=False):
         with tempfile.TemporaryDirectory() as temporary_directory:
             recipe_dir = Path(temporary_directory)
             (recipe_dir / "conf").mkdir()
             (recipe_dir / "conf" / "edge.toml").write_text("[training]\n")
             (recipe_dir / "success_on").write_text(f"{success_on}\n")
+            if stale_completion:
+                (recipe_dir / "edge.pipeline.log").write_text("previous run: Training loop finished at epoch 1\n")
             (recipe_dir / "run_full_pipeline.sh").write_text(
                 """#!/usr/bin/env bash
 set -euo pipefail
@@ -99,6 +101,22 @@ printf '%s\\n' evaluated >> "$recipe_dir/evaluations"
         self.assertEqual(run["attempts"], 5)
         self.assertEqual(run["evaluations"], [])
         self.assertEqual(run["status"], "failed")
+
+    def test_stale_completion_marker_does_not_count_as_completion(self):
+        run = self.run_supervisor(success_on=0, stale_completion=True)
+
+        self.assertEqual(run["completed"].returncode, 1, run["completed"].stderr)
+        self.assertEqual(run["attempts"], 5)
+        self.assertEqual(run["evaluations"], [])
+        self.assertEqual(run["status"], "failed")
+
+    def test_stale_completion_marker_does_not_skip_last_restart(self):
+        run = self.run_supervisor(success_on=5, stale_completion=True)
+
+        self.assertEqual(run["completed"].returncode, 0, run["completed"].stderr)
+        self.assertEqual(run["attempts"], 5)
+        self.assertEqual(run["evaluations"], ["evaluated"])
+        self.assertEqual(run["status"], "ready_to_stop")
 
 
 if __name__ == "__main__":

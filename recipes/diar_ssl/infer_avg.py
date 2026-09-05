@@ -21,6 +21,7 @@ from scipy.ndimage import median_filter
 from torch.torch_version import TorchVersion
 
 from diarizen.ckpt_utils import load_metric_summary
+from diarizen.inference_identity import build_engine_identity
 
 
 # pytorch 2.6+ needs an explicit allowlist for these checkpoint metadata types
@@ -28,7 +29,7 @@ torch.serialization.add_safe_globals([TorchVersion, Problem, Resolution, Specifi
 
 
 RUN_MANIFEST_FILENAME = "run_manifest.json"
-RUN_MANIFEST_VERSION = 3
+RUN_MANIFEST_VERSION = 4
 RTTM_COMPLETION_MARKER_SUFFIX = ".complete"
 
 
@@ -106,6 +107,7 @@ def build_run_manifest(args, config_path: Path, segmentation) -> dict[str, Any]:
         "configuration": describe_file(config_path),
         "segmentation": describe_segmentation(segmentation),
         "embedding": describe_file(embedding_model),
+        "engine": build_engine_identity(args.clustering_method, getattr(args, "diarizen_hub", None)),
         "inference": {
             "seg_duration": args.seg_duration,
             "segmentation_step": args.segmentation_step,
