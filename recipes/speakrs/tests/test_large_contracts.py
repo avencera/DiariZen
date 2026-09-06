@@ -353,6 +353,12 @@ class NotsofarSimMapTest(unittest.TestCase):
             html = Path(temporary) / "quota.html"
             html.write_bytes(b"<!DOCTYPE html><html>quota")
             self.assertTrue(_file_starts_with_html(html))
+            zip_head = Path(temporary) / "wav.zip.partial"
+            zip_head.write_bytes(b"PK\x03\x04" + b"\x00" * 64)
+            self.assertFalse(_file_starts_with_html(zip_head))
+            empty = Path(temporary) / "empty.bin"
+            empty.write_bytes(b"")
+            self.assertFalse(_file_starts_with_html(empty))
             cache = Path(temporary) / "sim"
             cache.mkdir()
             (cache / "hf-train-maps.jsonl").write_text(

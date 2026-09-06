@@ -1073,7 +1073,8 @@ def _gdown(file_id: str, destination: Path) -> None:
 def _file_starts_with_html(path: Path) -> bool:
     if not path.is_file() or path.stat().st_size == 0:
         return False
-    head = path.read_bytes()[:20].lower()
+    with path.open("rb") as handle:
+        head = handle.read(20).lower()
     return head.startswith(b"<!doctype") or head.startswith(b"<html")
 
 
