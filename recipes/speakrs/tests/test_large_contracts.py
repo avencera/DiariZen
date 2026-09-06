@@ -158,6 +158,67 @@ class GdriveUserAgentTest(unittest.TestCase):
         self.assertGreater(len(GDRIVE_USER_AGENT), len("Mozilla/5.0"))
 
 
+class GdriveRangeDownloadTest(unittest.TestCase):
+    def test_quota_html_does_not_spend_hard_failure_budget(self):
+        from unittest import mock
+
+        from recipes.speakrs.large.prepare import _gdrive_range_download
+
+        quota = b"<!DOCTYPE html><html><head><title>Google Drive - Quota exceeded</title></html>"
+        confirm = b'<html><input name="uuid" value="test-uuid"></html>'
+        expected = 16
+        payload = b"PK" + b"\x00" * (expected - 2)
+        html_hits = {"n": 0}
+
+        def fake_run(command, **kwargs):
+            output = Path(command[command.index("--output") + 1])
+            url = command[-1]
+            if "drive.google.com/uc" in url:
+                output.write_bytes(confirm)
+                return mock.Mock(returncode=0)
+            html_hits["n"] += 1
+            if html_hits["n"] <= 90:
+                output.write_bytes(quota)
+            else:
+                start, end = (int(part) for part in command[command.index("-r") + 1].split("-"))
+                output.write_bytes(payload[start : end + 1])
+            return mock.Mock(returncode=0)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            dest = Path(temporary) / "wav.zip"
+            cookies = Path(temporary) / "gdrive.cookies"
+            with mock.patch("recipes.speakrs.large.prepare.subprocess.run", side_effect=fake_run):
+                with mock.patch("recipes.speakrs.large.prepare.time.sleep") as slept:
+                    _gdrive_range_download("fileid", dest, expected, cookies=cookies)
+            self.assertEqual(dest.read_bytes(), payload)
+            self.assertGreaterEqual(html_hits["n"], 90)
+            self.assertTrue(any(call.args[0] == 120 for call in slept.call_args_list))
+
+    def test_non_html_failures_still_abort(self):
+        from unittest import mock
+
+        from recipes.speakrs.large.prepare import _gdrive_range_download
+
+        confirm = b'<html><input name="uuid" value="test-uuid"></html>'
+
+        def fake_run(command, **kwargs):
+            output = Path(command[command.index("--output") + 1])
+            url = command[-1]
+            if "drive.google.com/uc" in url:
+                output.write_bytes(confirm)
+                return mock.Mock(returncode=0)
+            return mock.Mock(returncode=22)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            dest = Path(temporary) / "wav.zip"
+            cookies = Path(temporary) / "gdrive.cookies"
+            with mock.patch("recipes.speakrs.large.prepare.subprocess.run", side_effect=fake_run):
+                with mock.patch("recipes.speakrs.large.prepare.time.sleep"):
+                    with self.assertRaises(PreparationError) as raised:
+                        _gdrive_range_download("fileid", dest, 16, cookies=cookies)
+        self.assertIn("range download failed", str(raised.exception))
+
+
 class LotusdisViewTest(unittest.TestCase):
     def test_prefers_jbl_then_rejects_lavalier_only(self):
         import zipfile

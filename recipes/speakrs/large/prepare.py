@@ -1247,16 +1247,19 @@ def _gdrive_range_download(file_id: str, destination: Path, expected_bytes: int,
         html = tmp.is_file() and _file_starts_with_html(tmp)
         bad = completed.returncode != 0 or not tmp.is_file() or tmp.stat().st_size != expected or html
         if bad:
-            failures += 1
             tmp.unlink(missing_ok=True)
             if html:
+                # Quota HTML is transient. Do not burn the hard-failure budget on it.
                 chunk = max(1024 * 1024, chunk // 2)
-            if failures >= 80:
-                raise PreparationError(
-                    "Google Drive range download failed",
-                    {"file_id": file_id, "offset": offset, "chunk": chunk},
-                )
-            time.sleep(45 if html else min(30, 2 ** min(failures, 5)))
+                time.sleep(120)
+            else:
+                failures += 1
+                if failures >= 80:
+                    raise PreparationError(
+                        "Google Drive range download failed",
+                        {"file_id": file_id, "offset": offset, "chunk": chunk},
+                    )
+                time.sleep(min(30, 2 ** min(failures, 5)))
             try:
                 uuid = _gdrive_confirm_uuid(file_id, cookies)
             except PreparationError:
