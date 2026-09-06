@@ -13,6 +13,7 @@ import struct
 import subprocess
 import sys
 import tarfile
+import time
 import zipfile
 from collections import defaultdict
 from pathlib import Path
@@ -77,6 +78,7 @@ RELEASE_FILES = (
 LOTUSDIS_VIEW_PREFERENCE = ("jbl", "bt3m", "bt10m", "con123")
 NOTSOFAR_SIM_MIXTURE_CHANNELS = 7
 NOTSOFAR_SIM_SAMPLE_RATE = 16000
+GDRIVE_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
 
 def _load_module(name: str, path: Path):
@@ -1174,7 +1176,7 @@ def _gdrive_confirm_uuid(file_id: str, cookies: Path) -> str:
             "--silent",
             "--location",
             "-A",
-            "Mozilla/5.0",
+            GDRIVE_USER_AGENT,
             "-b",
             str(cookies),
             "-c",
@@ -1212,7 +1214,7 @@ def _gdrive_range_download(file_id: str, destination: Path, expected_bytes: int,
     if offset and _file_starts_with_html(partial):
         partial.unlink()
         offset = 0
-    chunk = 32 * 1024 * 1024
+    chunk = 8 * 1024 * 1024
     uuid = _gdrive_confirm_uuid(file_id, cookies)
     failures = 0
     while offset < expected_bytes:
@@ -1225,7 +1227,7 @@ def _gdrive_range_download(file_id: str, destination: Path, expected_bytes: int,
                 "--silent",
                 "--location",
                 "-A",
-                "Mozilla/5.0",
+                GDRIVE_USER_AGENT,
                 "-b",
                 str(cookies),
                 "-c",
@@ -1242,23 +1244,27 @@ def _gdrive_range_download(file_id: str, destination: Path, expected_bytes: int,
             check=False,
         )
         expected = end - offset + 1
-        bad = (
-            completed.returncode != 0
-            or not tmp.is_file()
-            or tmp.stat().st_size != expected
-            or _file_starts_with_html(tmp)
-        )
+        html = tmp.is_file() and _file_starts_with_html(tmp)
+        bad = completed.returncode != 0 or not tmp.is_file() or tmp.stat().st_size != expected or html
         if bad:
             failures += 1
             tmp.unlink(missing_ok=True)
-            if failures >= 8:
+            if html:
+                chunk = max(1024 * 1024, chunk // 2)
+            if failures >= 24:
                 raise PreparationError(
                     "Google Drive range download failed",
-                    {"file_id": file_id, "offset": offset},
+                    {"file_id": file_id, "offset": offset, "chunk": chunk},
                 )
-            uuid = _gdrive_confirm_uuid(file_id, cookies)
+            time.sleep(min(30, 2 ** min(failures, 5)))
+            try:
+                uuid = _gdrive_confirm_uuid(file_id, cookies)
+            except PreparationError:
+                continue
             continue
         failures = 0
+        if chunk < 8 * 1024 * 1024:
+            chunk = min(8 * 1024 * 1024, chunk * 2)
         if offset == 0 and tmp.read_bytes()[:2] != b"PK":
             tmp.unlink(missing_ok=True)
             raise PreparationError("Google Drive range download is not a zip", {"file_id": file_id})

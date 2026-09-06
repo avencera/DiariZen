@@ -149,6 +149,15 @@ class LotusdisParentTest(unittest.TestCase):
         )
 
 
+class GdriveUserAgentTest(unittest.TestCase):
+    def test_confirm_user_agent_is_full_browser_string(self):
+        from recipes.speakrs.large.prepare import GDRIVE_USER_AGENT
+
+        self.assertIn("Macintosh", GDRIVE_USER_AGENT)
+        self.assertIn("AppleWebKit", GDRIVE_USER_AGENT)
+        self.assertGreater(len(GDRIVE_USER_AGENT), len("Mozilla/5.0"))
+
+
 class LotusdisViewTest(unittest.TestCase):
     def test_prefers_jbl_then_rejects_lavalier_only(self):
         import zipfile
