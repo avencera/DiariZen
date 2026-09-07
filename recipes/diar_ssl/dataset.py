@@ -2,8 +2,9 @@
 # Copyright 2020 CNRS (author: Herve Bredin, herve.bredin@irit.fr)
 # Copyright 2024 Brno University of Technology (author: Jiangyu Han, ihan@fit.vut.cz)
 
+import math
 import os
-from typing import Dict
+from typing import Dict, Iterator
 
 import numpy as np
 import soundfile as sf
@@ -40,12 +41,34 @@ def load_scp(scp_file: str) -> Dict[str, str]:
     return {x[0]: x[1] for x in lines}
 
 
-def load_uem(uem_file: str) -> Dict[str, float]:
-    """returns dictionary { recid: duration }"""
+def load_uem(uem_file: str) -> Dict[str, list[tuple[float, float]]] | None:
+    """Return every positive, non-overlapping ``(start, end)`` span per recording."""
+
     if not os.path.exists(uem_file):
         return None
-    lines = [line.strip().split() for line in open(uem_file)]
-    return {x[0]: [float(x[-2]), float(x[-1])] for x in lines}
+    regions: Dict[str, list[tuple[float, float]]] = {}
+    with open(uem_file) as file:
+        for line_number, line in enumerate(file, 1):
+            fields = line.strip().split()
+            if not fields or fields[0].startswith("#"):
+                continue
+            if len(fields) < 4:
+                raise ValueError(f"UEM line {line_number} must contain recording, channel, start, and end")
+            try:
+                start = float(fields[-2])
+                end = float(fields[-1])
+            except ValueError as error:
+                raise ValueError(f"UEM line {line_number} has non-numeric bounds") from error
+            if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
+                raise ValueError(f"UEM line {line_number} must have finite positive bounds")
+            regions.setdefault(fields[0], []).append((start, end))
+
+    for recording, spans in regions.items():
+        spans.sort()
+        for previous, current in zip(spans, spans[1:]):
+            if current[0] < previous[1]:
+                raise ValueError(f"UEM recording {recording} contains overlapping spans")
+    return regions
 
 
 def _gen_chunk_indices(
@@ -53,12 +76,17 @@ def _gen_chunk_indices(
     data_len: int,
     size: int,
     step: int,
-) -> None:
+) -> Iterator[tuple[int, int]]:
+    if size <= 0 or step <= 0:
+        raise ValueError("chunk size and shift must be positive")
     init_posi = int(init_posi + 1)
     data_len = int(data_len - 1)
     cur_len = data_len - init_posi
-    assert cur_len > size
+    if cur_len <= size:
+        raise ValueError("UEM span is too short for the requested chunk size")
     num_chunks = int((cur_len - size + step) / step)
+    if num_chunks <= 0:
+        raise ValueError("UEM span cannot produce a complete chunk")
 
     for i in range(num_chunks):
         yield init_posi + (i * step), init_posi + (i * step) + size
@@ -123,17 +151,19 @@ class DiarizationDataset(Dataset):
 
         self.rec_scp = load_scp(scp_file)
         self.reco2dur = load_uem(uem_file)
+        if self.reco2dur is None:
+            raise ValueError(f"UEM file does not exist: {uem_file}")
 
-        for rec, dur_info in self.reco2dur.items():
+        for rec, spans in self.reco2dur.items():
             if rec not in self.rec_scp:
                 raise ValueError(f"UEM recording is absent from wav.scp: {rec}")
 
-            start_sec, end_sec = dur_info
-            if chunk_size > 0:
-                for st, ed in _gen_chunk_indices(start_sec, end_sec, chunk_size, chunk_shift):
-                    self.chunk_indices.append((rec, self.rec_scp[rec], st, ed))  # seconds
-            else:
-                self.chunk_indices.append((rec, self.rec_scp[rec], start_sec, end_sec))
+            for start_sec, end_sec in spans:
+                if chunk_size > 0:
+                    for st, ed in _gen_chunk_indices(start_sec, end_sec, chunk_size, chunk_shift):
+                        self.chunk_indices.append((rec, self.rec_scp[rec], st, ed))  # seconds
+                else:
+                    self.chunk_indices.append((rec, self.rec_scp[rec], start_sec, end_sec))
 
         self.annotations = self.rttm2label(rttm_file)
 
@@ -149,27 +179,28 @@ class DiarizationDataset(Dataset):
         SPEAKER train100_306 1 15.71 1.76 <NA> <NA> 5456 <NA> <NA>
         """
         annotations = []
-        session_lst = []
+        speaker_indices = {}
         with open(rttm_file, "r") as file:
-            for seg_idx, line in enumerate(file):
+            for line in file:
                 line = line.split()
+                if not line or line[0].startswith("#"):
+                    continue
                 session, start, dur = line[1], line[3], line[4]
 
                 start = float(start)
                 end = start + float(dur)
                 spk = line[-2] if line[-2] != "<NA>" else line[-3]
 
-                # new nession
-                if session not in session_lst:
-                    unique_label_lst = []
-                    session_lst.append(session)
-
-                if spk not in unique_label_lst:
-                    unique_label_lst.append(spk)
-
-                label_idx = unique_label_lst.index(spk)
+                session_speakers = speaker_indices.setdefault(session, {})
+                label_idx = session_speakers.setdefault(spk, len(session_speakers))
 
                 annotations.append((self.get_session_idx(session), start, end, label_idx))
+
+        if not annotations:
+            return np.empty(
+                0,
+                dtype=[("session_idx", "i1"), ("start", "f"), ("end", "f"), ("label_idx", "i1")],
+            )
 
         segment_dtype = [
             (

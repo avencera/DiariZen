@@ -22,6 +22,7 @@ from .verify import verify_local
 COMMANDS = (
     "prepare",
     "verify-data",
+    "data",
     "export-wavlm",
     "verify-local",
     "preflight",
@@ -36,6 +37,19 @@ COMMANDS = (
     "resume",
     "verify-image",
     "package-handoff",
+)
+
+DATA_COMMANDS = (
+    "plan",
+    "prepare",
+    "verify",
+    "upload",
+    "verify-remote",
+    "commit-release",
+    "restore-check",
+    "final-restore",
+    "evict",
+    "handoff",
 )
 
 
@@ -136,6 +150,55 @@ def build_parser() -> argparse.ArgumentParser:
     handoff.add_argument("--spec", required=True, type=Path)
     handoff.add_argument("--verification", required=True, type=Path)
     handoff.add_argument("--output", required=True, type=Path)
+
+    data = sub.add_parser("data", help="verify and store accepted training inputs")
+    data_sub = data.add_subparsers(dest="data_command", required=True)
+    data_plan = data_sub.add_parser("plan", help="validate membership and emit required inputs")
+    data_plan.add_argument("--config", required=True, type=Path)
+    data_plan.add_argument("--output", required=True, type=Path)
+    data_prepare = data_sub.add_parser("prepare", help="process eligible sources with bounded staging")
+    data_prepare.add_argument("--config", required=True, type=Path)
+    data_prepare.add_argument("--source", default="all")
+    data_prepare.add_argument("--output", required=True, type=Path)
+    data_verify = data_sub.add_parser("verify", help="verify content, QA, splits, hours, and capacity")
+    data_verify.add_argument("--release", required=True, type=Path)
+    data_verify.add_argument("--config", required=True, type=Path)
+    data_verify.add_argument("--output", required=True, type=Path)
+    data_upload = data_sub.add_parser("upload", help="upload accepted training artifacts")
+    data_upload.add_argument("--release", required=True, type=Path)
+    data_upload.add_argument("--config", required=True, type=Path)
+    data_upload.add_argument("--output", required=True, type=Path)
+    data_upload.add_argument("--artifacts", type=Path)
+    data_verify_remote = data_sub.add_parser("verify-remote", help="full readback and batch commit")
+    data_verify_remote.add_argument("--receipt", required=True, type=Path)
+    data_verify_remote.add_argument("--config", required=True, type=Path)
+    data_verify_remote.add_argument("--output", required=True, type=Path)
+    data_commit = data_sub.add_parser("commit-release", help="commit the final remote release seal")
+    data_commit.add_argument("--release", required=True, type=Path)
+    data_commit.add_argument("--receipts", required=True, type=Path)
+    data_commit.add_argument("--config", required=True, type=Path)
+    data_commit.add_argument("--output", required=True, type=Path)
+    data_restore = data_sub.add_parser("restore-check", help="cold restore through the production reader")
+    data_restore.add_argument("--receipt", required=True, type=Path)
+    data_restore.add_argument("--config", required=True, type=Path)
+    data_restore.add_argument("--output", required=True, type=Path)
+    data_final_restore = data_sub.add_parser(
+        "final-restore", help="build a content-bound restore index for the committed release"
+    )
+    data_final_restore.add_argument("--release", required=True, type=Path)
+    data_final_restore.add_argument("--seal", required=True, type=Path)
+    data_final_restore.add_argument("--config", required=True, type=Path)
+    data_final_restore.add_argument("--output", required=True, type=Path)
+    data_final_restore.add_argument("--restores", type=Path)
+    data_evict = data_sub.add_parser("evict", help="remove eligible task-owned local files")
+    data_evict.add_argument("--receipt", required=True, type=Path)
+    data_evict.add_argument("--config", required=True, type=Path)
+    data_evict.add_argument("--output", required=True, type=Path)
+    data_data_handoff = data_sub.add_parser("handoff", help="emit the private index after a final seal")
+    data_data_handoff.add_argument("--release", required=True, type=Path)
+    data_data_handoff.add_argument("--receipt", required=True, type=Path)
+    data_data_handoff.add_argument("--config", required=True, type=Path)
+    data_data_handoff.add_argument("--output", required=True, type=Path)
     return parser
 
 
@@ -153,7 +216,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         result = dispatch(args)
     except LargeError as error:
-        return _fail(error)
+        code = _fail(error)
+        if getattr(error, "unresolved", False) or error.code == "unresolved":
+            return 2
+        return code
     except Exception as error:  # noqa: BLE001 - CLI must not emit traceback-only failures
         _print_json(
             {
@@ -178,6 +244,10 @@ def dispatch(args: argparse.Namespace) -> dict:
     """Dispatch a parsed command."""
 
     command = args.command
+    if command == "data":
+        from .data import dispatch_data
+
+        return dispatch_data(args)
     if command == "prepare":
         spec = load_spec(args.spec)
         return prepare_release(spec, args.output, plan_only=bool(args.plan))

@@ -1,0 +1,17 @@
+{
+  "policy_id": "speakrs-label-qa-v1",
+  "frozen_at": "2026-09-07T00:00:00Z",
+  "seed": 3407,
+  "speech_convention": "audible-speaker-activity-on-emitted-training-signal",
+  "frame_seconds": 0.02,
+  "collar_seconds": 0.0,
+  "speaker_time_denominator": "union-of-human-corrected-speaker-activity",
+  "window_seconds": 30,
+  "uniform_windows": 50,
+  "targeted_windows": 50,
+  "min_parents": 10,
+  "reviewer_procedure": "authorized-human-corrects-speaker-activity-then-independent-sign-off",
+  "overall_miss_fa_limit": 0.05,
+  "stratum_miss_fa_limit": 0.10,
+  "difficult_strata": ["overlap", "quiet-speech", "short-turns", "channel-defects"]
+}

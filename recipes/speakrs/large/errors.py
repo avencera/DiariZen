@@ -6,11 +6,19 @@ from __future__ import annotations
 class LargeError(RuntimeError):
     """A machine-readable Large recipe failure."""
 
-    def __init__(self, code: str, message: str, details: dict | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        details: dict | None = None,
+        *,
+        unresolved: bool = False,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.details = details or {}
+        self.unresolved = unresolved or code == "unresolved"
 
     def to_json(self) -> dict[str, object]:
         """Return the JSON error body written on nonzero exits."""
@@ -44,3 +52,10 @@ class RuntimeGateError(LargeError):
 
     def __init__(self, message: str, details: dict | None = None) -> None:
         super().__init__("runtime", message, details)
+
+
+class UnresolvedInputError(LargeError):
+    """An external input the executor cannot resolve without the user."""
+
+    def __init__(self, message: str, details: dict | None = None) -> None:
+        super().__init__("unresolved", message, details, unresolved=True)
