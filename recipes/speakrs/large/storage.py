@@ -1788,12 +1788,9 @@ class WranglerR2Backend:
                 evidence[name] = value
         return evidence
 
-    def provider_encryption_evidence(self, key: str) -> dict[str, object] | None:
-        """Return provider encryption policy bound to an authenticated bucket and object."""
+    def _provider_encryption_evidence_after_readback(self) -> dict[str, object]:
+        """Return bucket encryption policy after a caller proved object existence."""
 
-        _validate_key(key)
-        if not self.exists(key):
-            return None
         bucket = self._authenticated_bucket_evidence()
         configured = self.encryption_at_rest
         if configured is not None:
@@ -1803,7 +1800,7 @@ class WranglerR2Backend:
             if normalized not in {"AES256", "AES-256", "AES-256-GCM"}:
                 raise PreparationError(
                     "configured encryption evidence differs from Cloudflare R2 default policy",
-                    {"key": key},
+                    {"bucket": self.destination.bucket},
                 )
         return {
             "provider": "cloudflare-r2",
@@ -1811,6 +1808,14 @@ class WranglerR2Backend:
             "bucket": bucket,
             "authenticated": True,
         }
+
+    def provider_encryption_evidence(self, key: str) -> dict[str, object] | None:
+        """Return provider encryption policy bound to an authenticated bucket and object."""
+
+        _validate_key(key)
+        if not self.exists(key):
+            return None
+        return self._provider_encryption_evidence_after_readback()
 
     def provider_privacy_evidence(self) -> dict[str, object]:
         """Require disabled managed public access and no custom domains."""
@@ -1980,6 +1985,41 @@ def _readback(
     return ReadbackProof(key=key, sha256=actual, size=size)
 
 
+def _readback_payload(
+    backend: StorageBackend,
+    key: str,
+    *,
+    expected_sha256: str | None = None,
+    expected_size: int | None = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    max_bytes: int | None = DEFAULT_MAX_OBJECT_BYTES,
+) -> tuple[ReadbackProof, bytes]:
+    """Read one bounded object once while retaining a small caller-selected payload."""
+
+    key = _validate_key(key)
+    digest = hashlib.sha256()
+    size = 0
+    payload = bytearray()
+    for chunk in _iter_backend_bytes(backend, key, chunk_size=chunk_size, max_bytes=max_bytes):
+        digest.update(chunk)
+        size += len(chunk)
+        payload.extend(chunk)
+    actual = digest.hexdigest()
+    if expected_size is not None and size != expected_size:
+        raise PreparationError(
+            "remote object size differs from the accepted identity",
+            {"key": key, "actual_size": size, "expected_size": expected_size},
+        )
+    if expected_sha256 is not None:
+        expected = require_content_hash(expected_sha256, "expected sha256")
+        if actual != expected:
+            raise PreparationError(
+                "partial/corrupt/missing remote content cannot commit",
+                {"key": key, "actual": actual, "expected": expected},
+            )
+    return ReadbackProof(key=key, sha256=actual, size=size), bytes(payload)
+
+
 def full_readback_sha256(
     backend: StorageBackend,
     key: str,
@@ -2001,6 +2041,9 @@ def full_readback_sha256(
     ).sha256
 
 
+_NO_PROVIDER_EVIDENCE = object()
+
+
 def _assert_anonymous_denied(status: int, label: str) -> None:
     if 200 <= status < 300:
         raise PreparationError("public/readable anonymous objects fail privacy check", {"check": label})
@@ -2010,28 +2053,113 @@ def _assert_anonymous_denied(status: int, label: str) -> None:
         raise UnresolvedInputError("anonymous privacy check could not be resolved", {"check": label, "status": status})
 
 
-def assert_private_access(backend: StorageBackend, key: str, prefix: str) -> dict[str, object]:
-    """Authenticated read must work; anonymous GET/list must not disclose contents."""
+def _provider_privacy_evidence(backend: StorageBackend) -> object:
+    checker = getattr(backend, "provider_privacy_evidence", None)
+    if not callable(checker):
+        return _NO_PROVIDER_EVIDENCE
+    return checker()
+
+
+def _privacy_evidence_after_readback(
+    backend: StorageBackend,
+    proof: ReadbackProof,
+    prefix: str,
+    *,
+    anonymous_list: tuple[int, Sequence[str]] | None = None,
+    provider_evidence: object = _NO_PROVIDER_EVIDENCE,
+) -> dict[str, object]:
+    """Check anonymous privacy after authenticated bytes have already been proved."""
 
     prefix = _validate_prefix(prefix)
-    readback = _readback(backend, key)
-    get_status, _ = backend.anonymous_get(key)
-    list_status, _ = backend.anonymous_list(prefix)
+    if anonymous_list is None:
+        list_status, _ = backend.anonymous_list(prefix)
+    else:
+        list_status = anonymous_list[0]
+    get_status, _ = backend.anonymous_get(proof.key)
     _assert_anonymous_denied(get_status, "anonymous-get")
     _assert_anonymous_denied(list_status, "anonymous-list")
-    if backend.is_public(key):
-        raise PreparationError("public/readable anonymous objects fail privacy check", {"key": key})
     result: dict[str, object] = {
-        "authenticated_bytes": readback.size,
-        "authenticated_sha256": readback.sha256,
+        "authenticated_bytes": proof.size,
+        "authenticated_sha256": proof.sha256,
         "anonymous_get_status": get_status,
         "anonymous_list_status": list_status,
         "denied_anonymous": True,
     }
-    provider_check = getattr(backend, "provider_privacy_evidence", None)
-    if callable(provider_check):
-        result["provider"] = provider_check()
+    if provider_evidence is _NO_PROVIDER_EVIDENCE:
+        provider_evidence = _provider_privacy_evidence(backend)
+    if provider_evidence is not _NO_PROVIDER_EVIDENCE:
+        result["provider"] = provider_evidence
     return result
+
+
+def _encryption_evidence_after_readback(
+    backend: StorageBackend,
+    proof: ReadbackProof,
+    *,
+    wrangler_policy: object = _NO_PROVIDER_EVIDENCE,
+) -> tuple[str, object]:
+    """Read encryption metadata without re-reading an already proved Wrangler object."""
+
+    if isinstance(backend, WranglerR2Backend):
+        if wrangler_policy is _NO_PROVIDER_EVIDENCE:
+            wrangler_policy = backend._provider_encryption_evidence_after_readback()
+        if not isinstance(wrangler_policy, Mapping):
+            raise PreparationError("missing encryption evidence", {"key": proof.key})
+        return json.dumps(wrangler_policy, sort_keys=True, separators=(",", ":")), wrangler_policy
+    metadata = backend.head(proof.key)
+    if not isinstance(metadata, Mapping):
+        raise PreparationError("remote metadata is not an object", {"key": proof.key})
+    encryption = metadata.get("encryption")
+    if not isinstance(encryption, str) or not encryption:
+        raise PreparationError("missing encryption evidence", {"key": proof.key})
+    return encryption, wrangler_policy
+
+
+class _RemoteEvidenceSession:
+    """Cache operation-scoped privacy and provider policy evidence."""
+
+    __slots__ = ("backend", "_anonymous_list", "_privacy_prefix", "_provider_privacy", "_wrangler_policy")
+
+    def __init__(self, backend: StorageBackend, *, privacy_prefix: str | None = None) -> None:
+        self.backend = backend
+        self._privacy_prefix = (
+            _validate_prefix(privacy_prefix, "privacy_prefix") if privacy_prefix is not None else None
+        )
+        self._anonymous_list: tuple[int, Sequence[str]] | None = None
+        self._provider_privacy: object = _NO_PROVIDER_EVIDENCE
+        self._wrangler_policy: object = _NO_PROVIDER_EVIDENCE
+
+    def encryption_for(self, proof: ReadbackProof) -> str:
+        encryption, self._wrangler_policy = _encryption_evidence_after_readback(
+            self.backend,
+            proof,
+            wrangler_policy=self._wrangler_policy,
+        )
+        return encryption
+
+    def privacy_for(self, proof: ReadbackProof) -> dict[str, object]:
+        if self._privacy_prefix is None:
+            raise ContractError("privacy evidence requires a privacy prefix")
+        if self._anonymous_list is None:
+            self._anonymous_list = self.backend.anonymous_list(self._privacy_prefix)
+            _assert_anonymous_denied(self._anonymous_list[0], "anonymous-list")
+        if self._provider_privacy is _NO_PROVIDER_EVIDENCE:
+            self._provider_privacy = _provider_privacy_evidence(self.backend)
+        return _privacy_evidence_after_readback(
+            self.backend,
+            proof,
+            self._privacy_prefix,
+            anonymous_list=self._anonymous_list,
+            provider_evidence=self._provider_privacy,
+        )
+
+
+def assert_private_access(backend: StorageBackend, key: str, prefix: str) -> dict[str, object]:
+    """Authenticated read must work; anonymous GET/list must not disclose contents."""
+
+    proof = _readback(backend, key)
+    session = _RemoteEvidenceSession(backend, privacy_prefix=prefix)
+    return session.privacy_for(proof)
 
 
 def _object_identity(item: Mapping[str, object], label: str = "object") -> dict[str, object]:
@@ -2340,10 +2468,11 @@ def _publish_marker(
     *,
     marker_key: str,
     privacy_prefix: str,
+    marker_prefix: str | None = None,
 ) -> dict[str, object]:
     marker_key = _validate_key(marker_key, "marker key")
     marker_kind = "releases" if payload.get("schema") == "speakrs-remote-release-v1" else "batches"
-    _validate_marker_publication_scope(marker_key, privacy_prefix, marker_kind)
+    _validate_marker_publication_scope(marker_key, marker_prefix or privacy_prefix, marker_kind)
     marker_bytes = _canonical_json_bytes(payload)
     marker_sha256 = sha256_bytes(marker_bytes)
     backend.put_content_addressed(marker_key, marker_bytes, content_type="application/json")
@@ -2353,10 +2482,9 @@ def _publish_marker(
         expected_sha256=marker_sha256,
         expected_size=len(marker_bytes),
     )
-    encryption = backend.encryption_evidence(marker_key)
-    if not encryption:
-        raise PreparationError("missing encryption evidence", {"key": marker_key})
-    privacy = assert_private_access(backend, marker_key, privacy_prefix)
+    evidence = _RemoteEvidenceSession(backend, privacy_prefix=privacy_prefix)
+    encryption = evidence.encryption_for(proof)
+    privacy = evidence.privacy_for(proof)
     return {
         "key": proof.key,
         "sha256": proof.sha256,
@@ -2371,8 +2499,7 @@ def _read_marker(backend: StorageBackend, reference: Mapping[str, object]) -> di
     key = _validate_key(str(reference.get("key", "")), "marker key")
     digest = require_content_hash(reference.get("sha256"), "marker sha256")
     size = _positive_int(reference.get("size"), "marker size")
-    proof = _readback(backend, key, expected_sha256=digest, expected_size=size)
-    marker_bytes = _collect_chunks(_iter_backend_bytes(backend, key), max_bytes=DEFAULT_MAX_OBJECT_BYTES)
+    proof, marker_bytes = _readback_payload(backend, key, expected_sha256=digest, expected_size=size)
     marker_match = re.search(
         r"(?:^|/)(?P<relative>_commits/(?P<kind>batches|releases)/[0-9a-fA-F]{64}\.json)$",
         key,
@@ -2426,6 +2553,246 @@ def _marker_acceptance_hashes(payload: Mapping[str, object]) -> set[str]:
     return values
 
 
+_BATCH_SEAL_TOKEN = object()
+
+
+@dataclass(frozen=True)
+class _VerifiedBatch:
+    """In-memory proof bundle accepted only by the private batch sealer."""
+
+    receipts: tuple[Mapping[str, object], ...]
+    inventory: Mapping[str, object]
+    token: object
+
+
+def _validate_batch_contract(
+    *,
+    state: BatchState,
+    label_policy_id: str,
+    split_id: str,
+    qa_policy_sha256: str,
+    acceptance_sha256: str | None,
+    backend: StorageBackend | None,
+    inventory_prefix: str | None,
+) -> tuple[str, str]:
+    if is_placeholder_hash(qa_policy_sha256):
+        raise ContractError("placeholder hashes cannot seal a real release")
+    if not isinstance(label_policy_id, str) or not label_policy_id:
+        raise ContractError("label_policy_id must be a non-empty string")
+    if not isinstance(split_id, str) or not split_id:
+        raise ContractError("split_id must be a non-empty string")
+    if state not in {BatchState.DRAFT, BatchState.OBJECTS_VERIFIED, BatchState.COMMITTED}:
+        raise ContractError("batch state is unknown")
+    if backend is None or inventory_prefix is None:
+        raise UnresolvedInputError("a backend and scoped inventory prefix are required for a remote batch commit")
+    return require_content_hash(acceptance_sha256, "acceptance sha256"), _validate_prefix(
+        inventory_prefix, "inventory_prefix"
+    )
+
+
+def _expected_batch_inventory(
+    expected_objects: Sequence[Mapping[str, object]] | None,
+) -> dict[str, dict[str, object]]:
+    if expected_objects is None:
+        raise ContractError("expected_objects is required; uploaded rows cannot define the expected inventory")
+    if not isinstance(expected_objects, Sequence) or isinstance(expected_objects, (str, bytes)):
+        raise ContractError("expected_objects must be an array")
+    identities = [_object_identity(item, f"expected_objects[{index}]") for index, item in enumerate(expected_objects)]
+    if not identities:
+        raise PreparationError("a remote batch must contain at least one accepted object")
+    expected_by_key = {str(item["key"]): item for item in identities}
+    if len(expected_by_key) != len(identities):
+        raise ContractError("expected_objects contains duplicate keys")
+    return expected_by_key
+
+
+def _uploaded_batch_inventory(
+    objects: Sequence[Mapping[str, object]],
+    expected_by_key: Mapping[str, Mapping[str, object]],
+) -> dict[str, Mapping[str, object]]:
+    if not isinstance(objects, Sequence) or isinstance(objects, (str, bytes)):
+        raise ContractError("uploaded objects must be an array")
+    actual_by_key: dict[str, Mapping[str, object]] = {}
+    for item in objects:
+        identity = _object_identity(item, "uploaded object")
+        key = str(identity["key"])
+        if key in actual_by_key:
+            raise PreparationError("uploaded inventory contains duplicate keys", {"key": key})
+        actual_by_key[key] = item
+        if item.get("state") != ObjectState.UPLOADED.value:
+            raise PreparationError("remote verification requires UPLOADED objects", {"key": key})
+        expected_item = expected_by_key.get(key)
+        if expected_item is None:
+            raise PreparationError(
+                "remote batch contains an object outside the explicit accepted inventory", {"key": key}
+            )
+        _compare_object_identity(expected_item, item, "batch")
+    if set(actual_by_key) != set(expected_by_key):
+        raise PreparationError(
+            "remote batch does not cover the explicit accepted inventory",
+            {
+                "missing": sorted(set(expected_by_key) - set(actual_by_key))[:20],
+                "extra": sorted(set(actual_by_key) - set(expected_by_key))[:20],
+            },
+        )
+    return actual_by_key
+
+
+def _receipt_from_readback(
+    item: Mapping[str, object],
+    proof: ReadbackProof,
+    *,
+    encryption: str,
+) -> dict[str, object]:
+    identity = _object_identity(item, "uploaded object")
+    payload = {
+        "key": proof.key,
+        "sha256": proof.sha256,
+        "size": proof.size,
+        "purpose": identity.get("purpose"),
+        "parent_id": identity.get("parent_id"),
+        "source": identity.get("source"),
+        "state": ObjectState.READBACK_VERIFIED.value,
+        "codec": identity.get("codec"),
+        "etag": None,
+        "encryption": encryption,
+        "public": False,
+    }
+    receipt = parse_object_receipt(payload)
+    result = {
+        "key": receipt.key,
+        "sha256": receipt.sha256,
+        "size": receipt.size,
+        "purpose": receipt.purpose,
+        "parent_id": receipt.parent_id,
+        "source": receipt.source,
+        "state": receipt.state.value,
+        "codec": receipt.codec,
+        "etag": receipt.etag,
+        "encryption": receipt.encryption,
+        "public": False,
+    }
+    if "version" in identity:
+        result["version"] = identity["version"]
+    return result
+
+
+def _seal_batch(
+    verified: _VerifiedBatch,
+    *,
+    state: BatchState,
+    label_policy_id: str,
+    split_id: str,
+    qa_policy_sha256: str,
+    acceptance_sha256: str,
+    backend: StorageBackend,
+    inventory_prefix: str,
+    privacy_prefix: str | None = None,
+    marker_key: str | None = None,
+) -> dict[str, object]:
+    """Publish a batch marker from one in-memory verified operation."""
+
+    if verified.token is not _BATCH_SEAL_TOKEN:
+        raise TypeError("batch sealing requires an operation-owned verification bundle")
+    marker_inventory = _stable_inventory(
+        verified.inventory,
+        [str(item["key"]) for item in verified.receipts],
+    )
+    base: dict[str, object] = {
+        "schema": "speakrs-remote-batch-v1",
+        "state": BatchState.COMMITTED.value,
+        "objects": [dict(item) for item in verified.receipts],
+        "label_policy_id": label_policy_id,
+        "split_id": split_id,
+        "qa_policy_sha256": str(qa_policy_sha256).lower(),
+        "acceptance_sha256": acceptance_sha256,
+        "inventory": marker_inventory,
+    }
+    batch_sha256 = sha256_json(base)
+    resolved_marker_key = marker_key or _marker_key(inventory_prefix, "batches", batch_sha256)
+    marker_payload = {**base, "batch_sha256": batch_sha256}
+    marker = _publish_marker(
+        backend,
+        marker_payload,
+        marker_key=resolved_marker_key,
+        privacy_prefix=privacy_prefix or inventory_prefix,
+        marker_prefix=inventory_prefix,
+    )
+    if state is BatchState.DRAFT:
+        assert_state_transition(state, BatchState.OBJECTS_VERIFIED, BATCH_TRANSITIONS, "batch")
+        state = BatchState.OBJECTS_VERIFIED
+    if state is BatchState.OBJECTS_VERIFIED:
+        assert_state_transition(state, BatchState.COMMITTED, BATCH_TRANSITIONS, "batch")
+    elif state is not BatchState.COMMITTED:
+        raise ContractError("batch state is unknown")
+    result = dict(marker_payload)
+    result["marker"] = marker
+    return result
+
+
+def verify_and_commit_batch(
+    objects: Sequence[Mapping[str, object]],
+    *,
+    state: BatchState,
+    label_policy_id: str,
+    split_id: str,
+    qa_policy_sha256: str,
+    expected_objects: Sequence[Mapping[str, object]],
+    acceptance_sha256: str,
+    backend: StorageBackend,
+    inventory_prefix: str,
+    privacy_prefix: str,
+    allowed_inventory_keys: Sequence[str] = (),
+    marker_key: str | None = None,
+    required_keys: Sequence[str] | None = None,
+) -> dict[str, object]:
+    """Verify uploaded objects once and publish an immutable batch marker."""
+
+    del required_keys
+    acceptance, inventory_scope = _validate_batch_contract(
+        state=state,
+        label_policy_id=label_policy_id,
+        split_id=split_id,
+        qa_policy_sha256=qa_policy_sha256,
+        acceptance_sha256=acceptance_sha256,
+        backend=backend,
+        inventory_prefix=inventory_prefix,
+    )
+    expected_by_key = _expected_batch_inventory(expected_objects)
+    uploaded_by_key = _uploaded_batch_inventory(objects, expected_by_key)
+    evidence = _RemoteEvidenceSession(backend, privacy_prefix=privacy_prefix)
+    receipts: list[Mapping[str, object]] = []
+    for key in sorted(expected_by_key):
+        expected = expected_by_key[key]
+        proof = _readback(
+            backend,
+            key,
+            expected_sha256=str(expected["sha256"]),
+            expected_size=int(expected["size"]),
+        )
+        encryption = evidence.encryption_for(proof)
+        evidence.privacy_for(proof)
+        receipts.append(_receipt_from_readback(uploaded_by_key[key], proof, encryption=encryption))
+    inventory = verify_inventory_closure(
+        backend,
+        receipts,
+        prefix=inventory_scope,
+        allowed_keys=[*allowed_inventory_keys, *_known_marker_keys(backend, inventory_scope, kind="batches")],
+    )
+    return _seal_batch(
+        _VerifiedBatch(tuple(receipts), inventory, _BATCH_SEAL_TOKEN),
+        state=state,
+        label_policy_id=label_policy_id,
+        split_id=split_id,
+        qa_policy_sha256=qa_policy_sha256,
+        acceptance_sha256=acceptance,
+        backend=backend,
+        inventory_prefix=inventory_scope,
+        privacy_prefix=privacy_prefix,
+        marker_key=marker_key,
+    )
+
+
 def commit_batch(
     objects: Sequence[Mapping[str, object]],
     *,
@@ -2443,29 +2810,16 @@ def commit_batch(
 ) -> dict[str, object]:
     """Read back an explicit accepted inventory and publish an immutable batch marker."""
 
-    if is_placeholder_hash(qa_policy_sha256):
-        raise ContractError("placeholder hashes cannot seal a real release")
-    if not isinstance(label_policy_id, str) or not label_policy_id:
-        raise ContractError("label_policy_id must be a non-empty string")
-    if not isinstance(split_id, str) or not split_id:
-        raise ContractError("split_id must be a non-empty string")
-    if state not in {BatchState.DRAFT, BatchState.OBJECTS_VERIFIED, BatchState.COMMITTED}:
-        raise ContractError("batch state is unknown")
-    if backend is None or inventory_prefix is None:
-        raise UnresolvedInputError("a backend and scoped inventory prefix are required for a remote batch commit")
-    acceptance = require_content_hash(acceptance_sha256, "acceptance sha256")
-    if expected_objects is None:
-        raise ContractError("expected_objects is required; uploaded rows cannot define the expected inventory")
-    if not isinstance(expected_objects, Sequence) or isinstance(expected_objects, (str, bytes)):
-        raise ContractError("expected_objects must be an array")
-    expected_identities = [
-        _object_identity(item, f"expected_objects[{index}]") for index, item in enumerate(expected_objects)
-    ]
-    if not expected_identities:
-        raise PreparationError("a remote batch must contain at least one accepted object")
-    expected_by_key = {str(item["key"]): item for item in expected_identities}
-    if len(expected_by_key) != len(expected_identities):
-        raise ContractError("expected_objects contains duplicate keys")
+    acceptance, prefix = _validate_batch_contract(
+        state=state,
+        label_policy_id=label_policy_id,
+        split_id=split_id,
+        qa_policy_sha256=qa_policy_sha256,
+        acceptance_sha256=acceptance_sha256,
+        backend=backend,
+        inventory_prefix=inventory_prefix,
+    )
+    expected_by_key = _expected_batch_inventory(expected_objects)
     actual_by_key: dict[str, Mapping[str, object]] = {}
     for item in objects:
         identity = _object_identity(item, "uploaded object")
@@ -2473,7 +2827,11 @@ def commit_batch(
         if key in actual_by_key:
             raise PreparationError("uploaded inventory contains duplicate keys", {"key": key})
         actual_by_key[key] = item
-        if ObjectState(str(item.get("state"))) is not ObjectState.READBACK_VERIFIED:
+        try:
+            item_state = ObjectState(str(item.get("state")))
+        except ValueError as error:
+            raise ContractError("object state is unknown", {"key": key}) from error
+        if item_state is not ObjectState.READBACK_VERIFIED:
             raise PreparationError("partial/corrupt/missing remote content cannot commit", {"key": key})
         expected_item = expected_by_key.get(key)
         if expected_item is None:
@@ -2489,7 +2847,6 @@ def commit_batch(
                 "extra": sorted(set(actual_by_key) - set(expected_by_key))[:20],
             },
         )
-    prefix = _validate_prefix(inventory_prefix, "inventory_prefix")
     expected_receipts = []
     for key in sorted(expected_by_key):
         item = actual_by_key[key]
@@ -2511,31 +2868,17 @@ def commit_batch(
         prefix=prefix,
         allowed_keys=[*allowed_inventory_keys, *_known_marker_keys(backend, prefix, kind="batches")],
     )
-    marker_inventory = _stable_inventory(inventory, [str(item["key"]) for item in expected_receipts])
-    base: dict[str, object] = {
-        "schema": "speakrs-remote-batch-v1",
-        "state": BatchState.COMMITTED.value,
-        "objects": expected_receipts,
-        "label_policy_id": label_policy_id,
-        "split_id": split_id,
-        "qa_policy_sha256": str(qa_policy_sha256).lower(),
-        "acceptance_sha256": acceptance,
-        "inventory": marker_inventory,
-    }
-    batch_sha256 = sha256_json(base)
-    resolved_marker_key = marker_key or _marker_key(prefix, "batches", batch_sha256)
-    marker_payload = {**base, "batch_sha256": batch_sha256}
-    marker = _publish_marker(backend, marker_payload, marker_key=resolved_marker_key, privacy_prefix=prefix)
-    if state is BatchState.DRAFT:
-        assert_state_transition(state, BatchState.OBJECTS_VERIFIED, BATCH_TRANSITIONS, "batch")
-        state = BatchState.OBJECTS_VERIFIED
-    if state is BatchState.OBJECTS_VERIFIED:
-        assert_state_transition(state, BatchState.COMMITTED, BATCH_TRANSITIONS, "batch")
-    elif state is not BatchState.COMMITTED:
-        raise ContractError("batch state is unknown")
-    result = dict(marker_payload)
-    result["marker"] = marker
-    return result
+    return _seal_batch(
+        _VerifiedBatch(tuple(expected_receipts), inventory, _BATCH_SEAL_TOKEN),
+        state=state,
+        label_policy_id=label_policy_id,
+        split_id=split_id,
+        qa_policy_sha256=qa_policy_sha256,
+        acceptance_sha256=acceptance,
+        backend=backend,
+        inventory_prefix=prefix,
+        marker_key=marker_key,
+    )
 
 
 def _validate_batch_marker(backend: StorageBackend, batch: Mapping[str, object]) -> dict[str, object]:
@@ -3305,6 +3648,85 @@ def _verify_copy_before_eviction(
     return verify_remote_restore_proof(typed, backend=backend)
 
 
+def _group_copy_proof(copy: LocalCopy, session: _CleanupVerificationSession) -> RemoteRestoreProof:
+    """Bind one caller copy to the proof owned by a fresh cleanup session."""
+
+    candidate = _copy_proof(copy, None)
+    proof = session.proof_for(candidate.object_key)
+    if any(
+        (
+            getattr(candidate, field) != getattr(proof, field)
+            if field != "restore_receipt_path"
+            else candidate.restore_receipt_path.expanduser().resolve(strict=False)
+            != proof.restore_receipt_path.expanduser().resolve(strict=False)
+        )
+        for field in (
+            "object_key",
+            "object_sha256",
+            "object_size",
+            "acceptance_sha256",
+            "marker_key",
+            "marker_sha256",
+            "restore_receipt_sha256",
+            "restored_sha256",
+            "restored_size",
+            "restore_receipt_path",
+        )
+    ):
+        raise PreparationError(
+            "caller remote restore proof differs from the durable cleanup receipt", {"path": str(copy.path)}
+        )
+    return proof
+
+
+def _prepare_group_eviction_copy(
+    copy: LocalCopy,
+    *,
+    proof: RemoteRestoreProof,
+) -> LocalCopy:
+    """Run per-copy local checks before a grouped deletion core is entered."""
+
+    _validate_copy_metadata(copy)
+    if copy.state not in {LocalCopyState.RETAINED, LocalCopyState.EVICTION_ELIGIBLE}:
+        raise PreparationError("local copy is not retained", {"path": str(copy.path)})
+    expected_hash = require_content_hash(copy.sha256, "local copy sha256")
+    if proof.object_sha256 != expected_hash:
+        raise PreparationError("remote restore proof does not match the local copy", {"path": str(copy.path)})
+    if copy.path.is_file():
+        if sha256_file(copy.path) != expected_hash:
+            raise PreparationError("local copy changed after remote restore proof", {"path": str(copy.path)})
+        if copy.path.stat().st_size != proof.object_size:
+            raise PreparationError("local copy size differs from the remote proof", {"path": str(copy.path)})
+    elif copy.state is LocalCopyState.RETAINED:
+        raise PreparationError("eviction requires one existing task-owned regular file", {"path": str(copy.path)})
+    if copy.state is LocalCopyState.EVICTION_ELIGIBLE:
+        return LocalCopy(
+            path=copy.path,
+            state=copy.state,
+            source=copy.source,
+            sha256=copy.sha256,
+            live_readers=copy.live_readers,
+            task_owned=copy.task_owned,
+            labels_accepted=copy.labels_accepted,
+            remote_verified=True,
+            remote_proof=proof,
+            deletion_receipt=copy.deletion_receipt,
+        )
+    assert_state_transition(copy.state, LocalCopyState.EVICTION_ELIGIBLE, LOCAL_TRANSITIONS, "local")
+    return LocalCopy(
+        path=copy.path,
+        state=LocalCopyState.EVICTION_ELIGIBLE,
+        source=copy.source,
+        sha256=copy.sha256,
+        live_readers=copy.live_readers,
+        task_owned=copy.task_owned,
+        labels_accepted=copy.labels_accepted,
+        remote_verified=True,
+        remote_proof=proof,
+        deletion_receipt=copy.deletion_receipt,
+    )
+
+
 def _recheck_local_identity(path: Path, *, expected_sha256: str, expected_size: int, label: str) -> None:
     """Recheck local bytes and size after remote proof work and before deletion."""
 
@@ -3412,14 +3834,13 @@ def mark_eviction_eligible(
     )
 
 
-def evict_copy(
+def _evict_copy_after_proof(
     copy: LocalCopy,
     *,
-    proof: RemoteRestoreProof | Mapping[str, object] | None = None,
-    backend: StorageBackend | None = None,
+    proof: RemoteRestoreProof,
     preserve_on_interrupt: bool = False,
 ) -> LocalCopy:
-    """Delete one eligible task-owned file after rechecking its remote replacement."""
+    """Delete one eligible task-owned file after its remote proof is bound."""
 
     if copy.state is not LocalCopyState.EVICTION_ELIGIBLE:
         raise PreparationError("local copy is not eviction-eligible", {"path": str(copy.path)})
@@ -3446,9 +3867,6 @@ def evict_copy(
         )
         if recovered is None:
             raise PreparationError("eviction requires one existing task-owned regular file", {"path": str(copy.path)})
-        if backend is None:
-            raise UnresolvedInputError("eviction requires a backend to recheck the remote restore proof")
-        verify_remote_restore_proof(typed, backend=backend)
         if recovered.get("state") == DELETION_INTENT_STATE:
             intent = recovered.get("intent")
             if not isinstance(intent, Mapping):
@@ -3460,7 +3878,6 @@ def evict_copy(
             if not isinstance(completion, Mapping):
                 raise PreparationError("completed deletion journal has no receipt", {"path": str(copy.path)})
         return _evicted_copy(copy, typed, dict(completion))
-    typed = _verify_copy_before_eviction(copy, proof=proof, backend=backend)
     _recheck_local_identity(
         copy.path,
         expected_sha256=typed.object_sha256,
@@ -3487,6 +3904,30 @@ def evict_copy(
     return _evicted_copy(copy, typed, deletion)
 
 
+def evict_copy(
+    copy: LocalCopy,
+    *,
+    proof: RemoteRestoreProof | Mapping[str, object] | None = None,
+    backend: StorageBackend | None = None,
+    preserve_on_interrupt: bool = False,
+) -> LocalCopy:
+    """Delete one eligible task-owned file after rechecking its remote replacement."""
+
+    if copy.state is not LocalCopyState.EVICTION_ELIGIBLE:
+        raise PreparationError("local copy is not eviction-eligible", {"path": str(copy.path)})
+    if preserve_on_interrupt:
+        raise PreparationError("interrupted eviction", {"path": str(copy.path)})
+    if not copy.path.exists():
+        _validate_copy_metadata(copy)
+        typed = _copy_proof(copy, proof)
+        if backend is None:
+            raise UnresolvedInputError("eviction requires a backend to recheck the remote restore proof")
+        verify_remote_restore_proof(typed, backend=backend)
+        return _evict_copy_after_proof(copy, proof=typed, preserve_on_interrupt=preserve_on_interrupt)
+    typed = _verify_copy_before_eviction(copy, proof=proof, backend=backend)
+    return _evict_copy_after_proof(copy, proof=typed, preserve_on_interrupt=preserve_on_interrupt)
+
+
 def _load_json_mapping(
     value: Mapping[str, object] | Path | str,
     label: str,
@@ -3505,6 +3946,290 @@ def _load_json_mapping(
     if not isinstance(payload, dict):
         raise ContractError(f"{label} must contain a JSON object")
     return payload, path, sha256_file(path)
+
+
+_CLEANUP_SESSION_TOKEN = object()
+
+
+def _bare_object_identity(item: Mapping[str, object], label: str) -> dict[str, object]:
+    identity = _object_identity(item, label)
+    return {key: identity[key] for key in ("key", "sha256", "size")}
+
+
+class _CleanupVerificationSession:
+    """Private remote proof shared by one grouped cleanup operation."""
+
+    __slots__ = (
+        "_acceptance_sha256",
+        "_marker",
+        "_marker_records",
+        "_manifest_bytes",
+        "_manifest_payload",
+        "_proofs",
+        "_restore_path",
+        "_restore_sha256",
+        "_restored_records",
+        "_token",
+    )
+
+    def __init__(
+        self,
+        *,
+        acceptance_sha256: str,
+        marker: Mapping[str, object],
+        marker_records: Mapping[str, Mapping[str, object]],
+        manifest_bytes: bytes,
+        manifest_payload: Mapping[str, object],
+        proofs: Mapping[str, RemoteRestoreProof],
+        restore_path: Path,
+        restore_sha256: str,
+        restored_records: Mapping[str, Mapping[str, object]],
+        token: object,
+    ) -> None:
+        if token is not _CLEANUP_SESSION_TOKEN:
+            raise TypeError("cleanup verification sessions are created by grouped cleanup owners")
+        self._acceptance_sha256 = acceptance_sha256
+        self._marker = dict(marker)
+        self._marker_records = dict(marker_records)
+        self._manifest_bytes = manifest_bytes
+        self._manifest_payload = dict(manifest_payload)
+        self._proofs = dict(proofs)
+        self._restore_path = restore_path
+        self._restore_sha256 = restore_sha256
+        self._restored_records = dict(restored_records)
+        self._token = token
+
+    @property
+    def acceptance_sha256(self) -> str:
+        return self._acceptance_sha256
+
+    @property
+    def marker(self) -> dict[str, object]:
+        return dict(self._marker)
+
+    @property
+    def marker_records(self) -> dict[str, Mapping[str, object]]:
+        return dict(self._marker_records)
+
+    @property
+    def manifest_bytes(self) -> bytes:
+        return self._manifest_bytes
+
+    @property
+    def manifest_payload(self) -> dict[str, object]:
+        return dict(self._manifest_payload)
+
+    @property
+    def restore_path(self) -> Path:
+        return self._restore_path
+
+    @property
+    def restore_sha256(self) -> str:
+        return self._restore_sha256
+
+    @property
+    def restored_records(self) -> dict[str, Mapping[str, object]]:
+        return dict(self._restored_records)
+
+    def proof_for(self, object_key: str) -> RemoteRestoreProof:
+        """Return the proof derived from this session's durable receipt."""
+
+        if self._token is not _CLEANUP_SESSION_TOKEN:
+            raise PreparationError("cleanup verification session is invalid")
+        try:
+            return self._proofs[_validate_key(object_key, "cleanup object key")]
+        except KeyError as error:
+            raise PreparationError(
+                "cleanup object is absent from the committed inventory", {"key": object_key}
+            ) from error
+
+
+def _build_cleanup_verification_session(
+    restore_receipt: Path | str,
+    *,
+    backend: StorageBackend,
+) -> _CleanupVerificationSession:
+    """Validate one durable restore receipt and read each committed object once."""
+
+    if not isinstance(restore_receipt, (Path, str)):
+        raise ContractError("grouped cleanup requires a durable cold restore receipt path")
+    restore, restore_path, restore_sha256 = _load_json_mapping(restore_receipt, "cold restore receipt")
+    if restore_path is None or restore_sha256 is None:
+        raise ContractError("grouped cleanup requires a durable cold restore receipt path")
+    if (
+        restore.get("schema") != "speakrs-cold-restore-v1"
+        or restore.get("command") != "restore-check"
+        or restore.get("ok") is not True
+    ):
+        raise PreparationError("cold restore receipt is not a successful cold-restore receipt")
+
+    acceptance_sha256 = require_content_hash(restore.get("acceptance_sha256"), "restore acceptance sha256")
+    marker_value = restore.get("marker")
+    if not isinstance(marker_value, Mapping):
+        raise PreparationError("cold restore receipt has no committed marker")
+    marker_key = _validate_key(str(marker_value.get("key", "")), "restore marker key")
+    marker_sha256 = require_content_hash(marker_value.get("sha256"), "restore marker sha256")
+    marker_size_value = marker_value.get("size")
+    if marker_size_value is None:
+        marker_size_raw = backend.head(marker_key).get("size")
+        if not marker_size_raw:
+            raise PreparationError("committed marker size is unavailable", {"key": marker_key})
+        try:
+            marker_size_value = int(marker_size_raw)
+        except (TypeError, ValueError) as error:
+            raise PreparationError("committed marker size is invalid", {"key": marker_key}) from error
+    marker_size = _positive_int(marker_size_value, "marker size")
+    marker_reference = {"key": marker_key, "sha256": marker_sha256, "size": marker_size}
+    marker_payload = _read_marker(backend, marker_reference)
+    if acceptance_sha256.lower() not in _marker_acceptance_hashes(marker_payload):
+        raise PreparationError("cold restore acceptance is not bound by the committed marker")
+    for digest_field in ("batch_sha256", "release_sha256"):
+        declared = restore.get(digest_field)
+        if declared is not None and marker_payload.get(digest_field) != declared:
+            raise PreparationError(
+                "cold restore marker identity differs from the receipt",
+                {"field": digest_field},
+            )
+
+    marker_records: dict[str, Mapping[str, object]] = {}
+    for index, item in enumerate(_marker_object_records(marker_payload)):
+        identity = _bare_object_identity(item, f"committed marker object[{index}]")
+        key = str(identity["key"])
+        if key in marker_records:
+            raise PreparationError("committed marker contains duplicate object keys", {"key": key})
+        marker_records[key] = item
+    if not marker_records:
+        raise PreparationError("committed marker contains no objects")
+
+    restore_objects = restore.get("objects")
+    if not isinstance(restore_objects, list) or not restore_objects:
+        raise PreparationError("cold restore receipt has no restored object inventory")
+    restored_records: dict[str, Mapping[str, object]] = {}
+    for index, item in enumerate(restore_objects):
+        identity = _bare_object_identity(item, f"restore object[{index}]")
+        key = str(identity["key"])
+        if key in restored_records:
+            raise PreparationError("cold restore receipt contains duplicate objects", {"key": key})
+        restored_path = item.get("restored_path")
+        if not isinstance(restored_path, str) or not restored_path:
+            raise PreparationError("cold restore receipt does not name every restored file", {"key": key})
+        path = Path(restored_path).expanduser()
+        restored_records[key] = {**identity, "restored_path": path.as_posix()}
+
+    if set(marker_records) != set(restored_records):
+        raise PreparationError("cold restore object inventory differs from the committed marker")
+    for key in marker_records:
+        if _bare_object_identity(marker_records[key], "committed marker object") != {
+            field: restored_records[key][field] for field in ("key", "sha256", "size")
+        }:
+            raise PreparationError("cold restore object inventory differs from the committed marker", {"key": key})
+
+    proofs: dict[str, RemoteRestoreProof] = {}
+    manifest_keys = [key for key, item in marker_records.items() if item.get("purpose") == "manifest"]
+    if len(manifest_keys) != 1:
+        raise PreparationError("committed marker requires exactly one portable manifest")
+    manifest_key = manifest_keys[0]
+    manifest_payload: Mapping[str, object] | None = None
+    manifest_bytes = b""
+    evidence_session = _RemoteEvidenceSession(backend)
+    for key in sorted(marker_records):
+        marker_record = marker_records[key]
+        identity = _bare_object_identity(marker_record, "committed marker object")
+        if key == manifest_key:
+            proof, payload = _readback_payload(
+                backend,
+                key,
+                expected_sha256=str(identity["sha256"]),
+                expected_size=int(identity["size"]),
+            )
+            manifest_bytes = payload
+            try:
+                decoded = json.loads(payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise PreparationError("remote portable manifest is not valid JSON", {"key": key}) from error
+            if not isinstance(decoded, Mapping):
+                raise PreparationError("remote portable manifest is not an object", {"key": key})
+            manifest_payload = decoded
+        else:
+            proof = _readback(
+                backend,
+                key,
+                expected_sha256=str(identity["sha256"]),
+                expected_size=int(identity["size"]),
+            )
+        encryption = evidence_session.encryption_for(proof)
+        if not encryption or encryption != marker_record.get("encryption"):
+            raise PreparationError("remote encryption evidence differs from the committed marker", {"key": key})
+        restored = restored_records[key]
+        proofs[key] = RemoteRestoreProof(
+            object_key=key,
+            object_sha256=str(identity["sha256"]),
+            object_size=int(identity["size"]),
+            acceptance_sha256=acceptance_sha256,
+            marker_key=marker_key,
+            marker_sha256=marker_sha256,
+            restore_receipt_sha256=restore_sha256,
+            restored_sha256=str(restored["sha256"]),
+            restored_size=int(restored["size"]),
+            restore_receipt_path=restore_path,
+        )
+    if manifest_payload is None:
+        raise PreparationError("committed marker requires exactly one portable manifest")
+    return _CleanupVerificationSession(
+        acceptance_sha256=acceptance_sha256,
+        marker=marker_reference,
+        marker_records=marker_records,
+        manifest_bytes=manifest_bytes,
+        manifest_payload=manifest_payload,
+        proofs=proofs,
+        restore_path=restore_path,
+        restore_sha256=restore_sha256,
+        restored_records=restored_records,
+        token=_CLEANUP_SESSION_TOKEN,
+    )
+
+
+def _validate_restored_local_files(session: _CleanupVerificationSession) -> None:
+    """Validate every cold-restored file before grouped raw-source deletion."""
+
+    for key, record in session.restored_records.items():
+        restored_path = record.get("restored_path")
+        if not isinstance(restored_path, str) or not restored_path:
+            raise PreparationError("cold restore receipt does not name every restored file", {"key": key})
+        path = Path(restored_path).expanduser()
+        if path.is_symlink() or not path.is_file():
+            raise PreparationError("cold restore receipt names a missing or non-regular file", {"path": str(path)})
+        if path.stat().st_size != record["size"] or sha256_file(path) != record["sha256"]:
+            raise PreparationError("cold restore receipt has a changed restored file", {"key": key})
+
+
+def evict_copies(
+    copies: Sequence[LocalCopy],
+    *,
+    restore_receipt: Path | str,
+    backend: StorageBackend,
+    preserve_on_interrupt: bool = False,
+) -> list[LocalCopy]:
+    """Delete grouped local copies after one fresh remote cleanup verification."""
+
+    if not isinstance(copies, Sequence) or isinstance(copies, (str, bytes)):
+        raise ContractError("grouped eviction copies must be an array")
+    session = _build_cleanup_verification_session(restore_receipt, backend=backend)
+    prepared: list[LocalCopy] = []
+    paths: set[Path] = set()
+    for copy in copies:
+        if not isinstance(copy, LocalCopy):
+            raise ContractError("grouped eviction copies must be LocalCopy values")
+        normalized_path = copy.path.expanduser().resolve(strict=False)
+        if normalized_path in paths:
+            raise PreparationError("grouped eviction contains duplicate local paths", {"path": str(copy.path)})
+        paths.add(normalized_path)
+        proof = _group_copy_proof(copy, session)
+        prepared.append(_prepare_group_eviction_copy(copy, proof=proof))
+    return [
+        _evict_copy_after_proof(copy, proof=_copy_proof(copy, None), preserve_on_interrupt=preserve_on_interrupt)
+        for copy in prepared
+    ]
 
 
 def _portable_facts(value: object) -> object:
@@ -3627,40 +4352,6 @@ def _consumed_source_receipts(
     return receipts, manifest_receipts[0]
 
 
-def _consumed_source_restore_objects(
-    restore: Mapping[str, object],
-    *,
-    accepted_outputs: Sequence[Mapping[str, object]],
-) -> dict[str, dict[str, object]]:
-    objects = restore.get("objects")
-    if not isinstance(objects, list):
-        raise PreparationError("cold restore receipt has no restored object inventory")
-    restored: dict[str, dict[str, object]] = {}
-    for index, item in enumerate(objects):
-        if not isinstance(item, Mapping):
-            raise PreparationError("cold restore receipt contains an invalid object", {"index": index})
-        identity = _object_identity(item, f"restore object[{index}]")
-        key = str(identity["key"])
-        if key in restored:
-            raise PreparationError("cold restore receipt contains duplicate objects", {"key": key})
-        restored_path = item.get("restored_path")
-        if not isinstance(restored_path, str) or not restored_path:
-            raise PreparationError("cold restore receipt does not name every restored file", {"key": key})
-        path = Path(restored_path).expanduser()
-        if path.is_symlink() or not path.is_file():
-            raise PreparationError("cold restore receipt names a missing or non-regular file", {"path": str(path)})
-        if path.stat().st_size != identity["size"] or sha256_file(path) != identity["sha256"]:
-            raise PreparationError("cold restore receipt has a changed restored file", {"key": key})
-        restored[key] = {**identity, "restored_path": path.as_posix()}
-    for item in accepted_outputs:
-        key = _object_identity(item)["key"]
-        if key not in restored or any(
-            restored[key][field] != _object_identity(item)[field] for field in ("sha256", "size")
-        ):
-            raise PreparationError("cold restore proof does not cover an accepted output", {"key": key})
-    return restored
-
-
 def _consumed_source_completion(intent: Mapping[str, object]) -> dict[str, object]:
     return _receipt_with_hash(
         {
@@ -3696,16 +4387,15 @@ def _deletion_completion_for_intent(intent: Mapping[str, object]) -> dict[str, o
     raise ContractError("deletion intent operation is unknown")
 
 
-def discard_consumed_source(
+def _discard_consumed_source_with_session(
     request: ConsumedSource | Mapping[str, object],
     *,
     transform_receipt: Mapping[str, object] | Path | str,
     portable_manifest: Mapping[str, object] | Path | str,
     accepted_outputs: Sequence[Mapping[str, object]],
-    restore_receipt: Mapping[str, object] | Path | str,
-    backend: StorageBackend,
+    session: _CleanupVerificationSession,
 ) -> dict[str, object]:
-    """Delete one raw source file after its canonical and cold-restore proofs close.
+    """Delete one raw source file after a grouped remote proof and local checks.
 
     This API consumes exactly one parent file. It never consumes an archive, a directory,
     or multiple parents through one receipt.
@@ -3804,66 +4494,39 @@ def discard_consumed_source(
         raise PreparationError("portable manifest has no version identity")
     if any(item.get("source") != manifest_source or item.get("version") != manifest_version for item in receipts):
         raise PreparationError("accepted output receipt source/version differs from the portable manifest")
-    restore, restore_path, restore_file_sha256 = _load_json_mapping(restore_receipt, "cold restore receipt")
-    if restore_path is None or restore_file_sha256 is None:
-        raise ContractError("consumed-source cleanup requires a durable cold restore receipt path")
-    if restore.get("schema") != "speakrs-cold-restore-v1" or restore.get("command") != "restore-check":
-        raise ContractError("cold restore receipt schema is unknown")
-    if restore.get("ok") is not True:
-        raise PreparationError("cold restore receipt is not successful")
-    acceptance_sha256 = require_content_hash(restore.get("acceptance_sha256"), "restore acceptance sha256")
+    acceptance_sha256 = session.acceptance_sha256
     if require_content_hash(portable.get("acceptance_sha256"), "portable acceptance sha256") != acceptance_sha256:
         raise PreparationError("portable manifest and cold restore acceptance identities differ")
-    marker = restore.get("marker")
-    if not isinstance(marker, Mapping):
-        raise PreparationError("cold restore receipt has no committed marker")
-    marker_reference = dict(marker)
-    marker_key = _validate_key(str(marker_reference.get("key", "")), "restore marker key")
-    marker_sha256 = require_content_hash(marker_reference.get("sha256"), "restore marker sha256")
-    marker_reference["key"] = marker_key
-    marker_reference["sha256"] = marker_sha256
-    if not marker_reference.get("size"):
-        marker_size = backend.head(marker_key).get("size")
-        if not marker_size:
-            raise PreparationError("committed marker size is unavailable", {"key": marker_key})
-        try:
-            marker_reference["size"] = int(marker_size)
-        except (TypeError, ValueError) as error:
-            raise PreparationError("committed marker size is invalid", {"key": marker_key}) from error
-    marker_payload = _read_marker(backend, marker_reference)
-    if acceptance_sha256 not in _marker_acceptance_hashes(marker_payload):
-        raise PreparationError("cold restore acceptance is not bound by the committed marker")
-    marker_records: dict[str, Mapping[str, object]] = {}
-    for item in _marker_object_records(marker_payload):
-        key = str(_object_identity(item)["key"])
-        if key in marker_records:
-            raise PreparationError("committed marker contains duplicate object keys", {"key": key})
-        marker_records[key] = item
+    marker_reference = session.marker
+    marker_key = str(marker_reference["key"])
+    marker_sha256 = str(marker_reference["sha256"])
+    marker_records = session.marker_records
     for receipt in receipts:
         key = str(receipt["key"])
         marker_record = marker_records.get(key)
         if marker_record is None:
             raise PreparationError("accepted output is absent from the committed marker", {"key": key})
         _compare_object_identity(receipt, marker_record, "consumed-source marker")
-        _readback(backend, key, expected_sha256=str(receipt["sha256"]), expected_size=int(receipt["size"]))
-        if backend.encryption_evidence(key) != receipt.get("encryption"):
+        if marker_record.get("encryption") != receipt.get("encryption"):
             raise PreparationError("accepted output encryption differs from its receipt", {"key": key})
-    restored = _consumed_source_restore_objects(restore, accepted_outputs=receipts)
+        restored = session.restored_records.get(key)
+        if restored is None or any(restored[field] != receipt[field] for field in ("key", "sha256", "size")):
+            raise PreparationError("cold restore proof does not cover an accepted output", {"key": key})
+    restored = session.restored_records
     manifest_key = str(manifest_receipt["key"])
-    manifest_bytes = backend.get_bytes(manifest_key)
+    if manifest_key not in session.marker_records or session.marker_records[manifest_key].get("purpose") != "manifest":
+        raise PreparationError("accepted output manifest is absent from the committed marker", {"key": manifest_key})
+    manifest_bytes = session.manifest_bytes
+    remote_portable = session.manifest_payload
     if len(manifest_bytes) != manifest_receipt["size"] or sha256_bytes(manifest_bytes) != manifest_receipt["sha256"]:
         raise PreparationError("remote portable manifest failed full readback", {"key": manifest_key})
-    try:
-        remote_portable = json.loads(manifest_bytes)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise PreparationError("remote portable manifest is not valid JSON", {"key": manifest_key}) from error
     if remote_portable != portable:
         raise PreparationError("portable manifest differs from the committed remote object", {"key": manifest_key})
     if portable_path is not None:
         if portable_file_sha256 != manifest_receipt["sha256"] or portable_path.read_bytes() != manifest_bytes:
             raise PreparationError("local portable manifest differs from the committed remote object")
-    restore_receipt_sha256 = restore_file_sha256
-    restore_receipt_path = restore_path.expanduser().resolve(strict=False)
+    restore_receipt_sha256 = session.restore_sha256
+    restore_receipt_path = session.restore_path
     restore_marker = {"key": marker_key, "sha256": marker_sha256}
     transform_receipt_sha256 = transform_file_sha256 or sha256_json(transform)
     accepted_output_identities = [
@@ -3941,6 +4604,118 @@ def discard_consumed_source(
     deletion = _consumed_source_completion(intent)
     _persist_deletion_completion(intent, deletion)
     return deletion
+
+
+def discard_consumed_sources(
+    requests: Sequence[ConsumedSource | Mapping[str, object]],
+    *,
+    transform_receipt: Mapping[str, object] | Path | str,
+    portable_manifest: Mapping[str, object] | Path | str | None = None,
+    accepted_outputs: Sequence[Mapping[str, object]] | None = None,
+    restore_receipt: Path | str,
+    backend: StorageBackend,
+) -> list[dict[str, object]]:
+    """Delete grouped raw source files after one fresh remote cleanup verification."""
+
+    if not isinstance(requests, Sequence) or isinstance(requests, (str, bytes)):
+        raise ContractError("grouped consumed sources must be an array")
+    session = _build_cleanup_verification_session(restore_receipt, backend=backend)
+    typed_requests: list[ConsumedSource] = []
+    paths: set[Path] = set()
+    parents: set[str] = set()
+    for request in requests:
+        typed = request if isinstance(request, ConsumedSource) else ConsumedSource.from_mapping(request)
+        path = typed.path.expanduser().resolve(strict=False)
+        if path in paths:
+            raise PreparationError("grouped consumed sources contain duplicate paths", {"path": str(typed.path)})
+        if typed.parent_id in parents:
+            raise PreparationError(
+                "grouped consumed sources contain duplicate parent ids", {"parent_id": typed.parent_id}
+            )
+        paths.add(path)
+        parents.add(typed.parent_id)
+        typed_requests.append(typed)
+    transform, _, _ = _load_json_mapping(transform_receipt, "time-transform receipt")
+    transform_parents = transform.get("parents")
+    if transform.get("schema") != "speakrs-source-transforms-v1" or not isinstance(transform_parents, list):
+        raise ContractError("time-transform receipt schema is unknown")
+    transform_parent_ids = {item.get("parent_id") for item in transform_parents if isinstance(item, Mapping)}
+    if len(transform_parent_ids) != len(transform_parents) or None in transform_parent_ids:
+        raise PreparationError("time-transform receipt contains duplicate or invalid parents")
+    if portable_manifest is None:
+        portable = session.manifest_payload
+        portable_path = None
+        portable_sha256 = None
+    else:
+        portable, portable_path, portable_sha256 = _load_json_mapping(portable_manifest, "portable manifest")
+    if portable != session.manifest_payload:
+        raise PreparationError("portable manifest differs from the committed remote object")
+    if portable_path is not None and portable_sha256 != sha256_bytes(session.manifest_bytes):
+        raise PreparationError("local portable manifest differs from the committed remote object")
+    selected_parent_ids = portable.get("selected_parent_ids")
+    if not isinstance(selected_parent_ids, list):
+        recordings = portable.get("recordings")
+        selected_parent_ids = [item.get("recording_id") for item in recordings or () if isinstance(item, Mapping)]
+    if len(selected_parent_ids) != len(set(selected_parent_ids)) or set(selected_parent_ids) != transform_parent_ids:
+        raise PreparationError("consumed audio-parent inventory differs from the committed batch")
+    if not parents <= transform_parent_ids:
+        raise PreparationError("grouped consumed sources contain an unknown committed parent")
+    if accepted_outputs is None:
+        grouped_outputs = list(session.marker_records.values())
+    else:
+        grouped_outputs = list(accepted_outputs)
+    output_keys: list[str] = []
+    for item in grouped_outputs:
+        identity = _object_identity(item, "accepted output")
+        key = str(identity["key"])
+        if key in output_keys:
+            raise PreparationError("accepted output receipts contain duplicate keys", {"key": key})
+        marker_record = session.marker_records.get(key)
+        if marker_record is None:
+            raise PreparationError("accepted output is absent from the committed marker", {"key": key})
+        _compare_object_identity(item, marker_record, "grouped cleanup marker")
+        if item.get("encryption") != marker_record.get("encryption"):
+            raise PreparationError("accepted output encryption differs from its receipt", {"key": key})
+        output_keys.append(key)
+    if set(output_keys) != set(session.marker_records):
+        raise PreparationError("accepted output inventory differs from the committed marker")
+    if any(typed.path.expanduser().exists() for typed in typed_requests):
+        # completed deletion journals may outlive the restored local copies
+        _validate_restored_local_files(session)
+    grouped_portable = session.manifest_payload if portable_manifest is None else portable_manifest
+    return [
+        _discard_consumed_source_with_session(
+            typed,
+            transform_receipt=transform_receipt,
+            portable_manifest=grouped_portable,
+            accepted_outputs=grouped_outputs,
+            session=session,
+        )
+        for typed in typed_requests
+    ]
+
+
+def discard_consumed_source(
+    request: ConsumedSource | Mapping[str, object],
+    *,
+    transform_receipt: Mapping[str, object] | Path | str,
+    portable_manifest: Mapping[str, object] | Path | str,
+    accepted_outputs: Sequence[Mapping[str, object]],
+    restore_receipt: Mapping[str, object] | Path | str,
+    backend: StorageBackend,
+) -> dict[str, object]:
+    """Delete one raw source file through the grouped cleanup owner."""
+
+    if isinstance(restore_receipt, Mapping):
+        raise ContractError("single consumed-source cleanup requires a durable cold restore receipt path")
+    return discard_consumed_sources(
+        [request],
+        transform_receipt=transform_receipt,
+        portable_manifest=portable_manifest,
+        accepted_outputs=accepted_outputs,
+        restore_receipt=restore_receipt,
+        backend=backend,
+    )[0]
 
 
 def restore_object(

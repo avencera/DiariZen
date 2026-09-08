@@ -58,18 +58,16 @@ from .storage import (
     WranglerR2Backend,
     assert_private_access,
     backend_from_destination,
-    commit_batch,
     commit_release,
     directory_bytes,
-    discard_consumed_source,
+    discard_consumed_sources,
     enforce_cap,
     enforce_free_space_reserve,
-    evict_copy,
-    mark_eviction_eligible,
-    mark_readback_verified,
+    evict_copies,
     object_key,
     recover_deletion_journal,
     restore_object,
+    verify_and_commit_batch,
 )
 from .target_capacity import _load_powerset_class
 
@@ -662,35 +660,19 @@ def verify_remote(
     release = Path(str(receipt.get("release", "")))
     acceptance, manifest = _load_verified_selection(spec, release)
     expected = _package_selection(spec, release, acceptance, manifest)
-    expected_by_key = {item["key"]: item for item in expected}
-    uploaded = receipt.get("uploaded") or []
-    if (
-        not receipt.get("ok")
-        or len(uploaded) != len(expected_by_key)
-        or {item["key"] for item in uploaded} != set(expected_by_key)
-    ):
+    uploaded = receipt.get("uploaded")
+    if not receipt.get("ok") or not isinstance(uploaded, list):
         raise PreparationError("remote verification requires the complete independently accepted inventory")
-    for item in uploaded:
-        original = expected_by_key[item["key"]]
-        if any(
-            item.get(field) != original.get(field) for field in ("sha256", "size", "purpose", "source", "parent_id")
-        ):
-            raise PreparationError("uploaded inventory differs from accepted selection")
     if receipt.get("acceptance_sha256") != sha256_file(release / "acceptance.json"):
         raise PreparationError("upload receipt does not bind the current acceptance")
-    verified = []
-    for item in receipt.get("uploaded") or []:
-        marked = mark_readback_verified(item, backend=store, expected_sha256=str(item["sha256"]))
-        privacy = assert_private_access(store, marked["key"], spec.r2.prefix)
-        marked["privacy"] = privacy
-        verified.append(marked)
-    batch = commit_batch(
-        verified,
+    batch = verify_and_commit_batch(
+        uploaded,
         state=BatchState.DRAFT,
         expected_objects=expected,
         acceptance_sha256=receipt["acceptance_sha256"],
         backend=store,
         inventory_prefix=expected[0]["key"].split("/objects/")[0],
+        privacy_prefix=spec.r2.prefix,
         label_policy_id=label_policy_id,
         split_id=split_id,
         qa_policy_sha256=sha256_json(policy),
@@ -1510,34 +1492,15 @@ def discard_data_sources(
     if restore.get("schema") != "speakrs-cold-restore-v1" or restore.get("ok") is not True:
         raise PreparationError("consumed-source cleanup requires the actual cold restore receipt")
     store = _backend_from_spec(spec, backend)
-    batch, _ = _load_remote_batch(
-        spec,
-        {"batch": {"marker": restore["marker"], "batch_sha256": restore["batch_sha256"]}},
-        store,
-    )
-    manifests = [item for item in batch["objects"] if item["purpose"] == "manifest"]
-    if len(manifests) != 1:
-        raise PreparationError("consumed-source cleanup requires one committed portable manifest")
-    manifest_ref = manifests[0]
-    raw = store.get_bytes(manifest_ref["key"])
-    if len(raw) != manifest_ref["size"] or sha256_bytes(raw) != manifest_ref["sha256"]:
-        raise PreparationError("consumed-source portable manifest identity changed")
-    portable = json.loads(raw)
     transform = read_json(transform_path)
     parents = transform.get("parents") or []
-    if (
-        transform.get("schema") != "speakrs-source-transforms-v1"
-        or {row["parent_id"] for row in parents} != set(portable["selected_parent_ids"])
-        or len(parents) != len(portable["selected_parent_ids"])
-        or len({row["source_audio"] for row in parents}) != len(parents)
-    ):
-        raise PreparationError("consumed audio-parent inventory differs from the committed batch")
     restore_digest = sha256_file(receipt_path)
     previous = read_json(output) if output.is_file() else {}
     if previous and previous.get("restore_receipt_sha256") != restore_digest:
         raise PreparationError("consumed-source journal belongs to another cold restore")
     discarded = list(previous.get("discarded") or [])
     retained = []
+    pending: list[ConsumedSource] = []
     for parent in parents:
         path = Path(parent["source_audio"])
         if not path.resolve(strict=False).is_relative_to(spec.disk.staging_root.resolve()):
@@ -1572,20 +1535,21 @@ def discard_data_sources(
             )
             if recovered is None:
                 raise PreparationError("missing consumed source has no matching disposal receipt")
-        discarded.append(
-            discard_consumed_source(
-                ConsumedSource(path, parent["parent_id"], parent["source_sha256"], spec.disk.staging_root),
-                transform_receipt=transform_path,
-                portable_manifest=portable,
-                accepted_outputs=batch["objects"],
-                restore_receipt=receipt_path,
-                backend=store,
-            )
+        pending.append(ConsumedSource(path, parent["parent_id"], parent["source_sha256"], spec.disk.staging_root))
+    discarded.extend(
+        discard_consumed_sources(
+            pending,
+            transform_receipt=transform_path,
+            portable_manifest=None,
+            accepted_outputs=None,
+            restore_receipt=receipt_path,
+            backend=store,
         )
-        write_json(
-            output,
-            {"ok": False, "discarded": discarded, "retained": retained, "restore_receipt_sha256": restore_digest},
-        )
+    )
+    write_json(
+        output,
+        {"ok": False, "discarded": discarded, "retained": retained, "restore_receipt_sha256": restore_digest},
+    )
     payload = {
         "ok": True,
         "command": "discard-consumed-sources",
@@ -2516,6 +2480,7 @@ def evict_data(
         # raw disposal still checks the live cold copies before canonical-cache eviction removes them
         discard_data_sources(spec, receipt_path, transform_path, cleanup_path, backend=store)
         source_cleanup = {"path": str(cleanup_path), "sha256": sha256_file(cleanup_path)}
+    pending_copies: list[LocalCopy] = []
     for item in candidates:
         path = Path(item["path"])
         if not path.is_file() and path not in recovering:
@@ -2548,13 +2513,13 @@ def evict_data(
             labels_accepted=True,
             remote_proof=proof,
         )
-        eligible = copy if path in recovering else mark_eviction_eligible(copy, backend=store)
-        gone = evict_copy(eligible, backend=store)
-        evicted.append(dict(gone.deletion_receipt))
-        write_json(
-            output,
-            {"ok": False, "command": "evict", "evicted": evicted, "restore_receipt_sha256": restore_digest},
-        )
+        pending_copies.append(copy)
+    gone_copies = evict_copies(pending_copies, restore_receipt=receipt_path, backend=store)
+    evicted.extend(dict(copy.deletion_receipt) for copy in gone_copies if copy.deletion_receipt is not None)
+    write_json(
+        output,
+        {"ok": False, "command": "evict", "evicted": evicted, "restore_receipt_sha256": restore_digest},
+    )
     payload = {"ok": True, "command": "evict", "evicted": evicted, "restore_receipt_sha256": restore_digest}
     if source_cleanup is not None:
         payload["source_cleanup"] = source_cleanup

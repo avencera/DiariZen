@@ -32,7 +32,7 @@ from recipes.speakrs.large.contracts import (  # noqa: E402
 )
 from recipes.speakrs.large.data import restore_check  # noqa: E402
 from recipes.speakrs.large.errors import ContractError, PreparationError, UnresolvedInputError  # noqa: E402
-from recipes.speakrs.large.hashing import sha256_bytes, sha256_json  # noqa: E402
+from recipes.speakrs.large.hashing import sha256_bytes, sha256_file, sha256_json  # noqa: E402
 from recipes.speakrs.large.jsonio import write_json  # noqa: E402
 from recipes.speakrs.large.storage import (  # noqa: E402
     ConsumedSource,
@@ -47,7 +47,9 @@ from recipes.speakrs.large.storage import (  # noqa: E402
     commit_batch,
     commit_release,
     discard_consumed_source,
+    discard_consumed_sources,
     enforce_cap,
+    evict_copies,
     evict_copy,
     full_readback_sha256,
     mark_eviction_eligible,
@@ -57,6 +59,7 @@ from recipes.speakrs.large.storage import (  # noqa: E402
     recover_deletion_journal,
     upload_success_is_not_proof,
     validate_content_addressed_write,
+    verify_and_commit_batch,
 )
 from recipes.speakrs.tests.test_data_acceptance import (  # noqa: E402
     _data_spec_payload,
@@ -517,6 +520,112 @@ class WranglerR2BackendTest(unittest.TestCase):
         self.assertEqual(evidence["bucket"]["name"], "praveen")
         api_json.assert_called_once_with("a" * 32, "api-token", resource="", action="bucket")
 
+    def test_verify_and_commit_batch_counts_real_wrangler_requests(self):
+        from unittest import mock
+
+        backend = self._backend()
+        payload = b"alpha"
+        key = self._owned_key(payload)
+        expected = [
+            {
+                "key": key,
+                "sha256": sha256_bytes(payload),
+                "size": len(payload),
+                "purpose": "train-audio",
+                "parent_id": "p",
+                "source": "AMI",
+                "version": "official",
+                "codec": "flac",
+            }
+        ]
+        remote = {key: payload}
+        requests = []
+
+        def response(payload_bytes: bytes, status: int = 200):
+            return _FakeHttpResponse(status, [payload_bytes])
+
+        def fake_urlopen(request, timeout=60):
+            del timeout
+            requests.append(request)
+            parsed = urllib.parse.urlparse(request.full_url)
+            method = request.get_method()
+            path = parsed.path
+            if "/objects/" in path and method == "GET":
+                object_key_value = urllib.parse.unquote(path.split("/objects/", 1)[1])
+                if object_key_value not in remote:
+                    raise urllib.error.HTTPError(
+                        request.full_url,
+                        404,
+                        "not found",
+                        {},
+                        io.BytesIO(b"missing"),
+                    )
+                return response(remote[object_key_value])
+            if path.endswith("/objects") and method == "GET":
+                body = {
+                    "success": True,
+                    "result": [{"key": object_key_value} for object_key_value in sorted(remote)],
+                    "result_info": {"is_truncated": False},
+                }
+                return response(json.dumps(body).encode("utf-8"))
+            if path.endswith("/r2/buckets/praveen") and method == "GET":
+                return response(json.dumps({"success": True, "result": {"name": "praveen"}}).encode("utf-8"))
+            if path.endswith("/domains/managed") and method == "GET":
+                return response(json.dumps({"success": True, "result": {"enabled": False}}).encode("utf-8"))
+            if path.endswith("/domains/custom") and method == "GET":
+                return response(json.dumps({"success": True, "result": {"domains": []}}).encode("utf-8"))
+            if path.startswith("/praveen") and method == "GET":
+                return response(b"", status=403)
+            if "/objects/" in path and method == "PUT":
+                object_key_value = urllib.parse.unquote(path.split("/objects/", 1)[1])
+                remote[object_key_value] = bytes(request.data or b"")
+                return response(b"")
+            raise AssertionError(f"unexpected request: {method} {request.full_url}")
+
+        with mock.patch("recipes.speakrs.large.storage.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = verify_and_commit_batch(
+                [{**expected[0], "state": ObjectState.UPLOADED.value}],
+                state=BatchState.DRAFT,
+                expected_objects=expected,
+                acceptance_sha256=_h("acceptance"),
+                backend=backend,
+                inventory_prefix=self._PREFIX,
+                privacy_prefix=self._PREFIX,
+                label_policy_id="label-policy",
+                split_id="frozen",
+                qa_policy_sha256=_h("qa"),
+            )
+
+        marker_key = result["marker"]["key"]
+        authenticated_object_gets = [
+            request
+            for request in requests
+            if request.get_method() == "GET"
+            and request.get_header("Authorization")
+            and "/objects/" in urllib.parse.urlparse(request.full_url).path
+        ]
+        marker_gets = [request for request in authenticated_object_gets if marker_key in request.full_url]
+        object_gets = [request for request in authenticated_object_gets if key in request.full_url]
+        self.assertEqual(len(object_gets), 1)
+        self.assertEqual(len(marker_gets), 2)
+        self.assertEqual(
+            sum(
+                request.get_method() == "GET" and urllib.parse.urlparse(request.full_url).path.endswith("/objects")
+                for request in requests
+            ),
+            2,
+        )
+        self.assertEqual(sum(request.full_url.endswith("/r2/buckets/praveen") for request in requests), 2)
+        self.assertEqual(sum("/domains/managed" in request.full_url for request in requests), 2)
+        self.assertEqual(sum("/domains/custom" in request.full_url for request in requests), 2)
+        self.assertEqual(
+            sum(
+                request.full_url.startswith("https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com")
+                for request in requests
+            ),
+            4,
+        )
+
     def test_provider_privacy_evidence_requires_disabled_managed_route_and_no_custom_domain(self):
         from unittest import mock
 
@@ -827,6 +936,118 @@ class ConsumedSourceCleanupTest(unittest.TestCase):
             "backend": backend,
         }
 
+    def _grouped_copies(self, fixture, count=2):
+        restore = json.loads(fixture["restore_path"].read_text())
+        restore_sha256 = sha256_file(fixture["restore_path"])
+        marker = restore["marker"]
+        item = fixture["verified"][0]
+        restored = next(row for row in restore["objects"] if row["key"] == item["key"])
+        copies = []
+        for index in range(count):
+            path = fixture["staging"] / f"grouped-copy-{index}.bin"
+            path.write_bytes(fixture["backend"].get_bytes(item["key"]))
+            proof = RemoteRestoreProof(
+                object_key=item["key"],
+                object_sha256=item["sha256"],
+                object_size=item["size"],
+                acceptance_sha256=restore["acceptance_sha256"],
+                marker_key=marker["key"],
+                marker_sha256=marker["sha256"],
+                restore_receipt_sha256=restore_sha256,
+                restored_sha256=restored["sha256"],
+                restored_size=restored["size"],
+                restore_receipt_path=fixture["restore_path"],
+            )
+            copies.append(
+                LocalCopy(
+                    path=path,
+                    state=LocalCopyState.RETAINED,
+                    source="AMI",
+                    sha256=item["sha256"],
+                    labels_accepted=True,
+                    remote_proof=proof,
+                )
+            )
+        return copies, item["key"]
+
+    def test_grouped_eviction_reads_each_remote_object_once_for_duplicate_copies(self):
+        fixture = self._fixture()
+        copies, duplicate_key = self._grouped_copies(fixture)
+        backend = fixture["backend"]
+        restore = json.loads(fixture["restore_path"].read_text())
+        counts = {}
+        real_iter_bytes = backend.iter_bytes
+
+        def counted_iter(key, *, chunk_size=1024 * 1024, max_bytes=8 * 1024**3):
+            counts[key] = counts.get(key, 0) + 1
+            yield from real_iter_bytes(key, chunk_size=chunk_size, max_bytes=max_bytes)
+
+        backend.iter_bytes = counted_iter
+        gone = evict_copies(copies, restore_receipt=fixture["restore_path"], backend=backend)
+        self.assertEqual(len(gone), 2)
+        expected_keys = {restore["marker"]["key"], *(item["key"] for item in fixture["verified"])}
+        self.assertEqual({key: counts[key] for key in expected_keys}, dict.fromkeys(expected_keys, 1))
+        self.assertEqual(counts[duplicate_key], 1)
+        self.assertTrue(all(copy.state is LocalCopyState.EVICTED for copy in gone))
+
+    def test_grouped_eviction_corrupt_remote_fails_before_local_deletion(self):
+        fixture = self._fixture()
+        copies, corrupt_key = self._grouped_copies(fixture)
+        fixture["backend"].corrupt_get_keys.add(corrupt_key)
+        with self.assertRaises(PreparationError):
+            evict_copies(copies, restore_receipt=fixture["restore_path"], backend=fixture["backend"])
+        self.assertTrue(all(copy.path.is_file() for copy in copies))
+
+    def test_grouped_eviction_rejects_a_caller_fabricated_remote_proof(self):
+        fixture = self._fixture()
+        copies, key = self._grouped_copies(fixture)
+        fake_digest = sha256_bytes(b"fabricated")
+        real = copies[0].remote_proof
+        assert isinstance(real, RemoteRestoreProof)
+        copies[0].remote_proof = RemoteRestoreProof(
+            object_key=key,
+            object_sha256=fake_digest,
+            object_size=len(b"fabricated"),
+            acceptance_sha256=real.acceptance_sha256,
+            marker_key=real.marker_key,
+            marker_sha256=real.marker_sha256,
+            restore_receipt_sha256=real.restore_receipt_sha256,
+            restored_sha256=fake_digest,
+            restored_size=len(b"fabricated"),
+            restore_receipt_path=real.restore_receipt_path,
+        )
+        with self.assertRaises(PreparationError):
+            evict_copies(copies, restore_receipt=fixture["restore_path"], backend=fixture["backend"])
+        self.assertTrue(all(copy.path.is_file() for copy in copies))
+
+    def test_grouped_eviction_rechecks_each_local_copy_before_delete(self):
+        from unittest import mock
+
+        fixture = self._fixture()
+        copies, _ = self._grouped_copies(fixture)
+        first, second = copies
+        real_persist = __import__(
+            "recipes.speakrs.large.storage", fromlist=["_persist_deletion_intent"]
+        )._persist_deletion_intent
+        calls = {"count": 0}
+
+        def mutate_after_first_intent(intent):
+            result = real_persist(intent)
+            calls["count"] += 1
+            if calls["count"] == 1:
+                second.path.write_bytes(b"mutated")
+            return result
+
+        with mock.patch(
+            "recipes.speakrs.large.storage._persist_deletion_intent",
+            side_effect=mutate_after_first_intent,
+        ):
+            with self.assertRaises(PreparationError) as raised:
+                evict_copies(copies, restore_receipt=fixture["restore_path"], backend=fixture["backend"])
+        self.assertIn("changed after remote proof", str(raised.exception))
+        self.assertFalse(first.path.exists())
+        self.assertTrue(second.path.is_file())
+
     def test_discard_requires_complete_transform_and_restore_proof(self):
         fixture = self._fixture()
         request = ConsumedSource(
@@ -848,6 +1069,36 @@ class ConsumedSourceCleanupTest(unittest.TestCase):
         self.assertTrue(deletion["deleted"])
         self.assertEqual(deletion["parent_id"], "p1")
         self.assertEqual(len(deletion["accepted_outputs"]), 4)
+
+    def test_grouped_discard_requires_intact_restored_files_before_raw_deletion(self):
+        for mutation in ("missing", "corrupt", "symlink"):
+            with self.subTest(mutation=mutation):
+                fixture = self._fixture()
+                restore = json.loads(fixture["restore_path"].read_text())
+                restored_path = Path(restore["objects"][0]["restored_path"])
+                if mutation == "missing":
+                    restored_path.unlink()
+                elif mutation == "corrupt":
+                    restored_path.write_bytes(b"changed")
+                else:
+                    restored_path.unlink()
+                    restored_path.symlink_to(fixture["source_path"])
+                request = ConsumedSource(
+                    path=fixture["source_path"],
+                    parent_id="p1",
+                    source_sha256=fixture["source_sha256"],
+                    task_root=fixture["staging"],
+                )
+                with self.assertRaises(PreparationError):
+                    discard_consumed_sources(
+                        [request],
+                        transform_receipt=fixture["transform_path"],
+                        portable_manifest=fixture["portable_path"],
+                        accepted_outputs=fixture["verified"],
+                        restore_receipt=fixture["restore_path"],
+                        backend=fixture["backend"],
+                    )
+                self.assertTrue(fixture["source_path"].is_file())
 
     def test_discard_rejects_wrong_source_identity_and_active_reader(self):
         fixture = self._fixture()
@@ -931,6 +1182,253 @@ class UploadProofTest(unittest.TestCase):
         with self.assertRaises(PreparationError) as raised:
             upload_success_is_not_proof({"head": {"size": "12"}})
         self.assertIn("HEAD", str(raised.exception))
+
+
+class _CountingMemoryBackend(MemoryBackend):
+    def __init__(self):
+        super().__init__()
+        self.read_keys: list[str] = []
+        self.head_keys: list[str] = []
+        self.anonymous_get_keys: list[str] = []
+        self.anonymous_list_prefixes: list[str] = []
+
+    def iter_bytes(self, key, *, chunk_size=1024 * 1024, max_bytes=8 * 1024**3):
+        self.read_keys.append(key)
+        yield from super().iter_bytes(key, chunk_size=chunk_size, max_bytes=max_bytes)
+
+    def head(self, key):
+        self.head_keys.append(key)
+        return super().head(key)
+
+    def anonymous_get(self, key):
+        self.anonymous_get_keys.append(key)
+        return super().anonymous_get(key)
+
+    def anonymous_list(self, prefix):
+        self.anonymous_list_prefixes.append(prefix)
+        return super().anonymous_list(prefix)
+
+
+class VerifyAndCommitBatchTest(unittest.TestCase):
+    def _objects(self):
+        payloads = {"a": b"audio-a", "b": b"audio-b"}
+        expected = []
+        for parent_id, payload in payloads.items():
+            digest = sha256_bytes(payload)
+            expected.append(
+                {
+                    "key": object_key("AMI", "official", "train", digest, "flac"),
+                    "sha256": digest,
+                    "size": len(payload),
+                    "purpose": "train-audio",
+                    "parent_id": parent_id,
+                    "source": "AMI",
+                    "version": "official",
+                    "codec": "flac",
+                }
+            )
+        return expected, payloads
+
+    def test_owner_reads_each_data_object_once_and_marker_separately(self):
+        backend = _CountingMemoryBackend()
+        expected, payloads = self._objects()
+        for item, payload in zip(expected, payloads.values()):
+            backend.put_bytes(item["key"], payload)
+        uploaded = [{**item, "state": ObjectState.UPLOADED.value} for item in expected]
+
+        batch = verify_and_commit_batch(
+            uploaded,
+            state=BatchState.DRAFT,
+            expected_objects=expected,
+            acceptance_sha256=_h("acceptance"),
+            backend=backend,
+            inventory_prefix="datasets/AMI/official/train",
+            privacy_prefix="datasets",
+            label_policy_id="label-policy",
+            split_id="frozen",
+            qa_policy_sha256=_h("qa"),
+        )
+
+        data_keys = [item["key"] for item in expected]
+        self.assertEqual(backend.read_keys.count(data_keys[0]), 1)
+        self.assertEqual(backend.read_keys.count(data_keys[1]), 1)
+        marker_key = batch["marker"]["key"]
+        self.assertEqual(backend.read_keys.count(marker_key), 1)
+        self.assertEqual(backend.head_keys, [*sorted(data_keys), marker_key])
+        self.assertEqual(backend.anonymous_get_keys.count(data_keys[0]), 1)
+        self.assertEqual(backend.anonymous_get_keys.count(data_keys[1]), 1)
+        self.assertEqual(backend.anonymous_get_keys.count(marker_key), 1)
+        self.assertEqual(backend.anonymous_list_prefixes, ["datasets", "datasets"])
+        self.assertEqual([item["version"] for item in batch["objects"]], ["official", "official"])
+
+    def test_owner_rejects_forged_verified_state_before_remote_reads(self):
+        backend = _CountingMemoryBackend()
+        expected, payloads = self._objects()
+        for item, payload in zip(expected, payloads.values()):
+            backend.put_bytes(item["key"], payload)
+        forged = [{**item, "state": ObjectState.READBACK_VERIFIED.value} for item in expected]
+
+        with self.assertRaises(PreparationError):
+            verify_and_commit_batch(
+                forged,
+                state=BatchState.DRAFT,
+                expected_objects=expected,
+                acceptance_sha256=_h("acceptance"),
+                backend=backend,
+                inventory_prefix="datasets/AMI/official/train",
+                privacy_prefix="datasets",
+                label_policy_id="label-policy",
+                split_id="frozen",
+                qa_policy_sha256=_h("qa"),
+            )
+        self.assertEqual(backend.read_keys, [])
+        self.assertFalse(any("/_commits/" in key for key in backend.objects))
+
+    def test_corrupt_object_fails_before_marker_publication(self):
+        backend = _CountingMemoryBackend()
+        expected, payloads = self._objects()
+        for item, payload in zip(expected, payloads.values()):
+            backend.put_bytes(item["key"], payload)
+        backend.corrupt_get_keys.add(expected[1]["key"])
+        uploaded = [{**item, "state": ObjectState.UPLOADED.value} for item in expected]
+
+        with self.assertRaises(PreparationError):
+            verify_and_commit_batch(
+                uploaded,
+                state=BatchState.DRAFT,
+                expected_objects=expected,
+                acceptance_sha256=_h("acceptance"),
+                backend=backend,
+                inventory_prefix="datasets/AMI/official/train",
+                privacy_prefix="datasets",
+                label_policy_id="label-policy",
+                split_id="frozen",
+                qa_policy_sha256=_h("qa"),
+            )
+        self.assertEqual([key for key in backend.objects if "/_commits/" in key], [])
+
+    def test_owner_rejects_missing_encryption_and_public_object(self):
+        backend = _CountingMemoryBackend()
+        backend.encryption_default = None
+        expected, payloads = self._objects()
+        for item, payload in zip(expected, payloads.values()):
+            backend.put_bytes(item["key"], payload)
+        uploaded = [{**item, "state": ObjectState.UPLOADED.value} for item in expected]
+
+        with self.assertRaises(PreparationError):
+            verify_and_commit_batch(
+                uploaded,
+                state=BatchState.DRAFT,
+                expected_objects=expected,
+                acceptance_sha256=_h("acceptance"),
+                backend=backend,
+                inventory_prefix="datasets/AMI/official/train",
+                privacy_prefix="datasets",
+                label_policy_id="label-policy",
+                split_id="frozen",
+                qa_policy_sha256=_h("qa"),
+            )
+        self.assertFalse(any("/_commits/" in key for key in backend.objects))
+
+        backend = _CountingMemoryBackend()
+        for item, payload in zip(expected, payloads.values()):
+            backend.put_bytes(item["key"], payload)
+        backend.objects[expected[0]["key"]].public = True
+        with self.assertRaises(PreparationError):
+            verify_and_commit_batch(
+                uploaded,
+                state=BatchState.DRAFT,
+                expected_objects=expected,
+                acceptance_sha256=_h("acceptance"),
+                backend=backend,
+                inventory_prefix="datasets/AMI/official/train",
+                privacy_prefix="datasets",
+                label_policy_id="label-policy",
+                split_id="frozen",
+                qa_policy_sha256=_h("qa"),
+            )
+        self.assertFalse(any("/_commits/" in key for key in backend.objects))
+
+    def test_public_commit_rechecks_forged_readback_verified_rows(self):
+        backend = _CountingMemoryBackend()
+        expected, payloads = self._objects()
+        for item, payload in zip(expected, payloads.values()):
+            backend.put_bytes(item["key"], payload)
+        forged = [
+            {
+                **item,
+                "state": ObjectState.READBACK_VERIFIED.value,
+                "encryption": "AES256",
+                "public": False,
+            }
+            for item in expected
+        ]
+        backend.corrupt_get_keys.add(expected[0]["key"])
+
+        with self.assertRaises(PreparationError):
+            commit_batch(
+                forged,
+                state=BatchState.DRAFT,
+                expected_objects=expected,
+                acceptance_sha256=_h("acceptance"),
+                backend=backend,
+                inventory_prefix="datasets/AMI/official/train",
+                label_policy_id="label-policy",
+                split_id="frozen",
+                qa_policy_sha256=_h("qa"),
+            )
+        self.assertEqual(backend.read_keys.count(expected[0]["key"]), 1)
+        self.assertFalse(any("/_commits/" in key for key in backend.objects))
+
+    def test_owner_rejects_duplicate_and_mismatched_inventory_before_readback(self):
+        backend = _CountingMemoryBackend()
+        expected, payloads = self._objects()
+        for item, payload in zip(expected, payloads.values()):
+            backend.put_bytes(item["key"], payload)
+        uploaded = [{**item, "state": ObjectState.UPLOADED.value} for item in expected]
+
+        with self.assertRaises(PreparationError):
+            verify_and_commit_batch(
+                [uploaded[0], uploaded[0]],
+                state=BatchState.DRAFT,
+                expected_objects=expected,
+                acceptance_sha256=_h("acceptance"),
+                backend=backend,
+                inventory_prefix="datasets/AMI/official/train",
+                privacy_prefix="datasets",
+                label_policy_id="label-policy",
+                split_id="frozen",
+                qa_policy_sha256=_h("qa"),
+            )
+        self.assertEqual(backend.read_keys, [])
+
+        mismatch = [{**uploaded[0], "size": uploaded[0]["size"] + 1}, uploaded[1]]
+        with self.assertRaises(PreparationError):
+            verify_and_commit_batch(
+                mismatch,
+                state=BatchState.DRAFT,
+                expected_objects=expected,
+                acceptance_sha256=_h("acceptance"),
+                backend=backend,
+                inventory_prefix="datasets/AMI/official/train",
+                privacy_prefix="datasets",
+                label_policy_id="label-policy",
+                split_id="frozen",
+                qa_policy_sha256=_h("qa"),
+            )
+        self.assertEqual(backend.read_keys, [])
+
+    def test_public_privacy_wrapper_uses_its_own_single_readback(self):
+        backend = _CountingMemoryBackend()
+        expected, payloads = self._objects()
+        backend.put_bytes(expected[0]["key"], payloads["a"])
+
+        evidence = assert_private_access(backend, expected[0]["key"], "datasets")
+
+        self.assertEqual(evidence["authenticated_sha256"], expected[0]["sha256"])
+        self.assertEqual(backend.read_keys, [expected[0]["key"]])
+        self.assertEqual(backend.anonymous_get_keys, [expected[0]["key"]])
+        self.assertEqual(backend.anonymous_list_prefixes, ["datasets"])
 
     def test_partial_corrupt_missing_cannot_commit(self):
         backend = MemoryBackend()
