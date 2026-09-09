@@ -3,6 +3,10 @@
 **/.venv*
 **/__pycache__
 **/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+**/.wrangler
+_scratch
 recipes/speakrs/data
 recipes/speakrs/artifacts
 recipes/speakrs/exp*
