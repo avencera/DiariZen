@@ -463,6 +463,22 @@ class WranglerR2BackendTest(unittest.TestCase):
         self.assertEqual(second, ("0123456789abcdef0123456789abcdef", "token-b"))
         refresh.assert_called_once()
 
+    def test_oauth_cache_uses_token_until_actual_expiry(self):
+        from unittest import mock
+
+        backend = self._backend(api_token=None)
+        now = datetime.now(timezone.utc)
+        with mock.patch(
+            "recipes.speakrs.large.storage._load_wrangler_oauth_state",
+            return_value=("token-a", now + timedelta(seconds=30)),
+        ):
+            with mock.patch("recipes.speakrs.large.storage._wrangler_whoami") as refresh:
+                first = backend._direct_credentials()
+                second = backend._direct_credentials()
+        self.assertEqual(first, ("0123456789abcdef0123456789abcdef", "token-a"))
+        self.assertEqual(second, first)
+        refresh.assert_not_called()
+
     def test_object_read_retries_once_after_authenticated_expiry(self):
         from unittest import mock
 

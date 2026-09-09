@@ -15,7 +15,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 from xml.etree import ElementTree
@@ -46,7 +46,6 @@ OPEN_FILE_CHECK_TIMEOUT_SECONDS = 5
 CLOUDFLARE_R2_DEFAULT_ENCRYPTION = "AES-256"
 WRANGLER_R2_REST_MAX_UPLOAD_BYTES = 300 * 1024**2
 WRANGLER_VERSION = "4.129.0"
-WRANGLER_AUTH_REFRESH_SKEW_SECONDS = 60
 MARKER_DIRECTORY = "_commits"
 CONSUMED_SOURCE_STATE = "consumed-source"
 DELETION_JOURNAL_SCHEMA = "speakrs-deletion-journal-v1"
@@ -1311,10 +1310,9 @@ class WranglerR2Backend:
         """Resolve one cached account/token pair, refreshing Wrangler OAuth once if needed."""
 
         now = datetime.now(timezone.utc)
-        refresh_at = now + timedelta(seconds=WRANGLER_AUTH_REFRESH_SKEW_SECONDS)
         if self._credentials_cache is not None and not force_refresh:
             account_id, token, expiry = self._credentials_cache
-            if expiry is None or expiry > refresh_at:
+            if expiry is None or expiry > now:
                 return account_id, token
             self._credentials_cache = None
         if self.api_token is not None and (not isinstance(self.api_token, str) or not self.api_token.strip()):
@@ -1326,7 +1324,7 @@ class WranglerR2Backend:
             token = token.strip()
         if not token:
             token, expiry = _load_wrangler_oauth_state(self.profile)
-            if force_refresh or token is None or expiry is None or expiry <= refresh_at:
+            if force_refresh or token is None or expiry is None or expiry <= now:
                 whoami = _wrangler_whoami(self.profile)
                 if whoami.returncode != 0:
                     raise UnresolvedInputError(
@@ -1334,8 +1332,8 @@ class WranglerR2Backend:
                         {"status": whoami.returncode, "bucket": self.destination.bucket},
                     )
                 token, expiry = _load_wrangler_oauth_state(self.profile)
-                refresh_at = datetime.now(timezone.utc) + timedelta(seconds=WRANGLER_AUTH_REFRESH_SKEW_SECONDS)
-            if token is None or expiry is None or expiry <= refresh_at:
+                now = datetime.now(timezone.utc)
+            if token is None or expiry is None or expiry <= now:
                 raise UnresolvedInputError(
                     "Wrangler OAuth credentials are missing or expired",
                     {"bucket": self.destination.bucket},
