@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .budget import BudgetLedger
-from .contracts import DEFAULT_BUDGET, LAUNCH_KIND, parse_kinded_lock
+from .contracts import DEFAULT_BUDGET, LAUNCH_KIND, parse_kinded_lock, parse_qualification_binding
 from .controller import Controller, FakeProvider
 from .errors import LargeError
 from .handoff import package_handoff
@@ -50,6 +50,8 @@ DATA_COMMANDS = (
     "final-restore",
     "evict",
     "handoff",
+    "qualification-bundle",
+    "qualification-binding",
 )
 
 
@@ -105,10 +107,31 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--spec", required=True, type=Path)
     preflight.add_argument("--require-cuda", action="store_true")
 
-    qualify = sub.add_parser("qualify", help="GPU qualification (not run in this goal)")
-    qualify.add_argument("--spec", required=True, type=Path)
+    qualify = sub.add_parser("qualify", help="qualify a rented RTX 4090 with the supplied trainer TOML")
+    qualify.add_argument(
+        "--trainer-config",
+        dest="trainer_config",
+        required=True,
+        type=Path,
+        help="trainer TOML containing the real model, audio, RTTM, and UEM paths",
+    )
+    qualify.add_argument("--qualification-spec", type=Path, help="optional JSON qualification bounds")
+    qualify.add_argument(
+        "--qualification-binding",
+        required=True,
+        dest="qualification_binding",
+        type=Path,
+        help="strict data-release binding created by data qualification-binding",
+    )
+    qualify.add_argument("--qualification-lease", required=True, type=Path)
     qualify.add_argument("--gpu-profile", required=True)
-    qualify.add_argument("--spend-ceiling-usd", type=float, default=5.0)
+    qualify.add_argument("--warmup-optimizer-updates", "--warmup-updates", type=int)
+    qualify.add_argument("--measured-optimizer-updates", "--measured-updates", type=int)
+    qualify.add_argument("--effective-batch", type=int)
+    qualify.add_argument("--physical-batch-candidate", action="append", type=int, dest="physical_batch_candidates")
+    qualify.add_argument("--planned-updates-per-cycle", "--updates-per-cycle", type=int)
+    qualify.add_argument("--planned-max-cycles", "--max-cycles", type=int)
+    qualify.add_argument("--output", required=True, type=Path)
 
     freeze = sub.add_parser("freeze-run", help="freeze a launch lock after qualification")
     freeze.add_argument("--spec", required=True, type=Path)
@@ -120,6 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
     control = sub.add_parser("control", help="trusted controller")
     control.add_argument("--launch", type=Path)
     control.add_argument("--qualification-lease", type=Path)
+    control.add_argument("--qualification-binding", type=Path)
     control.add_argument("--connection", type=Path)
     control.add_argument("--backup-root", type=Path)
 
@@ -199,6 +223,29 @@ def build_parser() -> argparse.ArgumentParser:
     data_data_handoff.add_argument("--receipt", required=True, type=Path)
     data_data_handoff.add_argument("--config", required=True, type=Path)
     data_data_handoff.add_argument("--output", required=True, type=Path)
+    data_bundle = data_sub.add_parser(
+        "qualification-bundle",
+        help="restore one committed batch per source and build the real qualification trainer bundle",
+    )
+    data_bundle.add_argument("--release", required=True, type=Path)
+    data_bundle.add_argument("--seal", required=True, type=Path)
+    data_bundle.add_argument("--receipt", required=True, type=Path)
+    data_bundle.add_argument("--selection", required=True, type=Path)
+    data_bundle.add_argument("--wav-prefix", required=True)
+    data_bundle.add_argument("--config", required=True, type=Path)
+    data_bundle.add_argument("--output", required=True, type=Path)
+    data_binding = data_sub.add_parser(
+        "qualification-binding",
+        help="bind the committed release and final restore proof for diagnostic GPU qualification",
+    )
+    data_binding.add_argument("--release", required=True, type=Path)
+    data_binding.add_argument("--seal", required=True, type=Path)
+    data_binding.add_argument("--receipt", required=True, type=Path)
+    data_binding.add_argument("--bundle-manifest", required=True, type=Path)
+    data_binding.add_argument("--wavlm-initializer", required=True, type=Path)
+    data_binding.add_argument("--authorization-reference", required=True)
+    data_binding.add_argument("--config", required=True, type=Path)
+    data_binding.add_argument("--output", required=True, type=Path)
     return parser
 
 
@@ -271,17 +318,71 @@ def dispatch(args: argparse.Namespace) -> dict:
             raise LargeError("preflight", "CUDA is required and this host has no GPU", {"require_cuda": True})
         return {"spec": spec.run_id, "cuda": False}
     if command == "qualify":
-        return {
-            "ok": False,
-            "gpu_qualification_status": "not_run",
-            "message": "GPU qualification is outside this pre-rental goal",
-            "gpu_profile": args.gpu_profile,
-            "spend_ceiling_usd": args.spend_ceiling_usd,
+        from .qualification import execute_qualification, load_qualification_spec, write_failed_qualification
+        from .recovery import LocalTransport
+
+        try:
+            binding = parse_qualification_binding(json.loads(args.qualification_binding.read_text(encoding="utf-8")))
+            lease = json.loads(args.qualification_lease.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise LargeError(
+                "qualification", "cannot load qualification binding or lease", {"error": str(error)}
+            ) from error
+
+        controller = Controller(
+            ledger=BudgetLedger(DEFAULT_BUDGET),
+            provider=FakeProvider(),
+            transport=LocalTransport(),
+        )
+        qualification_control = controller.control_qualification(lease, binding)
+        offer = lease.get("offer") if isinstance(lease, dict) else None
+        if not isinstance(offer, dict) or offer.get("gpu_profile") != args.gpu_profile:
+            raise LargeError(
+                "qualification",
+                "qualification lease GPU profile differs from the requested worker profile",
+            )
+
+        overrides = {
+            "warmup_optimizer_updates": getattr(args, "warmup_optimizer_updates", None),
+            "measured_optimizer_updates": getattr(args, "measured_optimizer_updates", None),
+            "effective_batch": getattr(args, "effective_batch", None),
+            "physical_batch_candidates": getattr(args, "physical_batch_candidates", None),
+            "planned_updates_per_cycle": getattr(args, "planned_updates_per_cycle", None),
+            "planned_max_cycles": getattr(args, "planned_max_cycles", None),
         }
+        trainer_config = getattr(args, "trainer_config", None)
+        if trainer_config is None or getattr(args, "output", None) is None:
+            raise LargeError("usage", "qualify requires a trainer TOML and output path")
+        try:
+            qualification_spec = load_qualification_spec(getattr(args, "qualification_spec", None), overrides)
+        except LargeError as error:
+            return write_failed_qualification(
+                trainer_config,
+                args.gpu_profile,
+                args.output,
+                error,
+                qualification_binding=binding,
+                qualification_control=qualification_control,
+            )
+        return execute_qualification(
+            trainer_config,
+            args.gpu_profile,
+            qualification_spec,
+            args.output,
+            qualification_binding=binding,
+            qualification_control=qualification_control,
+        )
     if command == "freeze-run":
         qualification = json.loads(args.qualification.read_text(encoding="utf-8"))
-        if qualification.get("gpu_qualification_status") in (None, "not_run") or not qualification.get("ok"):
-            raise LargeError("freeze-run", "cannot freeze a launch lock without GPU qualification")
+        if (
+            qualification.get("gpu_qualification_status") != "qualified"
+            or not qualification.get("ok")
+            or not qualification.get("qualification_binding_sha256")
+            or qualification.get("training_ready") is not True
+        ):
+            raise LargeError("freeze-run", "cannot freeze a launch lock without training qualification")
+        if qualification.get("qualification_only") is True:
+            raise LargeError("freeze-run", "qualification-only artifact cannot create a training lock")
         parse_kinded_lock(
             {
                 "kind": LAUNCH_KIND,
@@ -309,7 +410,10 @@ def dispatch(args: argparse.Namespace) -> dict:
         )
         if args.qualification_lease:
             lease = json.loads(args.qualification_lease.read_text(encoding="utf-8"))
-            return controller.control_qualification(lease)
+            if args.qualification_binding is None:
+                raise LargeError("control", "qualification control requires --qualification-binding")
+            binding = parse_qualification_binding(json.loads(args.qualification_binding.read_text(encoding="utf-8")))
+            return controller.control_qualification(lease, binding)
         parse_kinded_lock(json.loads(args.launch.read_text(encoding="utf-8")), LAUNCH_KIND)
         return {"ok": True, "mode": "launch"}
     if command in {"supervise", "select", "test", "archive", "status", "resume"}:

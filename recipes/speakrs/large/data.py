@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import secrets
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -27,17 +28,21 @@ from .acceptance import (
 )
 from .contracts import (
     DATA_PREPARATION_SCHEMA,
+    DEFAULT_MODEL,
+    QUALIFICATION_SOURCES,
     BatchState,
     DataPreparationSpec,
     EvidenceReference,
     LocalCopyState,
     ObjectState,
+    QualificationBinding,
     RemoteReleaseState,
     SelectionState,
     SourceMembership,
     VerifiedSelectionBatch,
     data_spec_to_json,
     parse_data_preparation_spec,
+    qualification_binding_to_json,
 )
 from .errors import ContractError, LargeError, PreparationError, UnresolvedInputError
 from .hashing import sha256_bytes, sha256_file, sha256_json
@@ -2636,6 +2641,516 @@ def handoff_data(
     return payload
 
 
+def _qualification_release_context(
+    spec: DataPreparationSpec,
+    release: Path,
+    seal_path: Path,
+    restore_receipt_path: Path,
+    store: StorageBackend,
+) -> tuple[dict[str, Any], Mapping[str, object]]:
+    """Load the approved release and validate its final restore aggregate."""
+
+    context = _load_final_release_context(spec, seal_path, store)
+    try:
+        receipt = read_json(restore_receipt_path)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise PreparationError("qualification requires a readable final restore aggregate") from error
+    if (
+        not isinstance(receipt, Mapping)
+        or receipt.get("schema") != "speakrs-final-restore-v1"
+        or receipt.get("command") != "final-restore"
+    ):
+        raise PreparationError("qualification requires the generated final restore aggregate")
+    if receipt.get("release") != str(release):
+        raise PreparationError("final restore aggregate belongs to a different release path")
+    expected_batches = {str(batch_hash): batch for batch_hash, batch in context["batch_by_hash"].items()}
+    _validate_final_restore_aggregate(
+        receipt,
+        release_sha256=str(context["release_sha256"]),
+        seal=context["seal"],
+        implementation_hashes=context["implementation_hashes"],
+        closure_validator_sha256=context["closure_validator_sha256"],
+        source_dispositions=context["source_dispositions"],
+        expected_batches=expected_batches,
+        expected_batch_markers=context["batch_marker_by_hash"],
+        expected_portable=context["portable_by_batch"],
+        expected_objects=context["release_by_key"],
+    )
+    return context, receipt
+
+
+def _validate_qualification_bundle_against_release(
+    manifest_path: Path,
+    context: Mapping[str, Any],
+) -> Mapping[str, object]:
+    """Prove that every staged qualification object belongs to the final release."""
+
+    manifest_path = Path(manifest_path)
+    manifest = read_json(manifest_path)
+    required_fields = {
+        "schema",
+        "release_sha256",
+        "restore_receipt_sha256",
+        "required_sources",
+        "wav_prefix",
+        "selection_plan_sha256",
+        "selected_batches",
+        "manifests",
+        "recordings",
+    }
+    if (
+        not isinstance(manifest, Mapping)
+        or set(manifest) != required_fields
+        or manifest.get("schema") != "speakrs-qualification-bundle-v1"
+        or manifest.get("release_sha256") != context["release_sha256"]
+        or manifest.get("required_sources") != list(QUALIFICATION_SOURCES)
+    ):
+        raise PreparationError("qualification bundle header differs from the final release")
+    bundle_root = manifest_path.parent.resolve()
+    manifest_hashes = manifest.get("manifests")
+    input_paths = {
+        "wav_scp": bundle_root / "wav.scp",
+        "rttm": bundle_root / "all.rttm",
+        "uem": bundle_root / "all.uem",
+    }
+    if not isinstance(manifest_hashes, Mapping) or set(manifest_hashes) != set(input_paths):
+        raise PreparationError("qualification bundle training manifest hashes are incomplete")
+    if any(not path.is_file() or sha256_file(path) != manifest_hashes[name] for name, path in input_paths.items()):
+        raise PreparationError("qualification bundle training manifest content changed")
+
+    selected_batches = manifest.get("selected_batches")
+    if not isinstance(selected_batches, Mapping) or set(selected_batches) != set(QUALIFICATION_SOURCES):
+        raise PreparationError("qualification bundle selected batches are incomplete")
+    expected_recordings: dict[str, tuple[str, str, Mapping[str, object]]] = {}
+    expected_labels: dict[str, list[str]] = {"rttm": [], "uem": []}
+    for source in QUALIFICATION_SOURCES:
+        selected = selected_batches[source]
+        if not isinstance(selected, Mapping) or set(selected) != {
+            "batch_sha256",
+            "acceptance_sha256",
+            "restore_receipt",
+            "restore_receipt_sha256",
+        }:
+            raise PreparationError("qualification bundle selected batch is malformed", {"source": source})
+        batch_sha256 = selected.get("batch_sha256")
+        batch = context["batch_by_hash"].get(batch_sha256)
+        capacity = context["capacity_by_batch"].get(batch_sha256)
+        if (
+            not isinstance(batch_sha256, str)
+            or batch is None
+            or capacity is None
+            or capacity[0] != source
+            or selected.get("acceptance_sha256") != batch.get("acceptance_sha256")
+        ):
+            raise PreparationError(
+                "qualification bundle selected batch is outside the final release", {"source": source}
+            )
+        receipt_relative = selected.get("restore_receipt")
+        receipt_sha256 = selected.get("restore_receipt_sha256")
+        if not isinstance(receipt_relative, str) or not isinstance(receipt_sha256, str):
+            raise PreparationError("qualification bundle selected restore receipt is invalid", {"source": source})
+        receipt_path = (bundle_root / receipt_relative).resolve()
+        if (
+            Path(receipt_relative).is_absolute()
+            or not receipt_path.is_relative_to(bundle_root)
+            or not receipt_path.is_file()
+            or sha256_file(receipt_path) != receipt_sha256
+        ):
+            raise PreparationError("qualification bundle selected restore receipt changed", {"source": source})
+        receipt = read_json(receipt_path)
+        if not _batch_restore_matches(
+            receipt,
+            batch,
+            context["batch_marker_by_hash"][batch_sha256],
+            portable=context["portable_by_batch"][batch_sha256],
+        ):
+            raise PreparationError(
+                "qualification bundle restore receipt differs from the final release", {"source": source}
+            )
+        restored_by_key = {
+            item.get("key"): item
+            for item in receipt.get("objects", [])
+            if isinstance(item, Mapping) and isinstance(item.get("key"), str)
+        }
+        portable_rows = context["portable_by_batch"][batch_sha256].get("recordings")
+        if not isinstance(portable_rows, list) or not portable_rows:
+            raise PreparationError("qualification final-release batch has no recordings", {"source": source})
+        for row in portable_rows:
+            if not isinstance(row, Mapping) or not isinstance(row.get("recording_id"), str):
+                raise PreparationError("qualification final-release recording is malformed", {"source": source})
+            recording_id = str(row["recording_id"])
+            if recording_id in expected_recordings:
+                raise PreparationError("qualification final-release recording ids are not globally unique")
+            for field in ("rttm", "uem"):
+                identity = row.get(field)
+                restored = restored_by_key.get(identity.get("key")) if isinstance(identity, Mapping) else None
+                restored_path = restored.get("restored_path") if isinstance(restored, Mapping) else None
+                if not isinstance(identity, Mapping) or not isinstance(restored_path, str):
+                    raise PreparationError("qualification restored label identity is incomplete", {"field": field})
+                label_path = Path(restored_path)
+                if (
+                    not label_path.is_file()
+                    or label_path.stat().st_size != identity.get("size")
+                    or sha256_file(label_path) != identity.get("sha256")
+                ):
+                    raise PreparationError(
+                        "qualification restored label differs from the final release", {"field": field}
+                    )
+                label_text = label_path.read_text(encoding="utf-8")
+                expected_labels[field].append(label_text if label_text.endswith("\n") else label_text + "\n")
+            expected_recordings[recording_id] = (source, batch_sha256, row)
+
+    for field, manifest_name in (("rttm", "rttm"), ("uem", "uem")):
+        if input_paths[manifest_name].read_text(encoding="utf-8") != "".join(expected_labels[field]):
+            raise PreparationError("qualification bundle labels differ from the final release", {"field": field})
+
+    wav_prefix = manifest.get("wav_prefix")
+    if not isinstance(wav_prefix, str) or not wav_prefix:
+        raise PreparationError("qualification bundle wav prefix is invalid")
+    wav_rows: dict[str, str] = {}
+    for line_number, line in enumerate(input_paths["wav_scp"].read_text(encoding="utf-8").splitlines(), 1):
+        fields = line.split(maxsplit=1)
+        if len(fields) != 2 or fields[0] in wav_rows:
+            raise PreparationError("qualification bundle wav.scp is malformed", {"line": line_number})
+        wav_rows[fields[0]] = fields[1]
+
+    recordings = manifest.get("recordings")
+    if not isinstance(recordings, list) or len(recordings) != len(expected_recordings):
+        raise PreparationError("qualification bundle recording inventory is incomplete")
+    seen: set[str] = set()
+    for index, item in enumerate(recordings):
+        if not isinstance(item, Mapping) or set(item) != {
+            "recording_id",
+            "source",
+            "batch_sha256",
+            "audio_path",
+            "audio_sha256",
+            "audio_size",
+            "rttm_sha256",
+            "uem_sha256",
+        }:
+            raise PreparationError("qualification bundle recording is malformed", {"index": index})
+        recording_id = item.get("recording_id")
+        expected = expected_recordings.get(recording_id) if isinstance(recording_id, str) else None
+        if expected is None or recording_id in seen:
+            raise PreparationError("qualification bundle recording is outside the final release", {"index": index})
+        source, batch_sha256, portable = expected
+        if item.get("source") != source or item.get("batch_sha256") != batch_sha256:
+            raise PreparationError("qualification bundle recording has a different batch identity", {"index": index})
+        for field, digest_field in (("audio", "audio_sha256"), ("rttm", "rttm_sha256"), ("uem", "uem_sha256")):
+            identity = portable.get(field)
+            if not isinstance(identity, Mapping) or item.get(digest_field) != identity.get("sha256"):
+                raise PreparationError(
+                    "qualification bundle recording object differs from the final release", {"index": index}
+                )
+        audio_relative_raw = item.get("audio_path")
+        audio_size = item.get("audio_size")
+        audio_identity = portable["audio"]
+        if not isinstance(audio_relative_raw, str) or isinstance(audio_size, bool) or not isinstance(audio_size, int):
+            raise PreparationError("qualification bundle audio identity is invalid", {"index": index})
+        audio_relative = Path(audio_relative_raw)
+        audio_path = (bundle_root / audio_relative).resolve()
+        if (
+            audio_relative.is_absolute()
+            or not audio_path.is_relative_to(bundle_root)
+            or not audio_path.is_file()
+            or audio_size != audio_identity.get("size")
+            or audio_path.stat().st_size != audio_size
+            or sha256_file(audio_path) != audio_identity.get("sha256")
+            or wav_rows.get(recording_id) != (Path(wav_prefix) / audio_relative).as_posix()
+        ):
+            raise PreparationError("qualification bundle audio differs from the final release", {"index": index})
+        seen.add(recording_id)
+    if seen != set(expected_recordings) or set(wav_rows) != seen:
+        raise PreparationError("qualification bundle recording coverage differs from the final release")
+    return manifest
+
+
+def qualification_bundle_data(
+    spec: DataPreparationSpec,
+    release: Path,
+    seal_path: Path,
+    restore_receipt_path: Path,
+    selection_path: Path,
+    wav_prefix: str,
+    output: Path,
+    *,
+    backend: StorageBackend | None = None,
+) -> dict[str, object]:
+    """Restore one verified batch per source and build the real trainer bundle."""
+
+    release = Path(release)
+    seal_path = Path(seal_path)
+    restore_receipt_path = Path(restore_receipt_path)
+    selection_path = Path(selection_path)
+    output = Path(output)
+    if not isinstance(wav_prefix, str) or not wav_prefix.strip():
+        raise PreparationError("qualification bundle requires a non-empty trainer-relative wav prefix")
+    if output.exists():
+        raise PreparationError("qualification bundle output already exists", {"path": str(output)})
+    store = _backend_from_spec(spec, backend)
+    context, _ = _qualification_release_context(spec, release, seal_path, restore_receipt_path, store)
+    plan = read_json(selection_path)
+    selections = plan.get("batches") if isinstance(plan, Mapping) else None
+    if (
+        not isinstance(plan, Mapping)
+        or plan.get("schema") != "speakrs-qualification-restore-plan-v1"
+        or plan.get("purpose") != "gpu_qualification"
+        or not isinstance(selections, list)
+        or len(selections) != len(QUALIFICATION_SOURCES)
+    ):
+        raise PreparationError("qualification restore plan is invalid")
+
+    selected: dict[str, tuple[str, Path]] = {}
+    for index, item in enumerate(selections):
+        if not isinstance(item, Mapping) or set(item) != {"batch_sha256", "path"}:
+            raise PreparationError("qualification restore plan entry is invalid", {"index": index})
+        batch_sha256 = item.get("batch_sha256")
+        remote_path = item.get("path")
+        if not isinstance(batch_sha256, str) or not isinstance(remote_path, str):
+            raise PreparationError("qualification restore plan entry is invalid", {"index": index})
+        batch = context["batch_by_hash"].get(batch_sha256)
+        capacity = context["capacity_by_batch"].get(batch_sha256)
+        if batch is None or capacity is None:
+            raise PreparationError("qualification restore plan batch is outside the final release", {"index": index})
+        source = str(capacity[0])
+        if source in selected or source not in QUALIFICATION_SOURCES:
+            raise PreparationError("qualification restore plan source membership is invalid", {"source": source})
+        selected[source] = (batch_sha256, Path(remote_path))
+    if tuple(sorted(selected)) != tuple(sorted(QUALIFICATION_SOURCES)):
+        raise PreparationError("qualification restore plan does not cover every approved source")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f".{output.name}-", dir=str(output.parent)) as temporary:
+        bundle = Path(temporary) / "bundle"
+        audio_root = bundle / "audio"
+        receipt_root = bundle / "restore-receipts"
+        audio_root.mkdir(parents=True)
+        receipt_root.mkdir(parents=True)
+        wav_rows: list[str] = []
+        rttm_rows: list[str] = []
+        uem_rows: list[str] = []
+        recordings: list[dict[str, object]] = []
+        selected_batches: dict[str, dict[str, object]] = {}
+        seen_recordings: set[str] = set()
+
+        for source in QUALIFICATION_SOURCES:
+            batch_sha256, remote_path = selected[source]
+            restore_path = receipt_root / f"{source}.json"
+            restore = restore_check(spec, remote_path, restore_path, backend=store)
+            batch = context["batch_by_hash"][batch_sha256]
+            if not _batch_restore_matches(
+                restore,
+                batch,
+                context["batch_marker_by_hash"][batch_sha256],
+                portable=context["portable_by_batch"][batch_sha256],
+            ):
+                raise PreparationError("qualification cold restore differs from its final-release batch")
+            restored_by_key = {
+                str(item["key"]): item
+                for item in restore["objects"]
+                if isinstance(item, Mapping) and isinstance(item.get("key"), str)
+            }
+            portable = context["portable_by_batch"][batch_sha256]
+            portable_rows = portable.get("recordings")
+            if not isinstance(portable_rows, list) or not portable_rows:
+                raise PreparationError("qualification batch has no portable recordings", {"source": source})
+            selected_batches[source] = {
+                "batch_sha256": batch_sha256,
+                "acceptance_sha256": batch["acceptance_sha256"],
+                "restore_receipt": restore_path.relative_to(bundle).as_posix(),
+                "restore_receipt_sha256": sha256_file(restore_path),
+            }
+            for row_index, row in enumerate(portable_rows):
+                if not isinstance(row, Mapping) or not isinstance(row.get("recording_id"), str):
+                    raise PreparationError("qualification portable recording is invalid", {"source": source})
+                recording_id = str(row["recording_id"])
+                if not recording_id or recording_id in seen_recordings:
+                    raise PreparationError(
+                        "qualification recording ids must be non-empty and globally unique",
+                        {"source": source, "recording_id": recording_id},
+                    )
+                identities: dict[str, Mapping[str, object]] = {}
+                for field in ("audio", "rttm", "uem"):
+                    identity = row.get(field)
+                    if not isinstance(identity, Mapping) or not isinstance(identity.get("key"), str):
+                        raise PreparationError("qualification recording object identity is invalid", {"field": field})
+                    restored = restored_by_key.get(str(identity["key"]))
+                    if restored is None or restored.get("sha256") != identity.get("sha256"):
+                        raise PreparationError("qualification recording object was not restored", {"field": field})
+                    restored_path = restored.get("restored_path")
+                    if not isinstance(restored_path, str):
+                        raise PreparationError("qualification restored object has no local path", {"field": field})
+                    path = Path(restored_path)
+                    if not path.is_file() or sha256_file(path) != identity.get("sha256"):
+                        raise PreparationError(
+                            "qualification restored object changed before bundling", {"field": field}
+                        )
+                    identities[field] = {**identity, "path": path}
+
+                audio_identity = identities["audio"]
+                audio_source = audio_identity["path"]
+                assert isinstance(audio_source, Path)
+                suffix = audio_source.suffix.lower() or ".audio"
+                audio_relative = Path("audio") / source / f"{row_index:03d}-{audio_identity['sha256']}{suffix}"
+                audio_destination = bundle / audio_relative
+                audio_destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(audio_source, audio_destination)
+                if sha256_file(audio_destination) != audio_identity["sha256"]:
+                    raise PreparationError("qualification audio copy failed content verification")
+
+                label_texts: dict[str, str] = {}
+                for field in ("rttm", "uem"):
+                    label_path = identities[field]["path"]
+                    assert isinstance(label_path, Path)
+                    text = label_path.read_text(encoding="utf-8")
+                    label_texts[field] = text if text.endswith("\n") else text + "\n"
+                wav_path = (Path(wav_prefix) / audio_relative).as_posix()
+                wav_rows.append(f"{recording_id} {wav_path}\n")
+                rttm_rows.append(label_texts["rttm"])
+                uem_rows.append(label_texts["uem"])
+                seen_recordings.add(recording_id)
+                recordings.append(
+                    {
+                        "recording_id": recording_id,
+                        "source": source,
+                        "batch_sha256": batch_sha256,
+                        "audio_path": audio_relative.as_posix(),
+                        "audio_sha256": audio_identity["sha256"],
+                        "audio_size": audio_destination.stat().st_size,
+                        "rttm_sha256": identities["rttm"]["sha256"],
+                        "uem_sha256": identities["uem"]["sha256"],
+                    }
+                )
+
+        manifest_paths = {
+            "wav_scp": bundle / "wav.scp",
+            "rttm": bundle / "all.rttm",
+            "uem": bundle / "all.uem",
+        }
+        manifest_paths["wav_scp"].write_text("".join(wav_rows), encoding="utf-8")
+        manifest_paths["rttm"].write_text("".join(rttm_rows), encoding="utf-8")
+        manifest_paths["uem"].write_text("".join(uem_rows), encoding="utf-8")
+        bundle_manifest = {
+            "schema": "speakrs-qualification-bundle-v1",
+            "release_sha256": context["release_sha256"],
+            "restore_receipt_sha256": sha256_file(restore_receipt_path),
+            "required_sources": list(QUALIFICATION_SOURCES),
+            "wav_prefix": wav_prefix,
+            "selection_plan_sha256": sha256_file(selection_path),
+            "selected_batches": selected_batches,
+            "manifests": {name: sha256_file(path) for name, path in manifest_paths.items()},
+            "recordings": recordings,
+        }
+        manifest_path = bundle / "bundle.json"
+        write_json(manifest_path, bundle_manifest)
+        _validate_qualification_bundle_against_release(manifest_path, context)
+        bundle.replace(output)
+
+    return {
+        "ok": True,
+        "command": "qualification-bundle",
+        "bundle": str(output),
+        "bundle_manifest": str(output / "bundle.json"),
+        "bundle_manifest_sha256": sha256_file(output / "bundle.json"),
+        "recordings": len(recordings),
+        "sources": list(QUALIFICATION_SOURCES),
+    }
+
+
+def qualification_binding_data(
+    spec: DataPreparationSpec,
+    release: Path,
+    seal_path: Path,
+    restore_receipt_path: Path,
+    bundle_manifest_path: Path,
+    wavlm_initializer_path: Path,
+    output: Path,
+    authorization_reference: str,
+    *,
+    backend: StorageBackend | None = None,
+) -> dict[str, object]:
+    """Build a diagnostic GPU binding from one committed release and restore proof.
+
+    This path validates the full final-release closure, but it does not call
+    training handoff admission and it never changes the global capacity limit.
+    """
+
+    if not isinstance(authorization_reference, str) or not authorization_reference:
+        raise ContractError("qualification binding requires a non-empty authorization reference")
+    if not isinstance(release, Path):
+        release = Path(release)
+    if not isinstance(seal_path, Path):
+        seal_path = Path(seal_path)
+    if not isinstance(restore_receipt_path, Path):
+        restore_receipt_path = Path(restore_receipt_path)
+    if not isinstance(bundle_manifest_path, Path):
+        bundle_manifest_path = Path(bundle_manifest_path)
+    if not isinstance(wavlm_initializer_path, Path):
+        wavlm_initializer_path = Path(wavlm_initializer_path)
+    if not isinstance(output, Path):
+        output = Path(output)
+    if not wavlm_initializer_path.is_file():
+        raise PreparationError("qualification binding requires the WavLM initializer")
+
+    store = _backend_from_spec(spec, backend)
+    context, _ = _qualification_release_context(spec, release, seal_path, restore_receipt_path, store)
+    required_sources = tuple(context["required_sources"])
+    if set(required_sources) != set(QUALIFICATION_SOURCES) or len(required_sources) != len(QUALIFICATION_SOURCES):
+        raise PreparationError(
+            "qualification binding requires the exact approved source membership",
+            {"actual": list(required_sources), "required": list(QUALIFICATION_SOURCES)},
+        )
+    if {source.name for source in spec.sources} != set(QUALIFICATION_SOURCES):
+        raise PreparationError(
+            "qualification binding requires the exact approved source membership",
+            {"actual": sorted(source.name for source in spec.sources), "required": list(QUALIFICATION_SOURCES)},
+        )
+    invalid_membership = [
+        source.name
+        for source in spec.sources
+        if source.membership is not SourceMembership.ACCEPTED
+        or source.permission_state.value != "permitted"
+        or not spec.permissions[source.permission_id].permitted_for_training_storage()
+    ]
+    if invalid_membership:
+        raise UnresolvedInputError(
+            "qualification binding requires permitted accepted sources",
+            {"sources": sorted(invalid_membership)},
+        )
+
+    try:
+        bundle_manifest = _validate_qualification_bundle_against_release(bundle_manifest_path, context)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise PreparationError("qualification binding requires a readable bundle manifest") from error
+    if bundle_manifest.get("restore_receipt_sha256") != sha256_file(restore_receipt_path):
+        raise PreparationError("qualification bundle identity differs from the final release")
+
+    source_capacity: dict[str, dict[str, object]] = {}
+    for source_name in QUALIFICATION_SOURCES:
+        records = [
+            capacity for batch_source, capacity in context["capacity_by_batch"].values() if batch_source == source_name
+        ]
+        aggregate = aggregate_capacity(records, label=f"qualification-source[{source_name}]")
+        selected = next(profile for profile in aggregate.profiles if profile.key == (8, 2, 4))
+        source_capacity[source_name] = selected.as_dict()
+
+    binding = QualificationBinding(
+        release_sha256=str(context["release_sha256"]),
+        restore_receipt_sha256=sha256_file(restore_receipt_path),
+        bundle_manifest_sha256=sha256_file(bundle_manifest_path),
+        wavlm_initializer_sha256=sha256_file(wavlm_initializer_path),
+        required_sources=QUALIFICATION_SOURCES,
+        model_identity=DEFAULT_MODEL,
+        target_profile={"chunk_seconds": 8, "max_overlap": 2, "local_slots": 4},
+        source_capacity=source_capacity,
+        authorization_reference=authorization_reference,
+    )
+    payload = qualification_binding_to_json(binding)
+    write_json(output, payload)
+    return payload
+
+
 def dispatch_data(args, *, backend: StorageBackend | None = None) -> dict[str, object]:
     """Dispatch one data subcommand."""
 
@@ -2677,4 +3192,27 @@ def dispatch_data(args, *, backend: StorageBackend | None = None) -> dict[str, o
         return evict_data(spec, args.receipt, args.output, backend=backend)
     if command == "handoff":
         return handoff_data(spec, args.release, args.receipt, args.output, backend=backend)
+    if command == "qualification-bundle":
+        return qualification_bundle_data(
+            spec,
+            args.release,
+            args.seal,
+            args.receipt,
+            args.selection,
+            args.wav_prefix,
+            args.output,
+            backend=backend,
+        )
+    if command == "qualification-binding":
+        return qualification_binding_data(
+            spec,
+            args.release,
+            args.seal,
+            args.receipt,
+            args.bundle_manifest,
+            args.wavlm_initializer,
+            args.output,
+            args.authorization_reference,
+            backend=backend,
+        )
     raise LargeError("usage", f"unknown data command {command}")

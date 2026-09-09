@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from .errors import ContractError
@@ -66,6 +68,14 @@ POWERSET_CLASSES = 11
 CHUNK_SECONDS = 8
 SAMPLE_RATE = 16_000
 OUTPUT_FRAMES = 399
+
+QUALIFICATION_BINDING_SCHEMA = "speakrs-qualification-input-v1"
+QUALIFICATION_BINDING_PURPOSE = "gpu_qualification"
+QUALIFICATION_SOURCES = ("AMI", "AliMeeting", "AISHELL-5", "VoxConverse")
+QUALIFICATION_TARGET_PROFILE = {"chunk_seconds": 8, "max_overlap": 2, "local_slots": 4}
+QUALIFICATION_CAPACITY_POLICY = "diagnostic"
+QUALIFICATION_CAPACITY_LIMIT = 0.005
+QUALIFICATION_BINDING_DIGEST_FIELD = "qualification_binding_sha256"
 
 PREPARATION_KIND = "preparation"
 QUALIFICATION_LEASE_KIND = "qualification-lease"
@@ -339,6 +349,340 @@ DEFAULT_MODEL = ModelIdentity(
 )
 
 
+_QUALIFICATION_CAPACITY_FIELDS = frozenset(
+    {
+        "chunk_seconds",
+        "max_overlap",
+        "local_slots",
+        "speaker_seconds",
+        "lost_seconds",
+        "loss_fraction",
+        "admitted",
+        "slot_lost_seconds",
+        "encoded_lost_seconds",
+        "overlap_limit_excess_seconds",
+        "actual_lost_seconds",
+        "encode_decode_lost_seconds",
+        "post_slot_overlap_lost_seconds",
+        "uem_speaker_seconds",
+        "chunks",
+        "frames",
+        "chunk_shift",
+        "model_num_frames",
+        "model_rf_duration",
+        "model_rf_step",
+    }
+)
+
+
+@dataclass(frozen=True)
+class QualificationBinding:
+    """Immutable diagnostic input identity for one GPU qualification run."""
+
+    release_sha256: str
+    restore_receipt_sha256: str
+    bundle_manifest_sha256: str
+    wavlm_initializer_sha256: str
+    required_sources: tuple[str, ...]
+    model_identity: ModelIdentity
+    target_profile: Mapping[str, int]
+    source_capacity: Mapping[str, Mapping[str, object]]
+    authorization_reference: str
+
+    def __post_init__(self) -> None:
+        """Reject invalid direct construction as well as invalid JSON input."""
+
+        if self.required_sources != QUALIFICATION_SOURCES:
+            raise ContractError("qualification binding source membership is not the approved set")
+        if (
+            not isinstance(self.model_identity, ModelIdentity)
+            or self.model_identity.identity() != DEFAULT_MODEL.identity()
+        ):
+            raise ContractError("qualification binding model identity is not the selected model")
+        if not isinstance(self.target_profile, Mapping) or dict(self.target_profile) != QUALIFICATION_TARGET_PROFILE:
+            raise ContractError("qualification binding target profile is not the selected profile")
+        object.__setattr__(self, "target_profile", MappingProxyType(dict(QUALIFICATION_TARGET_PROFILE)))
+        object.__setattr__(
+            self,
+            "release_sha256",
+            require_content_hash(self.release_sha256, "qualification binding release sha256"),
+        )
+        object.__setattr__(
+            self,
+            "restore_receipt_sha256",
+            require_content_hash(self.restore_receipt_sha256, "qualification binding restore receipt sha256"),
+        )
+        object.__setattr__(
+            self,
+            "bundle_manifest_sha256",
+            require_content_hash(self.bundle_manifest_sha256, "qualification binding bundle manifest sha256"),
+        )
+        object.__setattr__(
+            self,
+            "wavlm_initializer_sha256",
+            require_content_hash(self.wavlm_initializer_sha256, "qualification binding WavLM initializer sha256"),
+        )
+        if not isinstance(self.authorization_reference, str) or not self.authorization_reference:
+            raise ContractError("qualification binding authorization reference must be non-empty")
+        if not isinstance(self.source_capacity, Mapping) or set(self.source_capacity) != set(QUALIFICATION_SOURCES):
+            raise ContractError("qualification binding source capacity membership is incomplete")
+        normalized = MappingProxyType(
+            {
+                source: MappingProxyType(_parse_qualification_capacity_record(self.source_capacity[source], source))
+                for source in QUALIFICATION_SOURCES
+            }
+        )
+        object.__setattr__(self, "source_capacity", normalized)
+
+    @property
+    def schema(self) -> str:
+        """Return the qualification binding schema name."""
+
+        return QUALIFICATION_BINDING_SCHEMA
+
+    @property
+    def purpose(self) -> str:
+        """Return the only purpose accepted for this binding."""
+
+        return QUALIFICATION_BINDING_PURPOSE
+
+    @property
+    def capacity_policy(self) -> str:
+        """Return the non-admission capacity policy."""
+
+        return QUALIFICATION_CAPACITY_POLICY
+
+    @property
+    def capacity_limit(self) -> float:
+        """Return the unchanged global capacity limit used for diagnostics."""
+
+        return QUALIFICATION_CAPACITY_LIMIT
+
+    @property
+    def qualification_ready(self) -> bool:
+        """Return whether the binding is valid for a diagnostic GPU run."""
+
+        return True
+
+    @property
+    def training_ready(self) -> bool:
+        """Return whether this binding authorizes training."""
+
+        return False
+
+    @property
+    def capacity_admitted(self) -> bool:
+        """Return whether every selected source profile passed the limit."""
+
+        return all(bool(record["admitted"]) for record in self.source_capacity.values())
+
+    @property
+    def gpu_qualification_status(self) -> str:
+        """Return the pre-run GPU status sealed in the binding."""
+
+        return "not_run"
+
+    def _base_json(self) -> dict[str, object]:
+        """Return the content that defines the binding digest."""
+
+        return {
+            "schema": self.schema,
+            "purpose": self.purpose,
+            "release_sha256": self.release_sha256,
+            "restore_receipt_sha256": self.restore_receipt_sha256,
+            "bundle_manifest_sha256": self.bundle_manifest_sha256,
+            "wavlm_initializer_sha256": self.wavlm_initializer_sha256,
+            "required_sources": list(self.required_sources),
+            "model_identity": self.model_identity.identity(),
+            "target_profile": dict(self.target_profile),
+            "source_capacity": {source: dict(self.source_capacity[source]) for source in self.required_sources},
+            "capacity_policy": self.capacity_policy,
+            "capacity_limit": self.capacity_limit,
+            "authorization_reference": self.authorization_reference,
+            "qualification_ready": self.qualification_ready,
+            "training_ready": self.training_ready,
+            "capacity_admitted": self.capacity_admitted,
+            "gpu_qualification_status": self.gpu_qualification_status,
+        }
+
+    @property
+    def binding_sha256(self) -> str:
+        """Return the content digest used by leases and GPU reports."""
+
+        return sha256_json(self._base_json())
+
+    def as_dict(self) -> dict[str, object]:
+        """Serialize the binding with derived readiness and digest fields."""
+
+        payload = self._base_json()
+        payload[QUALIFICATION_BINDING_DIGEST_FIELD] = self.binding_sha256
+        return payload
+
+
+def _parse_qualification_capacity_record(value: Any, source: str) -> dict[str, object]:
+    """Parse one selected weighted capacity record without dropping diagnostics."""
+
+    data = _require_object(value, f"source_capacity.{source}")
+    _reject_unknown(data, set(_QUALIFICATION_CAPACITY_FIELDS), f"source_capacity.{source}")
+    for key in ("chunk_seconds", "max_overlap", "local_slots"):
+        if _require_int(data, key, f"source_capacity.{source}", minimum=1) != QUALIFICATION_TARGET_PROFILE[key]:
+            raise ContractError(
+                f"source_capacity.{source}.{key} does not match the qualification profile",
+                {"actual": data.get(key), "expected": QUALIFICATION_TARGET_PROFILE[key]},
+            )
+    speaker_seconds = _require_number(data, "speaker_seconds", f"source_capacity.{source}")
+    lost_seconds = _require_number(data, "lost_seconds", f"source_capacity.{source}")
+    loss_fraction = _require_number(data, "loss_fraction", f"source_capacity.{source}")
+    if not all(math.isfinite(value) for value in (speaker_seconds, lost_seconds, loss_fraction)):
+        raise ContractError("qualification capacity totals must be finite", {"source": source})
+    if speaker_seconds <= 0 or lost_seconds < 0:
+        raise ContractError("qualification capacity totals are invalid", {"source": source})
+    expected_fraction = lost_seconds / speaker_seconds
+    if not math.isclose(loss_fraction, expected_fraction, rel_tol=1e-12, abs_tol=1e-12):
+        raise ContractError("qualification capacity loss fraction is inconsistent", {"source": source})
+    if loss_fraction > 1.0 + 1e-12:
+        raise ContractError("qualification capacity loss fraction cannot exceed one", {"source": source})
+    admitted = data.get("admitted")
+    expected_admitted = expected_fraction <= QUALIFICATION_CAPACITY_LIMIT
+    if not isinstance(admitted, bool) or admitted is not expected_admitted:
+        raise ContractError("qualification capacity admission is inconsistent", {"source": source})
+    parsed: dict[str, object] = {
+        "chunk_seconds": 8,
+        "max_overlap": 2,
+        "local_slots": 4,
+        "speaker_seconds": speaker_seconds,
+        "lost_seconds": lost_seconds,
+        "loss_fraction": float(data["loss_fraction"]),
+        "admitted": expected_admitted,
+    }
+    for key, raw in data.items():
+        if key in parsed:
+            continue
+        if key in {"chunks", "frames", "chunk_shift", "model_num_frames"}:
+            parsed[key] = _require_int(data, key, f"source_capacity.{source}", minimum=1)
+        else:
+            parsed[key] = _require_number(data, key, f"source_capacity.{source}")
+            numeric = float(parsed[key])
+            must_be_positive = key in {"model_rf_duration", "model_rf_step", "uem_speaker_seconds"}
+            if not math.isfinite(numeric) or numeric < 0 or (must_be_positive and numeric == 0):
+                raise ContractError(
+                    "qualification capacity diagnostics must be finite and non-negative", {"source": source}
+                )
+    return parsed
+
+
+def parse_qualification_binding(payload: Any, label: str = "qualification-binding") -> QualificationBinding:
+    """Parse a strict qualification-only binding and reject training promotion."""
+
+    data = _require_object(payload, label)
+    _reject_unknown(
+        data,
+        {
+            "schema",
+            "purpose",
+            "release_sha256",
+            "restore_receipt_sha256",
+            "bundle_manifest_sha256",
+            "wavlm_initializer_sha256",
+            "required_sources",
+            "model_identity",
+            "target_profile",
+            "source_capacity",
+            "capacity_policy",
+            "capacity_limit",
+            "authorization_reference",
+            "qualification_ready",
+            "training_ready",
+            "capacity_admitted",
+            "gpu_qualification_status",
+            QUALIFICATION_BINDING_DIGEST_FIELD,
+        },
+        label,
+    )
+    if data.get("schema") != QUALIFICATION_BINDING_SCHEMA:
+        raise ContractError(f"{label}.schema must be {QUALIFICATION_BINDING_SCHEMA}")
+    if data.get("purpose") != QUALIFICATION_BINDING_PURPOSE:
+        raise ContractError(f"{label}.purpose must be {QUALIFICATION_BINDING_PURPOSE}")
+    release_sha256 = require_content_hash(data.get("release_sha256"), f"{label}.release_sha256")
+    restore_sha256 = require_content_hash(data.get("restore_receipt_sha256"), f"{label}.restore_receipt_sha256")
+    bundle_manifest_sha256 = require_content_hash(
+        data.get("bundle_manifest_sha256"), f"{label}.bundle_manifest_sha256"
+    )
+    wavlm_initializer_sha256 = require_content_hash(
+        data.get("wavlm_initializer_sha256"), f"{label}.wavlm_initializer_sha256"
+    )
+    sources = data.get("required_sources")
+    if not isinstance(sources, list) or tuple(sources) != QUALIFICATION_SOURCES:
+        raise ContractError(
+            f"{label}.required_sources must contain exactly the approved qualification sources",
+            {"actual": sources, "required": list(QUALIFICATION_SOURCES)},
+        )
+    model = parse_model_identity(data.get("model_identity"), f"{label}.model_identity")
+    profile_data = _require_object(data.get("target_profile"), f"{label}.target_profile")
+    _reject_unknown(profile_data, set(QUALIFICATION_TARGET_PROFILE), f"{label}.target_profile")
+    target_profile = {
+        key: _require_int(profile_data, key, f"{label}.target_profile", minimum=1)
+        for key in ("chunk_seconds", "max_overlap", "local_slots")
+    }
+    if dict(target_profile) != QUALIFICATION_TARGET_PROFILE:
+        raise ContractError(f"{label}.target_profile does not match the selected model profile")
+    source_capacity = _require_object(data.get("source_capacity"), f"{label}.source_capacity")
+    if set(source_capacity) != set(QUALIFICATION_SOURCES):
+        raise ContractError(
+            f"{label}.source_capacity must contain exactly the approved qualification sources",
+            {"actual": sorted(source_capacity), "required": list(QUALIFICATION_SOURCES)},
+        )
+    parsed_capacity = {
+        source: _parse_qualification_capacity_record(source_capacity[source], source)
+        for source in QUALIFICATION_SOURCES
+    }
+    capacity_policy = data.get("capacity_policy")
+    if capacity_policy != QUALIFICATION_CAPACITY_POLICY:
+        raise ContractError(f"{label}.capacity_policy must be {QUALIFICATION_CAPACITY_POLICY}")
+    capacity_limit = _require_number(data, "capacity_limit", label)
+    if capacity_limit != QUALIFICATION_CAPACITY_LIMIT:
+        raise ContractError(
+            f"{label}.capacity_limit must remain {QUALIFICATION_CAPACITY_LIMIT}",
+            {"actual": capacity_limit},
+        )
+    authorization_reference = _require_str(data, "authorization_reference", label)
+    binding = QualificationBinding(
+        release_sha256=release_sha256,
+        restore_receipt_sha256=restore_sha256,
+        bundle_manifest_sha256=bundle_manifest_sha256,
+        wavlm_initializer_sha256=wavlm_initializer_sha256,
+        required_sources=QUALIFICATION_SOURCES,
+        model_identity=model,
+        target_profile=target_profile,
+        source_capacity=parsed_capacity,
+        authorization_reference=authorization_reference,
+    )
+    derived = {
+        "qualification_ready": binding.qualification_ready,
+        "training_ready": binding.training_ready,
+        "capacity_admitted": binding.capacity_admitted,
+        "gpu_qualification_status": binding.gpu_qualification_status,
+    }
+    for key, expected in derived.items():
+        if key in data and data[key] != expected:
+            raise ContractError(f"{label}.{key} is derived and cannot be changed", {"expected": expected})
+    supplied_digest = data.get(QUALIFICATION_BINDING_DIGEST_FIELD)
+    if supplied_digest is not None and not isinstance(supplied_digest, str):
+        raise ContractError(f"{label}.{QUALIFICATION_BINDING_DIGEST_FIELD} must be a string")
+    if supplied_digest is not None and supplied_digest != binding.binding_sha256:
+        raise ContractError(
+            f"{label}.{QUALIFICATION_BINDING_DIGEST_FIELD} does not match the binding content",
+            {"expected": binding.binding_sha256, "actual": supplied_digest},
+        )
+    return binding
+
+
+def qualification_binding_to_json(binding: QualificationBinding) -> dict[str, object]:
+    """Serialize a validated qualification binding."""
+
+    return binding.as_dict()
+
+
 @dataclass(frozen=True)
 class MixturePolicy:
     """Deterministic 80% gold / 20% bronze quotas."""
@@ -600,7 +944,15 @@ def parse_kinded_lock(payload: Any, expected_kind: str) -> dict[str, Any]:
         present = sorted((LAUNCH_ONLY_FIELDS - LEASE_ONLY_FIELDS).intersection(data))
         if present:
             raise ContractError("qualification lease cannot parse as a launch lock", {"fields": present})
-        for key in ("offer", "rates", "hard_deadline", "backup_target", "lease_id"):
+        for key in (
+            "offer",
+            "rates",
+            "hard_deadline",
+            "backup_target",
+            "lease_id",
+            "spend_ceiling_usd",
+            QUALIFICATION_BINDING_DIGEST_FIELD,
+        ):
             if key not in data:
                 raise ContractError(f"qualification lease missing {key}")
     if expected_kind == LAUNCH_KIND:

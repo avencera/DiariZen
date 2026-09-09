@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -36,6 +37,7 @@ from recipes.speakrs.large.controller import (  # noqa: E402
 )
 from recipes.speakrs.large.errors import ContractError, PreparationError, RuntimeGateError  # noqa: E402
 from recipes.speakrs.large.handoff import package_handoff  # noqa: E402
+from recipes.speakrs.large.hashing import sha256_json  # noqa: E402
 from recipes.speakrs.large.prepare import seal_release  # noqa: E402
 from recipes.speakrs.large.sampler import MixtureSampler  # noqa: E402
 from recipes.speakrs.large.selection import (  # noqa: E402
@@ -501,9 +503,16 @@ class BudgetControllerTest(unittest.TestCase):
 
     def test_qualification_lease_is_not_a_launch_lock(self):
         lease = lease_from_offer(
-            {"offer_id": "o1", "gpu_profile": "4090", "usd_per_hour": 0.3, "disk_usd_per_hour": 0.01},
+            {
+                "offer_id": "o1",
+                "gpu_profile": "4090",
+                "usd_per_hour": 0.3,
+                "disk_usd_per_hour": 0.01,
+                "hard_deadline": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+            },
             "prep",
             "/tmp/backup",
+            sha256_json({"fixture": "qualification-binding"}),
         )
         parse_kinded_lock(lease, QUALIFICATION_LEASE_KIND)
         with self.assertRaises(ContractError):

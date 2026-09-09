@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Callable, Mapping
 
 from .budget import BudgetLedger, replacement_ledger
-from .contracts import QUALIFICATION_LEASE_KIND, parse_kinded_lock
+from .contracts import (
+    QUALIFICATION_BINDING_DIGEST_FIELD,
+    QUALIFICATION_LEASE_KIND,
+    QualificationBinding,
+    parse_kinded_lock,
+    parse_qualification_binding,
+    require_content_hash,
+)
 from .errors import RuntimeGateError
 from .recovery import BackupReceipt, LocalTransport, newest_complete_generation
 
@@ -151,21 +160,79 @@ class Controller:
         if not success and self.total_attempts >= self.retry_total:
             self.ledger.mark_terminal("failed")
 
-    def control_qualification(self, lease: Mapping[str, object]) -> dict[str, object]:
-        """Run qualification control from a lease, never from a launch lock."""
+    def control_qualification(
+        self,
+        lease: Mapping[str, object],
+        qualification_binding: QualificationBinding | Mapping[str, object] | str,
+    ) -> dict[str, object]:
+        """Run qualification control from a lease bound to one release identity."""
 
         parsed = parse_kinded_lock(lease, QUALIFICATION_LEASE_KIND)
         if parsed.get("kind") != QUALIFICATION_LEASE_KIND:
             raise RuntimeGateError("qualification control requires a qualification lease")
-        ceiling = float(parsed.get("spend_ceiling_usd") or self.ledger.policy.qualification_usd)
-        if ceiling > self.ledger.policy.qualification_usd + 1e-9:
+        expected_digest: str
+        if isinstance(qualification_binding, QualificationBinding):
+            expected_digest = qualification_binding.binding_sha256
+        elif isinstance(qualification_binding, Mapping):
+            expected_digest = parse_qualification_binding(qualification_binding).binding_sha256
+        else:
+            expected_digest = require_content_hash(qualification_binding, "qualification binding sha256")
+        actual_digest = parsed.get(QUALIFICATION_BINDING_DIGEST_FIELD)
+        if actual_digest != expected_digest:
+            raise RuntimeGateError(
+                "qualification lease is not bound to the supplied qualification input",
+                {"expected": expected_digest, "actual": actual_digest},
+            )
+        actual_digest = require_content_hash(actual_digest, "qualification binding sha256")
+        ceiling_raw = parsed.get("spend_ceiling_usd")
+        if isinstance(ceiling_raw, bool) or not isinstance(ceiling_raw, (int, float)):
+            raise RuntimeGateError("qualification lease has an invalid spend ceiling")
+        ceiling = float(ceiling_raw)
+        if not math.isfinite(ceiling) or ceiling <= 0 or ceiling > self.ledger.policy.qualification_usd + 1e-9:
             raise RuntimeGateError("qualification ceiling exceeds the $5 allocation")
+        rates = parsed.get("rates")
+        if not isinstance(rates, Mapping):
+            raise RuntimeGateError("qualification lease has no hourly rates")
+        gpu_rate = rates.get("gpu_usd_per_hour")
+        disk_rate = rates.get("disk_usd_per_hour")
+        if (
+            isinstance(gpu_rate, bool)
+            or not isinstance(gpu_rate, (int, float))
+            or not math.isfinite(float(gpu_rate))
+            or float(gpu_rate) <= 0
+            or isinstance(disk_rate, bool)
+            or not isinstance(disk_rate, (int, float))
+            or not math.isfinite(float(disk_rate))
+            or float(disk_rate) < 0
+        ):
+            raise RuntimeGateError("qualification lease has invalid hourly rates")
+        hard_deadline = parsed.get("hard_deadline")
+        if not isinstance(hard_deadline, str):
+            raise RuntimeGateError("qualification lease has no hard deadline")
+        try:
+            deadline = datetime.fromisoformat(hard_deadline.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise RuntimeGateError("qualification lease hard deadline is not an ISO-8601 timestamp") from error
+        if deadline.tzinfo is None:
+            raise RuntimeGateError("qualification lease hard deadline must include a UTC offset")
+        deadline_epoch_seconds = deadline.timestamp()
+        deadline_seconds = deadline_epoch_seconds - datetime.now(timezone.utc).timestamp()
+        if deadline_seconds <= 0:
+            raise RuntimeGateError("qualification lease hard deadline has passed")
+        hourly_rate = float(gpu_rate) + float(disk_rate)
+        budget_seconds = ceiling / hourly_rate * 3600.0
+        max_runtime_seconds = min(deadline_seconds, budget_seconds)
         return {
             "ok": True,
             "lease_id": parsed["lease_id"],
             "spend_ceiling_usd": ceiling,
+            "hourly_rate_usd": hourly_rate,
+            "hard_deadline": hard_deadline,
+            "deadline_epoch_seconds": deadline_epoch_seconds,
+            "max_runtime_seconds": max_runtime_seconds,
             "provider": type(self.provider).__name__,
             "live_vast": False,
+            QUALIFICATION_BINDING_DIGEST_FIELD: actual_digest,
         }
 
     def backup_newest(self, worker_root, trusted_root) -> BackupReceipt:
@@ -191,14 +258,20 @@ class Controller:
         return ledger
 
 
-def lease_from_offer(offer: Mapping[str, object], preparation_digest: str, backup_target: str) -> dict[str, object]:
+def lease_from_offer(
+    offer: Mapping[str, object],
+    preparation_digest: str,
+    backup_target: str,
+    qualification_binding_sha256: str,
+) -> dict[str, object]:
     """Build a qualification lease from a fixture offer. Does not rent."""
 
-    required = ("offer_id", "gpu_profile", "usd_per_hour", "disk_usd_per_hour")
+    required = ("offer_id", "gpu_profile", "usd_per_hour", "disk_usd_per_hour", "hard_deadline")
     missing = [key for key in required if key not in offer]
     if missing:
         raise RuntimeGateError("offer is incomplete", {"missing": missing})
-    return {
+    binding_digest = require_content_hash(qualification_binding_sha256, "qualification binding sha256")
+    lease = {
         "kind": QUALIFICATION_LEASE_KIND,
         "lease_id": f"lease-{offer['offer_id']}",
         "preparation_digest": preparation_digest,
@@ -208,7 +281,9 @@ def lease_from_offer(offer: Mapping[str, object], preparation_digest: str, backu
             "gpu_usd_per_hour": offer["usd_per_hour"],
             "disk_usd_per_hour": offer["disk_usd_per_hour"],
         },
-        "hard_deadline": offer.get("hard_deadline") or "unset",
+        "hard_deadline": offer["hard_deadline"],
         "backup_target": backup_target,
         "spend_ceiling_usd": 5.0,
     }
+    lease[QUALIFICATION_BINDING_DIGEST_FIELD] = binding_digest
+    return lease

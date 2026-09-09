@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
 
@@ -15,6 +16,7 @@ from .contracts import (
 )
 from .controller import Controller, FakeProvider, assert_worker_has_no_tokens, scrubbed_worker_environment
 from .errors import LargeError, RuntimeGateError
+from .hashing import sha256_json
 from .prepare import verify_release
 from .recovery import LocalTransport, copy_generation, newest_complete_generation, restore_into
 from .sampler import MixtureSampler, coverage_plan, schedule_batch_streams
@@ -214,18 +216,20 @@ def _check_controller(spec) -> dict:
     ledger = BudgetLedger(DEFAULT_BUDGET)
     controller = Controller(ledger=ledger, provider=FakeProvider(), transport=LocalTransport())
     controller.acquire()
+    qualification_binding_sha256 = sha256_json({"fixture": "qualification-binding"})
     lease = {
         "kind": "qualification-lease",
         "lease_id": "lease-fixture",
         "offer": {"offer_id": "off1", "gpu_profile": "4090", "usd_per_hour": 0.3, "disk_usd_per_hour": 0.01},
         "instance": None,
         "rates": {"gpu_usd_per_hour": 0.3, "disk_usd_per_hour": 0.01},
-        "hard_deadline": "unset",
+        "hard_deadline": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
         "backup_target": spec.relocation.backup_root.as_posix(),
         "spend_ceiling_usd": 5.0,
+        "qualification_binding_sha256": qualification_binding_sha256,
     }
     parse_kinded_lock(lease, "qualification-lease")
-    qualification = controller.control_qualification(lease)
+    qualification = controller.control_qualification(lease, qualification_binding_sha256)
     ledger.pause_for_extension()
     denied = False
     try:
