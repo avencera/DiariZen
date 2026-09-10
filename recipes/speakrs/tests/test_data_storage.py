@@ -1862,6 +1862,8 @@ class InterruptAndCapTest(unittest.TestCase):
             split_id="frozen",
             qa_policy_sha256=_h("qa"),
         )
+        backend.put_bytes("datasets/_canary/owner-probe.bin", b"speakrs-diarization-r2-owner-canary")
+        backend.put_bytes("datasets/_canary/probe.txt", b"speakrs-diarization-r2-canary")
 
         with mock.patch.object(backend, "iter_bytes", wraps=backend.iter_bytes) as iter_bytes:
             result = commit_release(
@@ -1879,6 +1881,75 @@ class InterruptAndCapTest(unittest.TestCase):
         self.assertEqual(result["state"], RemoteReleaseState.COMMITTED.value)
         object_reads = [call for call in iter_bytes.call_args_list if call.args[0] == key]
         self.assertEqual(len(object_reads), 1)
+        for relative, payload in (
+            ("owner-probe.bin", b"speakrs-diarization-r2-owner-canary"),
+            ("probe.txt", b"speakrs-diarization-r2-canary"),
+        ):
+            canary_key = f"datasets/_canary/{relative}"
+            canary_reads = [call for call in iter_bytes.call_args_list if call.args[0] == canary_key]
+            self.assertEqual(len(canary_reads), 1)
+            self.assertEqual(canary_reads[0].kwargs["max_bytes"], len(payload))
+
+        backend.put_bytes("datasets/_canary/unknown.bin", b"unknown")
+        with self.assertRaisesRegex(PreparationError, "inventory is not an exact accepted-selection closure"):
+            commit_release(
+                [batch],
+                required_sources=["AMI"],
+                state=RemoteReleaseState.DRAFT,
+                backend=backend,
+                inventory_prefix="datasets",
+                required_objects=batch["objects"],
+                release_identity={
+                    "required_batches": {batch["batch_sha256"]: batch["acceptance_sha256"]},
+                },
+            )
+
+    def test_release_commit_rejects_changed_control_canary(self):
+        backend = MemoryBackend()
+        payload = b"audio"
+        digest = sha256_bytes(payload)
+        key = object_key("AMI", "official", "train", digest, "flac")
+        backend.put_bytes(key, payload)
+        verified = mark_readback_verified(
+            {
+                "key": key,
+                "sha256": digest,
+                "size": len(payload),
+                "purpose": "train-audio",
+                "parent_id": "p",
+                "source": "AMI",
+                "state": ObjectState.UPLOADED.value,
+                "codec": "flac",
+            },
+            backend=backend,
+            expected_sha256=digest,
+        )
+        batch = commit_batch(
+            [verified],
+            state=BatchState.DRAFT,
+            expected_objects=[verified],
+            acceptance_sha256=_h("acceptance"),
+            backend=backend,
+            inventory_prefix="datasets",
+            label_policy_id="label-qa-policy",
+            split_id="frozen",
+            qa_policy_sha256=_h("qa"),
+        )
+        expected_canary = b"speakrs-diarization-r2-canary"
+        backend.put_bytes("datasets/_canary/probe.txt", b"x" * len(expected_canary))
+
+        with self.assertRaisesRegex(PreparationError, "partial/corrupt/missing remote content"):
+            commit_release(
+                [batch],
+                required_sources=["AMI"],
+                state=RemoteReleaseState.DRAFT,
+                backend=backend,
+                inventory_prefix="datasets",
+                required_objects=batch["objects"],
+                release_identity={
+                    "required_batches": {batch["batch_sha256"]: batch["acceptance_sha256"]},
+                },
+            )
 
     def test_generic_backend_uses_its_encryption_evidence_contract(self):
         class ProviderAttestedBackend(MemoryBackend):

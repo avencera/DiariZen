@@ -47,6 +47,10 @@ CLOUDFLARE_R2_DEFAULT_ENCRYPTION = "AES-256"
 WRANGLER_R2_REST_MAX_UPLOAD_BYTES = 300 * 1024**2
 WRANGLER_VERSION = "4.129.0"
 MARKER_DIRECTORY = "_commits"
+_R2_CONTROL_CANARIES = (
+    ("_canary/owner-probe.bin", b"speakrs-diarization-r2-owner-canary"),
+    ("_canary/probe.txt", b"speakrs-diarization-r2-canary"),
+)
 CONSUMED_SOURCE_STATE = "consumed-source"
 DELETION_JOURNAL_SCHEMA = "speakrs-deletion-journal-v1"
 DELETION_JOURNAL_DIRECTORY = ".deletion-journal"
@@ -2154,6 +2158,33 @@ class _RemoteEvidenceSession:
         )
 
 
+def _verified_control_keys(
+    backend: StorageBackend,
+    prefix: str,
+    evidence: _RemoteEvidenceSession,
+    inventory_keys: Sequence[str],
+) -> tuple[str, ...]:
+    """Verify known task-control canaries before excluding them from release data."""
+
+    present = set(inventory_keys)
+    verified = []
+    for relative, payload in _R2_CONTROL_CANARIES:
+        key = f"{prefix}/{relative}"
+        if key not in present:
+            continue
+        proof = _readback(
+            backend,
+            key,
+            expected_sha256=sha256_bytes(payload),
+            expected_size=len(payload),
+            max_bytes=len(payload),
+        )
+        evidence.encryption_for(proof)
+        evidence.privacy_for(proof)
+        verified.append(key)
+    return tuple(verified)
+
+
 def assert_private_access(backend: StorageBackend, key: str, prefix: str) -> dict[str, object]:
     """Authenticated read must work; anonymous GET/list must not disclose contents."""
 
@@ -2217,11 +2248,16 @@ def _known_marker_keys(
     *,
     kind: str,
     max_keys: int | None = DEFAULT_MAX_INVENTORY_KEYS,
+    inventory_keys: Sequence[str] | None = None,
 ) -> list[str]:
     """Return existing content-addressed markers that can be explained in a retry."""
 
     marker_prefix = f"{prefix}/{MARKER_DIRECTORY}/{kind}/"
-    keys = _list_prefix_bounded(backend, prefix, max_keys=max_keys)
+    keys = (
+        _list_prefix_bounded(backend, prefix, max_keys=max_keys)
+        if inventory_keys is None
+        else [_validate_key(key, "remote inventory key") for key in inventory_keys]
+    )
     known = []
     for key in keys:
         if not key.startswith(marker_prefix) or not key.endswith(".json"):
@@ -2262,6 +2298,19 @@ def verify_inventory_closure(
     prefix = _validate_prefix(prefix)
     if max_keys is not None:
         max_keys = _positive_int(max_keys, "max_keys")
+    actual = _list_prefix_bounded(backend, prefix, max_keys=max_keys)
+    return _verify_inventory_closure(expected, prefix=prefix, allowed_keys=allowed_keys, actual_keys=actual)
+
+
+def _verify_inventory_closure(
+    expected: Sequence[Mapping[str, object]],
+    *,
+    prefix: str,
+    allowed_keys: Sequence[str],
+    actual_keys: Sequence[str],
+) -> dict[str, object]:
+    """Validate inventory closure against one operation-owned inventory snapshot."""
+
     expected_keys = []
     for index, item in enumerate(expected):
         identity = _object_identity(item, f"expected[{index}]")
@@ -2275,7 +2324,7 @@ def verify_inventory_closure(
     outside_allowed = sorted(key for key in allowed if not key.startswith(prefix + "/") and key != prefix)
     if outside_allowed:
         raise ContractError("allowed inventory key lies outside the inventory prefix", {"keys": outside_allowed[:10]})
-    actual = _list_prefix_bounded(backend, prefix, max_keys=max_keys)
+    actual = [_validate_key(str(key), "remote inventory key") for key in actual_keys]
     if len(set(actual)) != len(actual):
         raise PreparationError("remote inventory contains duplicate keys", {"prefix": prefix})
     actual_set = set(actual)
@@ -3007,6 +3056,8 @@ def commit_release(
         if evidence.encryption_for(proof) != item.get("encryption"):
             raise PreparationError("remote encryption evidence differs from the object receipt", {"key": key})
         evidence.privacy_for(proof)
+    inventory_keys = _list_prefix_bounded(backend, prefix)
+    control_keys = _verified_control_keys(backend, prefix, evidence, inventory_keys)
     present_sources = {str(item.get("source")) for item in union.values()}
     missing_sources = sorted(set(source_names) - present_sources)
     extra_sources = sorted(present_sources - set(source_names))
@@ -3015,15 +3066,16 @@ def commit_release(
             "required membership is incomplete",
             {"missing": missing_sources, "extra": extra_sources},
         )
-    inventory = verify_inventory_closure(
-        backend,
+    inventory = _verify_inventory_closure(
         list(union.values()),
         prefix=prefix,
         allowed_keys=[
             *allowed_inventory_keys,
+            *control_keys,
             *marker_refs,
-            *_known_marker_keys(backend, prefix, kind="releases"),
+            *_known_marker_keys(backend, prefix, kind="releases", inventory_keys=inventory_keys),
         ],
+        actual_keys=inventory_keys,
     )
     marker_inventory = _stable_inventory(inventory, list(union))
     batches_payload = [dict(batch) for batch in sorted(batch_payloads, key=lambda item: str(item["batch_sha256"]))]
