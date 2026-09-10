@@ -14,7 +14,7 @@ import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass
-from functools import wraps
+from functools import partial, wraps
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -393,6 +393,12 @@ def _cleanup_cuda(torch_module: Any) -> None:
     ipc_collect = getattr(cuda, "ipc_collect", None)
     if callable(ipc_collect):
         ipc_collect()
+
+
+def _bind_collate(collate_fn: Callable[..., Any], max_speakers_per_chunk: int) -> Callable[[Any], Any]:
+    """Bind the speaker limit without creating an unpicklable local function."""
+
+    return partial(collate_fn, max_speakers_per_chunk=max_speakers_per_chunk)
 
 
 def _device_facts(torch_module: Any) -> dict[str, object]:
@@ -1369,8 +1375,9 @@ def _run_real_attempt(
         train_args["model_num_frames"] = model_num_frames
         train_args["model_rf_duration"] = model_rf_duration
         train_args["model_rf_step"] = model_rf_step
-        collate = lambda batch: _collate_fn(  # noqa: E731 - configured collate needs its bound slot count
-            batch, max_speakers_per_chunk=runtime_config["model"]["args"]["max_speakers_per_chunk"]
+        collate = _bind_collate(
+            _collate_fn,
+            runtime_config["model"]["args"]["max_speakers_per_chunk"],
         )
         dataset = instantiate(runtime_config["train_dataset"]["path"], args=train_args)
         dataloader = DataLoader(dataset=dataset, collate_fn=collate, shuffle=True, **train_loader_config)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import pickle
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from recipes.speakrs.large.qualification import (
     AttemptResult,
     QualificationError,
     QualificationSpec,
+    _bind_collate,
     _code_hash,
     _run_isolated_real_attempt,
     estimate_training_hours,
@@ -21,6 +23,10 @@ from recipes.speakrs.large.qualification import (
     run_qualification,
     select_largest_batch,
 )
+
+
+def _collate_stub(batch, *, max_speakers_per_chunk):
+    return batch, max_speakers_per_chunk
 
 
 def _trainer_toml(tmp_path: Path) -> Path:
@@ -40,6 +46,14 @@ def test_defaults_match_first_run_profile() -> None:
     assert spec.planned_max_cycles == 100
     assert spec.accumulation_for(2) == 32
     assert spec.accumulation_for(8) == 8
+
+
+def test_bound_collate_is_picklable_for_data_loader_workers() -> None:
+    bound = _bind_collate(_collate_stub, 4)
+
+    restored = pickle.loads(pickle.dumps(bound))
+
+    assert restored(["audio"]) == (["audio"], 4)
 
 
 def test_real_code_hash_covers_model_dataset_and_trainers() -> None:
