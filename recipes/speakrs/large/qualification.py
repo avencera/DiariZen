@@ -1296,6 +1296,35 @@ def _run_isolated_real_attempt(*, timeout_seconds: float | None = None, **kwargs
     )
 
 
+def _real_attempt_config(
+    config: Mapping[str, Any],
+    spec: QualificationSpec,
+    *,
+    physical_batch: int,
+    accumulation: int,
+    phase: str,
+    work_root: Path | None,
+) -> dict[str, Any]:
+    """Build one isolated trainer configuration for the full timing window."""
+
+    runtime_config = copy.deepcopy(dict(config))
+    trainer_args = runtime_config.setdefault("trainer", {}).setdefault("args", {})
+    trainer_args["gradient_accumulation_steps"] = accumulation
+    trainer_args["max_steps"] = spec.warmup_optimizer_updates + spec.measured_optimizer_updates
+    trainer_args["max_epochs"] = 1
+    trainer_args["validation_before_training"] = False
+    trainer_args["validation_interval"] = 2**31 - 1
+    trainer_args["save_ckpt_interval"] = 1
+    train_loader_config = runtime_config["train_dataset"]["dataloader"]
+    train_loader_config["batch_size"] = physical_batch
+    train_loader_config["drop_last"] = True
+    if work_root is not None:
+        runtime_config.setdefault("meta", {})["save_dir"] = str(work_root)
+        runtime_config["meta"]["exp_id"] = f"{phase}-batch-{physical_batch}"
+    runtime_config.setdefault("meta", {}).setdefault("exp_id", f"qualification-{phase}-{physical_batch}")
+    return runtime_config
+
+
 def _run_real_attempt(
     *,
     config_path: Path,
@@ -1315,26 +1344,20 @@ def _run_real_attempt(
 
     import torch
     from accelerate import Accelerator, DistributedDataParallelKwargs
-    from accelerate.utils import set_seed
+    from accelerate.utils import GradientAccumulationPlugin, set_seed
     from torch.utils.data import DataLoader
 
     from diarizen.utils import instantiate
 
-    runtime_config = copy.deepcopy(dict(config))
-    trainer_args = runtime_config.setdefault("trainer", {}).setdefault("args", {})
-    trainer_args["gradient_accumulation_steps"] = accumulation
-    trainer_args["max_steps"] = 0
-    trainer_args["max_epochs"] = 1
-    trainer_args["validation_before_training"] = False
-    trainer_args["validation_interval"] = 2**31 - 1
-    trainer_args["save_ckpt_interval"] = 1
+    runtime_config = _real_attempt_config(
+        config,
+        spec,
+        physical_batch=physical_batch,
+        accumulation=accumulation,
+        phase=phase,
+        work_root=work_root,
+    )
     train_loader_config = runtime_config["train_dataset"]["dataloader"]
-    train_loader_config["batch_size"] = physical_batch
-    train_loader_config["drop_last"] = True
-    if work_root is not None:
-        runtime_config.setdefault("meta", {})["save_dir"] = str(work_root)
-        runtime_config["meta"]["exp_id"] = f"{phase}-batch-{physical_batch}"
-    runtime_config.setdefault("meta", {}).setdefault("exp_id", f"qualification-{phase}-{physical_batch}")
 
     current_directory = Path.cwd()
     path_inserted = False
@@ -1346,8 +1369,12 @@ def _run_real_attempt(
         from dataset import _collate_fn
 
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        accumulation_plugin = GradientAccumulationPlugin(
+            num_steps=accumulation,
+            sync_with_dataloader=False,
+        )
         accelerator = Accelerator(
-            gradient_accumulation_steps=accumulation,
+            gradient_accumulation_plugin=accumulation_plugin,
             mixed_precision="bf16",
             kwargs_handlers=[ddp_kwargs],
         )

@@ -15,6 +15,7 @@ from recipes.speakrs.large.qualification import (
     QualificationSpec,
     _bind_collate,
     _code_hash,
+    _real_attempt_config,
     _run_isolated_real_attempt,
     estimate_training_hours,
     execute_qualification,
@@ -54,6 +55,31 @@ def test_bound_collate_is_picklable_for_data_loader_workers() -> None:
     restored = pickle.loads(pickle.dumps(bound))
 
     assert restored(["audio"]) == (["audio"], 4)
+
+
+def test_real_attempt_runs_full_warmup_and_measurement_window(tmp_path: Path) -> None:
+    config = {
+        "meta": {"save_dir": "original", "exp_id": "original"},
+        "trainer": {"args": {"max_steps": 2_000, "max_epochs": 100}},
+        "train_dataset": {"dataloader": {"batch_size": 8, "drop_last": False}},
+    }
+    spec = QualificationSpec(warmup_optimizer_updates=20, measured_optimizer_updates=100)
+
+    runtime = _real_attempt_config(
+        config,
+        spec,
+        physical_batch=2,
+        accumulation=32,
+        phase="probe",
+        work_root=tmp_path,
+    )
+
+    assert runtime["trainer"]["args"]["max_steps"] == 120
+    assert runtime["trainer"]["args"]["gradient_accumulation_steps"] == 32
+    assert runtime["train_dataset"]["dataloader"]["batch_size"] == 2
+    assert runtime["train_dataset"]["dataloader"]["drop_last"] is True
+    assert runtime["meta"] == {"save_dir": str(tmp_path), "exp_id": "probe-batch-2"}
+    assert config["trainer"]["args"]["max_steps"] == 2_000
 
 
 def test_real_code_hash_covers_model_dataset_and_trainers() -> None:
