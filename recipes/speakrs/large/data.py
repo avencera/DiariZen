@@ -1590,9 +1590,16 @@ def _load_final_release_context(
     """Validate the current final seal, source identities, and remote object union."""
 
     from .contracts import require_content_hash
-    from .storage import _object_identity, _readback, _validate_batch_marker
+    from .storage import (
+        _object_identity,
+        _readback,
+        _readback_payload,
+        _RemoteEvidenceSession,
+        _validate_batch_marker,
+    )
 
     prefix = spec.r2.prefix
+    evidence = _RemoteEvidenceSession(store, privacy_prefix=prefix)
     seal = _find_release_seal(read_json(seal_path))
     if seal is None:
         raise PreparationError("final restore requires a final-release seal")
@@ -1608,9 +1615,12 @@ def _load_final_release_context(
         raise PreparationError("final-release marker is outside the authorized task prefix")
     if isinstance(marker_size, bool) or not isinstance(marker_size, int) or marker_size <= 0:
         raise PreparationError("final-release marker size is invalid")
-    raw_marker = store.get_bytes(marker_key)
-    if len(raw_marker) != marker_size or sha256_bytes(raw_marker) != marker_sha256:
-        raise PreparationError("final-release marker failed full content verification")
+    marker_proof, raw_marker = _readback_payload(
+        store,
+        marker_key,
+        expected_sha256=marker_sha256,
+        expected_size=marker_size,
+    )
     try:
         marker_payload = json.loads(raw_marker)
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
@@ -1627,7 +1637,7 @@ def _load_final_release_context(
         raise PreparationError("local final-release seal differs from the remote marker")
     if {key: value for key, value in seal.items() if key != "marker"} != dict(marker_payload):
         raise PreparationError("local final-release seal content differs from its immutable marker")
-    assert_private_access(store, marker_key, prefix)
+    evidence.privacy_for(marker_proof)
 
     serialized_spec = data_spec_to_json(spec)
     current_implementation = _implementation_identity()
@@ -1699,6 +1709,7 @@ def _load_final_release_context(
     portable_by_batch: dict[str, Mapping[str, object]] = {}
     capacity_by_batch: dict[str, tuple[str, CapacityClosure]] = {}
     batch_union: dict[str, Mapping[str, object]] = {}
+    prevalidated_objects: dict[str, Any] = {}
     for batch in batch_payloads:
         if not isinstance(batch, Mapping):
             raise PreparationError("final-release marker contains an invalid batch")
@@ -1732,11 +1743,14 @@ def _load_final_release_context(
         if len(manifests) != 1:
             raise PreparationError("final-release batch requires exactly one portable manifest")
         manifest_identity = _object_identity(manifests[0], "final-release portable manifest")
-        raw_manifest = store.get_bytes(str(manifest_identity["key"]))
-        if len(raw_manifest) != int(manifest_identity["size"]) or sha256_bytes(raw_manifest) != str(
-            manifest_identity["sha256"]
-        ):
-            raise PreparationError("final-release portable manifest failed full content verification")
+        manifest_key = str(manifest_identity["key"])
+        manifest_proof, raw_manifest = _readback_payload(
+            store,
+            manifest_key,
+            expected_sha256=str(manifest_identity["sha256"]),
+            expected_size=int(manifest_identity["size"]),
+        )
+        prevalidated_objects[manifest_key] = manifest_proof
         try:
             portable = json.loads(raw_manifest)
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
@@ -1772,13 +1786,15 @@ def _load_final_release_context(
             for name in ("key", "sha256", "size")
         ):
             raise PreparationError("final-release object identity differs from its committed batches", {"key": key})
-        _readback(
-            store,
-            key,
-            expected_sha256=str(_object_identity(release_by_key[key])["sha256"]),
-            expected_size=int(_object_identity(release_by_key[key])["size"]),
-        )
-        assert_private_access(store, key, prefix)
+        proof = prevalidated_objects.get(key)
+        if proof is None:
+            proof = _readback(
+                store,
+                key,
+                expected_sha256=str(_object_identity(release_by_key[key])["sha256"]),
+                expected_size=int(_object_identity(release_by_key[key])["size"]),
+            )
+        evidence.privacy_for(proof)
     required_batches = identity.get("required_batches")
     expected_batches = {
         batch_hash: require_content_hash(batch.get("acceptance_sha256"), "batch acceptance sha256")

@@ -2109,6 +2109,8 @@ def _encryption_evidence_after_readback(
         raise PreparationError("remote metadata is not an object", {"key": proof.key})
     encryption = metadata.get("encryption")
     if not isinstance(encryption, str) or not encryption:
+        encryption = backend.encryption_evidence(proof.key)
+    if not isinstance(encryption, str) or not encryption:
         raise PreparationError("missing encryption evidence", {"key": proof.key})
     return encryption, wrangler_policy
 
@@ -2336,11 +2338,10 @@ def mark_readback_verified(
         except ValueError as error:
             raise PreparationError("remote metadata contains an invalid object size", {"key": key}) from error
     proof = _readback(backend, key, expected_sha256=expected, expected_size=expected_size, max_bytes=max_bytes)
-    encryption = backend.encryption_evidence(key)
-    if not encryption:
-        raise PreparationError("missing encryption evidence", {"key": key})
+    evidence = _RemoteEvidenceSession(backend, privacy_prefix=prefix)
+    encryption = evidence.encryption_for(proof)
     if prefix is not None:
-        privacy = assert_private_access(backend, key, prefix)
+        privacy = evidence.privacy_for(proof)
     elif backend.is_public(key):
         raise PreparationError("public/readable anonymous objects fail privacy check", {"key": key})
     else:
@@ -2846,19 +2847,20 @@ def commit_batch(
             },
         )
     expected_receipts = []
+    evidence = _RemoteEvidenceSession(backend, privacy_prefix=prefix)
     for key in sorted(expected_by_key):
         item = actual_by_key[key]
         receipt = _receipt_dict(item)
-        _readback(
+        proof = _readback(
             backend,
             key,
             expected_sha256=str(receipt["sha256"]),
             expected_size=int(receipt["size"]),
         )
-        encryption = backend.encryption_evidence(key)
-        if not encryption or encryption != receipt.get("encryption"):
+        encryption = evidence.encryption_for(proof)
+        if encryption != receipt.get("encryption"):
             raise PreparationError("remote encryption evidence differs from the object receipt", {"key": key})
-        assert_private_access(backend, key, prefix)
+        evidence.privacy_for(proof)
         expected_receipts.append(receipt)
     inventory = verify_inventory_closure(
         backend,
@@ -2997,12 +2999,14 @@ def commit_release(
                 "extra": sorted(set(union) - set(expected_by_key))[:20],
             },
         )
+    prefix = _validate_prefix(inventory_prefix, "inventory_prefix")
+    evidence = _RemoteEvidenceSession(backend, privacy_prefix=prefix)
     for key, item in union.items():
         _compare_object_identity(expected_by_key[key], item, "release")
-        _readback(backend, key, expected_sha256=str(item["sha256"]), expected_size=int(item["size"]))
-        if backend.encryption_evidence(key) != item.get("encryption"):
+        proof = _readback(backend, key, expected_sha256=str(item["sha256"]), expected_size=int(item["size"]))
+        if evidence.encryption_for(proof) != item.get("encryption"):
             raise PreparationError("remote encryption evidence differs from the object receipt", {"key": key})
-        assert_private_access(backend, key, _validate_prefix(inventory_prefix))
+        evidence.privacy_for(proof)
     present_sources = {str(item.get("source")) for item in union.values()}
     missing_sources = sorted(set(source_names) - present_sources)
     extra_sources = sorted(present_sources - set(source_names))
@@ -3011,7 +3015,6 @@ def commit_release(
             "required membership is incomplete",
             {"missing": missing_sources, "extra": extra_sources},
         )
-    prefix = _validate_prefix(inventory_prefix, "inventory_prefix")
     inventory = verify_inventory_closure(
         backend,
         list(union.values()),

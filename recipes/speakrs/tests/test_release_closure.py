@@ -127,6 +127,32 @@ def test_final_restore_dispatch_reuses_actual_batch_proof_and_handoff_accepts_in
     assert handoff["complete_release"] is True
 
 
+def test_final_restore_validates_each_release_object_once(committed_release):
+    from collections import Counter
+    from unittest import mock
+
+    _, _, release, backend, config, seal, _ = committed_release
+    object_keys = {item["key"] for item in seal["objects"]} | {seal["marker"]["key"]}
+    with (
+        mock.patch.object(backend, "iter_bytes", wraps=backend.iter_bytes) as iter_bytes,
+        mock.patch.object(backend, "anonymous_list", wraps=backend.anonymous_list) as anonymous_list,
+    ):
+        dispatch_data(
+            _final_restore_args(
+                config,
+                release,
+                release / "remote-release.json",
+                release / "batch-restore.json",
+                release / "single-read-final-restore.json",
+            ),
+            backend=backend,
+        )
+
+    reads = Counter(call.args[0] for call in iter_bytes.call_args_list if call.args[0] in object_keys)
+    assert reads == Counter(dict.fromkeys(object_keys, 1))
+    anonymous_list.assert_called_once()
+
+
 def test_final_restore_reuses_legacy_v1_proof_without_an_incarnation(committed_release):
     spec, _, release, backend, config, _, batch_restore = committed_release
     legacy = {key: value for key, value in batch_restore.items() if key != "incarnation_id"}

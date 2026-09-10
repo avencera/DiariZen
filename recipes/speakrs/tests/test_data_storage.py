@@ -1829,6 +1829,88 @@ class InterruptAndCapTest(unittest.TestCase):
                 state=RemoteReleaseState.DRAFT,
             )
 
+    def test_release_commit_reads_each_object_once(self):
+        from unittest import mock
+
+        backend = MemoryBackend()
+        payload = b"audio"
+        digest = sha256_bytes(payload)
+        key = object_key("AMI", "official", "train", digest, "flac")
+        backend.put_bytes(key, payload)
+        verified = mark_readback_verified(
+            {
+                "key": key,
+                "sha256": digest,
+                "size": len(payload),
+                "purpose": "train-audio",
+                "parent_id": "p",
+                "source": "AMI",
+                "state": ObjectState.UPLOADED.value,
+                "codec": "flac",
+            },
+            backend=backend,
+            expected_sha256=digest,
+        )
+        batch = commit_batch(
+            [verified],
+            state=BatchState.DRAFT,
+            expected_objects=[verified],
+            acceptance_sha256=_h("acceptance"),
+            backend=backend,
+            inventory_prefix="datasets",
+            label_policy_id="label-qa-policy",
+            split_id="frozen",
+            qa_policy_sha256=_h("qa"),
+        )
+
+        with mock.patch.object(backend, "iter_bytes", wraps=backend.iter_bytes) as iter_bytes:
+            result = commit_release(
+                [batch],
+                required_sources=["AMI"],
+                state=RemoteReleaseState.DRAFT,
+                backend=backend,
+                inventory_prefix="datasets",
+                required_objects=batch["objects"],
+                release_identity={
+                    "required_batches": {batch["batch_sha256"]: batch["acceptance_sha256"]},
+                },
+            )
+
+        self.assertEqual(result["state"], RemoteReleaseState.COMMITTED.value)
+        object_reads = [call for call in iter_bytes.call_args_list if call.args[0] == key]
+        self.assertEqual(len(object_reads), 1)
+
+    def test_generic_backend_uses_its_encryption_evidence_contract(self):
+        class ProviderAttestedBackend(MemoryBackend):
+            def head(self, key):
+                return {name: value for name, value in super().head(key).items() if name != "encryption"}
+
+            def encryption_evidence(self, key):
+                return "provider-attested"
+
+        backend = ProviderAttestedBackend()
+        payload = b"audio"
+        digest = sha256_bytes(payload)
+        key = object_key("AMI", "official", "train", digest, "flac")
+        backend.put_bytes(key, payload)
+
+        verified = mark_readback_verified(
+            {
+                "key": key,
+                "sha256": digest,
+                "size": len(payload),
+                "purpose": "train-audio",
+                "parent_id": "p",
+                "source": "AMI",
+                "state": ObjectState.UPLOADED.value,
+                "codec": "flac",
+            },
+            backend=backend,
+            expected_sha256=digest,
+        )
+
+        self.assertEqual(verified["encryption"], "provider-attested")
+
 
 class RestoreReaderTest(unittest.TestCase):
     def test_caller_samples_cannot_replace_committed_manifest(self):
