@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from recipes.speakrs.large import qualification as qualification_module
 from recipes.speakrs.large.qualification import (
     AttemptResult,
     QualificationError,
@@ -117,6 +118,58 @@ def test_cpu_fake_runner_probes_then_measures_only_selected(tmp_path: Path) -> N
     assert report["physical_batch"] == 4
     assert calls == [("probe", 2), ("probe", 4), ("probe", 8)]
     assert windows == [(1, 3), (1, 3), (1, 3)]
+
+
+def test_default_real_runner_forwards_attempt_contract_once(monkeypatch, tmp_path: Path) -> None:
+    config = _trainer_toml(tmp_path)
+    calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(qualification_module, "_coerce_qualification_binding", lambda _value: object())
+    monkeypatch.setattr(qualification_module, "_qualification_timeout_seconds", lambda _control, _binding: 60.0)
+    monkeypatch.setattr(qualification_module, "_validate_real_config", lambda _config, _root, _binding: {})
+    monkeypatch.setattr(qualification_module, "_training_root", lambda _path: tmp_path)
+
+    def isolated_attempt(**kwargs):
+        calls.append(kwargs)
+        return AttemptResult(
+            physical_batch=int(kwargs["physical_batch"]),
+            accumulation=int(kwargs["accumulation"]),
+            ok=True,
+            total_memory_bytes=100,
+            peak_reserved_bytes=70,
+            update_seconds=(1.0,),
+            measured_update_count=1,
+            checkpoint_write_reload={"feasible": True, "write": True, "reload": True},
+        )
+
+    monkeypatch.setattr(qualification_module, "_run_isolated_real_attempt", isolated_attempt)
+    monkeypatch.setattr(
+        qualification_module,
+        "_build_report",
+        lambda **kwargs: {"ok": kwargs.get("failure") is None},
+    )
+
+    report = run_qualification(
+        config,
+        "4090",
+        QualificationSpec(
+            warmup_optimizer_updates=1,
+            measured_optimizer_updates=1,
+            physical_batch_candidates=(2,),
+        ),
+        qualification_binding={},
+        qualification_control={},
+        device_facts={"cuda_available": True, "device_name": "RTX 4090", "total_memory_bytes": 100},
+    )
+
+    assert report == {"ok": True}
+    assert len(calls) == 1
+    assert calls[0]["physical_batch"] == 2
+    assert calls[0]["accumulation"] == 32
+    assert calls[0]["phase"] == "probe"
+    assert calls[0]["warmup_updates"] == 1
+    assert calls[0]["measured_updates"] == 1
+    assert calls[0]["config"] == {"meta": {"seed": 3407}}
 
 
 def test_invalid_profile_and_no_cuda_publish_failed_report(tmp_path: Path) -> None:

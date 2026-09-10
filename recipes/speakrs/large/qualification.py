@@ -806,7 +806,7 @@ def _invoke_attempt_runner(
     spec: QualificationSpec,
     config: Mapping[str, Any],
 ) -> AttemptResult:
-    """Call an injected runner with the same inputs used by the real runner."""
+    """Call one runner with the complete qualification attempt contract."""
 
     accumulation = spec.accumulation_for(physical_batch)
     updates = spec.measured_optimizer_updates
@@ -819,8 +819,6 @@ def _invoke_attempt_runner(
             measured_updates=updates,
             config=config,
         )
-    except TypeError:
-        result = runner(physical_batch, phase)
     except BaseException as error:  # noqa: BLE001 - classify only CUDA OOM here
         if _is_cuda_oom(error):
             return AttemptResult(
@@ -1054,12 +1052,20 @@ def run_qualification(
         config_facts = _validate_real_config(config, root, binding)
         deadline = time.monotonic() + timeout_seconds
 
-        def real_runner(**kwargs: Any) -> AttemptResult:
+        def real_runner(
+            *,
+            physical_batch: int,
+            accumulation: int,
+            phase: str,
+            warmup_updates: int,
+            measured_updates: int,
+            config: Mapping[str, Any],
+        ) -> AttemptResult:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return AttemptResult(
-                    physical_batch=int(kwargs["physical_batch"]),
-                    accumulation=int(kwargs["accumulation"]),
+                    physical_batch=physical_batch,
+                    accumulation=accumulation,
                     ok=False,
                     error_code="qualification_deadline_exceeded",
                     error_message="qualification runtime limit expired before this candidate",
@@ -1072,7 +1078,11 @@ def run_qualification(
                 device=device,
                 work_root=work_root,
                 timeout_seconds=remaining,
-                **kwargs,
+                physical_batch=physical_batch,
+                accumulation=accumulation,
+                phase=phase,
+                warmup_updates=warmup_updates,
+                measured_updates=measured_updates,
             )
 
         attempt_runner = real_runner
