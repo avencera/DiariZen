@@ -127,15 +127,19 @@ def test_final_restore_dispatch_reuses_actual_batch_proof_and_handoff_accepts_in
     assert handoff["complete_release"] is True
 
 
-def test_final_restore_validates_each_release_object_once(committed_release):
+def test_final_restore_reads_release_metadata_without_payloads(committed_release):
     from collections import Counter
     from unittest import mock
 
     _, _, release, backend, config, seal, _ = committed_release
-    object_keys = {item["key"] for item in seal["objects"]} | {seal["marker"]["key"]}
+    release_marker_key = seal["marker"]["key"]
+    batch_marker_keys = {batch["marker"]["key"] for batch in seal["batches"]}
+    manifest_keys = {item["key"] for item in seal["objects"] if item.get("purpose") == "manifest"}
+    payload_keys = {item["key"] for item in seal["objects"] if item.get("purpose") in {"train-audio", "train-label"}}
     with (
         mock.patch.object(backend, "iter_bytes", wraps=backend.iter_bytes) as iter_bytes,
         mock.patch.object(backend, "anonymous_list", wraps=backend.anonymous_list) as anonymous_list,
+        mock.patch.object(backend, "anonymous_get", wraps=backend.anonymous_get) as anonymous_get,
     ):
         dispatch_data(
             _final_restore_args(
@@ -148,9 +152,35 @@ def test_final_restore_validates_each_release_object_once(committed_release):
             backend=backend,
         )
 
-    reads = Counter(call.args[0] for call in iter_bytes.call_args_list if call.args[0] in object_keys)
-    assert reads == Counter(dict.fromkeys(object_keys, 1))
+    reads = Counter(call.args[0] for call in iter_bytes.call_args_list)
+    expected_reads = {release_marker_key, *batch_marker_keys, *manifest_keys}
+    assert reads == Counter(dict.fromkeys(expected_reads, 1))
+    assert not (set(reads) & payload_keys)
+    privacy_reads = Counter(call.args[0] for call in anonymous_get.call_args_list)
+    assert privacy_reads == Counter(dict.fromkeys({release_marker_key, *manifest_keys}, 1))
+    assert not (set(privacy_reads) & payload_keys)
     anonymous_list.assert_called_once()
+
+
+def test_final_restore_rejects_release_marker_outside_content_addressed_path(committed_release):
+    spec, _, release, backend, _, seal, _ = committed_release
+    marker_key = seal["marker"]["key"]
+    alias_key = marker_key.replace("/_commits/releases/", "/_commits/release-aliases/")
+    backend.put_bytes(alias_key, backend.get_bytes(marker_key))
+    receipt = json.loads((release / "remote-release.json").read_text(encoding="utf-8"))
+    receipt["seal"]["marker"]["key"] = alias_key
+    alias_receipt = release / "aliased-release-marker.json"
+    write_json(alias_receipt, receipt)
+
+    with pytest.raises(PreparationError, match="content-addressed by the release hash"):
+        data_module.final_restore_data(
+            spec,
+            release,
+            alias_receipt,
+            release / "aliased-final-restore.json",
+            restore_receipts_path=release / "batch-restore.json",
+            backend=backend,
+        )
 
 
 def test_final_restore_reuses_legacy_v1_proof_without_an_incarnation(committed_release):

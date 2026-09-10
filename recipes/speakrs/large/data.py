@@ -1591,8 +1591,8 @@ def _load_final_release_context(
 
     from .contracts import require_content_hash
     from .storage import (
+        _marker_key,
         _object_identity,
-        _readback,
         _readback_payload,
         _RemoteEvidenceSession,
         _validate_batch_marker,
@@ -1633,6 +1633,8 @@ def _load_final_release_context(
     marker_base = {key: value for key, value in marker_payload.items() if key != "release_sha256"}
     if sha256_json(marker_base) != release_sha256:
         raise PreparationError("final-release marker release hash is invalid")
+    if marker_key != _marker_key(prefix, "releases", release_sha256):
+        raise PreparationError("final-release marker key is not content-addressed by the release hash")
     if seal.get("release_sha256") != release_sha256:
         raise PreparationError("local final-release seal differs from the remote marker")
     if {key: value for key, value in seal.items() if key != "marker"} != dict(marker_payload):
@@ -1709,7 +1711,6 @@ def _load_final_release_context(
     portable_by_batch: dict[str, Mapping[str, object]] = {}
     capacity_by_batch: dict[str, tuple[str, CapacityClosure]] = {}
     batch_union: dict[str, Mapping[str, object]] = {}
-    prevalidated_objects: dict[str, Any] = {}
     for batch in batch_payloads:
         if not isinstance(batch, Mapping):
             raise PreparationError("final-release marker contains an invalid batch")
@@ -1750,7 +1751,7 @@ def _load_final_release_context(
             expected_sha256=str(manifest_identity["sha256"]),
             expected_size=int(manifest_identity["size"]),
         )
-        prevalidated_objects[manifest_key] = manifest_proof
+        evidence.privacy_for(manifest_proof)
         try:
             portable = json.loads(raw_manifest)
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
@@ -1786,15 +1787,6 @@ def _load_final_release_context(
             for name in ("key", "sha256", "size")
         ):
             raise PreparationError("final-release object identity differs from its committed batches", {"key": key})
-        proof = prevalidated_objects.get(key)
-        if proof is None:
-            proof = _readback(
-                store,
-                key,
-                expected_sha256=str(_object_identity(release_by_key[key])["sha256"]),
-                expected_size=int(_object_identity(release_by_key[key])["size"]),
-            )
-        evidence.privacy_for(proof)
     required_batches = identity.get("required_batches")
     expected_batches = {
         batch_hash: require_content_hash(batch.get("acceptance_sha256"), "batch acceptance sha256")
