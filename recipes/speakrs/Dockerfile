@@ -44,11 +44,15 @@ RUN python3.10 -m pip install --upgrade pip \
         "pandas" \
         "tqdm" \
         "einops" \
+        "tensorboard==2.21.0" \
+        "torchinfo==1.8.0" \
         "pytest" \
         "ruff" \
     && python3.10 -m pip install --no-cache-dir "torchcodec==0.13.0" \
     && python3.10 -m pip install --no-cache-dir -e /opt/diarizen/pyannote-audio \
     && python3.10 -m pip install --no-cache-dir -e /opt/diarizen \
+    && PYTHONPATH=/opt/diarizen:/opt/diarizen/recipes/diar_ssl python3.10 -c \
+        "from dataset import DiarizationDataset; from diarizen.models.eend.model_wavlm_conformer import Model; from trainer_dual_opt import Trainer" \
     && find /opt/diarizen -name '.git' -prune -o -name '*.pt' -print -o -name '*.flac' -print -o -name '*.wav' -print | head
 
 WORKDIR /opt/diarizen
