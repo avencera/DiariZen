@@ -164,9 +164,23 @@ def trainer_for(module, root, accelerator=None):
     trainer.accelerator = accelerator or FakeAccelerator()
     trainer.model = object()
     trainer.max_num_checkpoints = 10
+    trainer.max_update_checkpoints = 3
+    trainer.max_steps = 0
+    trainer.snapshot_every_updates = 0
     trainer.ranked_checkpoint_count = 0
     trainer.save_max_score = True
-    trainer.state = SimpleNamespace(best_score=-float("inf"), best_score_epoch=0, patience=3, epochs_trained=4)
+    trainer.launch_id = None
+    trainer.state = SimpleNamespace(
+        best_score=-float("inf"),
+        best_score_epoch=0,
+        patience=3,
+        epochs_trained=4,
+        steps_trained=400,
+        updates_trained=100,
+        microbatches_in_epoch=0,
+        training_complete=False,
+        stop_reason=None,
+    )
     return trainer
 
 
@@ -232,6 +246,85 @@ class TransactionalCheckpointTest(unittest.TestCase):
             incomplete.mkdir()
             (incomplete / "pytorch_model.bin").write_bytes(b"partial")
             self.assertEqual(trainer._find_latest_ckpt_path(), complete)
+
+    def test_update_checkpoint_interval_uses_optimizer_boundaries(self):
+        module = load_trainer_module("dual")
+        with TemporaryDirectory() as temporary:
+            trainer = trainer_for(module, Path(temporary))
+            trainer.snapshot_every_updates = 2_000
+
+            self.assertFalse(trainer._should_save_update_checkpoint(1_999))
+            self.assertTrue(trainer._should_save_update_checkpoint(2_000))
+            self.assertTrue(trainer._should_save_update_checkpoint(60_000))
+
+    def test_update_retention_and_progress_select_newer_epoch(self):
+        module = load_trainer_module("dual")
+        with TemporaryDirectory() as temporary:
+            trainer = trainer_for(module, Path(temporary))
+            trainer.max_update_checkpoints = 2
+            for updates in (2_000, 4_000, 6_000):
+                trainer.state.updates_trained = updates
+                trainer.state.steps_trained = updates * 8
+                trainer._save_update_checkpoint(updates)
+
+            self.assertEqual(
+                [path.name for path in trainer._complete_update_checkpoint_paths()],
+                ["update_00004000", "update_00006000"],
+            )
+            trainer.state.epochs_trained = 5
+            trainer.state.steps_trained += 1
+            trainer._save_checkpoint(epoch=5, is_best_epoch=False)
+            self.assertEqual(trainer._find_latest_ckpt_path().name, "epoch_0005")
+
+    def test_update_retention_preserves_generation_pinned_for_backup(self):
+        module = load_trainer_module("dual")
+        with TemporaryDirectory() as temporary:
+            trainer = trainer_for(module, Path(temporary))
+            trainer.max_update_checkpoints = 2
+            for updates in (2_000, 4_000):
+                trainer.state.updates_trained = updates
+                trainer._save_update_checkpoint(updates)
+            (trainer.checkpoints_dir / ".backup-pin").write_text("update_00002000\n", encoding="utf-8")
+            trainer.state.updates_trained = 6_000
+            trainer._save_update_checkpoint(6_000)
+
+            self.assertEqual(
+                [path.name for path in trainer._complete_update_checkpoint_paths()],
+                ["update_00002000", "update_00004000", "update_00006000"],
+            )
+
+    def test_terminal_update_checkpoint_persists_exact_stop_state(self):
+        module = load_trainer_module("dual")
+        with TemporaryDirectory() as temporary:
+            trainer = trainer_for(module, Path(temporary))
+            trainer.max_update_checkpoints = 3
+            trainer.state.updates_trained = 60_000
+            trainer.state.training_complete = True
+            trainer.state.stop_reason = "completed"
+
+            trainer._save_update_checkpoint(60_000)
+
+            progress = json.loads(
+                (trainer.checkpoints_dir / "update_00060000" / "progress.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(progress["updates_trained"], 60_000)
+            self.assertEqual(progress["epochs_trained"], trainer.state.epochs_trained)
+            self.assertEqual(progress["microbatches_in_epoch"], trainer.state.microbatches_in_epoch)
+            self.assertTrue(progress["training_complete"])
+            self.assertEqual(progress["stop_reason"], "completed")
+            self.assertIsNone(progress["launch_id"])
+
+    def test_latest_rejects_checkpoint_from_another_launch(self):
+        module = load_trainer_module("dual")
+        with TemporaryDirectory() as temporary:
+            trainer = trainer_for(module, Path(temporary))
+            trainer.launch_id = "launch-old"
+            trainer.state.updates_trained = 2_000
+            trainer._save_update_checkpoint(2_000)
+
+            trainer.launch_id = "launch-new"
+            with self.assertRaises(FileNotFoundError):
+                trainer._find_latest_ckpt_path()
 
     def test_best_replacement_keeps_previous_checkpoint_on_save_failure(self):
         module = load_trainer_module("single")

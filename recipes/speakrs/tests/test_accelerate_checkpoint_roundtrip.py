@@ -53,6 +53,7 @@ class DualOptimizerCheckpointRoundtripTest(unittest.TestCase):
 
         trainer = Trainer.__new__(Trainer)
         trainer.accelerator = accelerator
+        trainer.state = state
 
         inputs = torch.tensor([[1.0, -1.0], [0.5, 2.0]])
         loss = model(inputs).square().mean()

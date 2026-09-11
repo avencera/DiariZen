@@ -3,26 +3,32 @@
 # Copyright 2024 Brno University of Technology (author: Jiangyu Han, ihan@fit.vut.cz)
 
 import argparse
+from functools import partial
 from pathlib import Path
 
 import toml
+import torch
 from accelerate import Accelerator, DistributedDataParallelKwargs
-from accelerate.utils import set_seed
+from accelerate.utils import GradientAccumulationPlugin, set_seed
+from dataset import _collate_fn
 from torch.utils.data import DataLoader
 
+from diarizen.ckpt_utils import average_ckpt
 from diarizen.logger import init_logging_logger
 from diarizen.utils import instantiate
-from diarizen.ckpt_utils import average_ckpt
 
-from dataset import _collate_fn
-from functools import partial
 
 def run(config, resume):
     init_logging_logger(config)
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    # keep the qualified effective batch across epoch boundaries
+    accumulation = GradientAccumulationPlugin(
+        num_steps=config["trainer"]["args"]["gradient_accumulation_steps"],
+        sync_with_dataloader=False,
+    )
     accelerator = Accelerator(
-        gradient_accumulation_steps=config["trainer"]["args"]["gradient_accumulation_steps"],
+        gradient_accumulation_plugin=accumulation,
         kwargs_handlers=[ddp_kwargs],
     )
 
@@ -30,9 +36,9 @@ def run(config, resume):
 
     model = instantiate(config["model"]["path"], args=config["model"]["args"])
     model_num_frames, model_rf_duration, model_rf_step = model.get_rf_info
-    
+
     if config["finetune"]["finetune"]:
-        accelerator.print('fine-tuning...')
+        accelerator.print("fine-tuning...")
         model = average_ckpt(config["finetune"]["ckpt_dir"], model)
 
     optimizer_small = instantiate(
@@ -61,32 +67,37 @@ def run(config, resume):
     validate_dataset_config["model_rf_duration"] = model_rf_duration
     validate_dataset_config["model_rf_step"] = model_rf_step
 
-    collate_fn_partial = partial(
-        _collate_fn, 
-        max_speakers_per_chunk=config["model"]["args"]["max_speakers_per_chunk"]
-    )
+    collate_fn_partial = partial(_collate_fn, max_speakers_per_chunk=config["model"]["args"]["max_speakers_per_chunk"])
 
     if "train" in args.mode:
         train_dataset = instantiate(config["train_dataset"]["path"], args=train_dataset_config)
+        train_generator = torch.Generator().manual_seed(config["meta"]["seed"])
         train_dataloader = DataLoader(
-            dataset=train_dataset, collate_fn=collate_fn_partial, shuffle=True, **config["train_dataset"]["dataloader"]
+            dataset=train_dataset,
+            collate_fn=collate_fn_partial,
+            shuffle=True,
+            generator=train_generator,
+            **config["train_dataset"]["dataloader"],
         )
         train_dataloader = accelerator.prepare(train_dataloader)
 
     if "train" in args.mode or "validate" in args.mode:
         validate_dataset = instantiate(config["validate_dataset"]["path"], args=validate_dataset_config)
         validate_dataloader = DataLoader(
-            dataset=validate_dataset, collate_fn=collate_fn_partial, shuffle=False, **config["validate_dataset"]["dataloader"]
+            dataset=validate_dataset,
+            collate_fn=collate_fn_partial,
+            shuffle=False,
+            **config["validate_dataset"]["dataloader"],
         )
         validate_dataloader = accelerator.prepare(validate_dataloader)
- 
+
     trainer = instantiate(config["trainer"]["path"], initialize=False)(
         accelerator=accelerator,
         config=config,
         resume=resume,
         model=model,
         optimizer_small=optimizer_small,
-        optimizer_big=optimizer_big
+        optimizer_big=optimizer_big,
     )
 
     for flag in args.mode:

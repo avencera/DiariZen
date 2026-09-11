@@ -2,6 +2,8 @@
 # Copyright 2024 Hong Kong Polytechnic University (author: Xiang Hao, haoxiangsnr@gmail.com)
 # Copyright 2024 Brno University of Technology (author: Jiangyu Han, ihan@fit.vut.cz)
 
+import fcntl
+import itertools
 import json
 import math
 import os
@@ -80,6 +82,18 @@ class Trainer:
         self.validation_interval = self.trainer_config.get("validation_interval", 1)
         self.max_num_checkpoints = self.trainer_config.get("max_num_checkpoints", 10)
         self.ranked_checkpoint_count = self.trainer_config.get("ranked_checkpoint_count", 0)
+        self.snapshot_every_updates = self.trainer_config.get("snapshot_every_updates", 0)
+        if not isinstance(self.snapshot_every_updates, int) or isinstance(self.snapshot_every_updates, bool):
+            raise ValueError("snapshot_every_updates must be an integer")
+        if self.snapshot_every_updates < 0:
+            raise ValueError("snapshot_every_updates cannot be negative")
+        self.max_update_checkpoints = self.trainer_config.get("max_update_checkpoints", self.max_num_checkpoints)
+        if (
+            not isinstance(self.max_update_checkpoints, int)
+            or isinstance(self.max_update_checkpoints, bool)
+            or self.max_update_checkpoints < 1
+        ):
+            raise ValueError("max_update_checkpoints must be a positive integer")
         self.scheduler_name = self.trainer_config.get("scheduler_name", "constant_schedule_with_warmup")
         self.warmup_steps = self.trainer_config.get("warmup_steps", 0)
         self.warmup_ratio = self.trainer_config.get("warmup_ratio", 0.0)
@@ -123,6 +137,7 @@ class Trainer:
         self.accelerator.register_for_checkpointing(self.state)  # Register accelerate objects
         self.run_hooks = None
         self._stop_signal = None
+        self.launch_id = os.environ.get("SPEAKRS_LAUNCH_ID")
 
         # Others
         pd.set_option("display.float_format", lambda x: "%.3f" % x)
@@ -153,13 +168,15 @@ class Trainer:
 
     def _run_early_stop_check(self, score: float):
         should_stop = False
+        fixed_update_run = getattr(self, "max_steps", 0) > 0
 
         if self._check_improvement(score, save_max_score=self.save_max_score):
             self.state.best_score = score
             self.state.best_score_epoch = self.state.epochs_trained
             self.state.patience = 0
-            self._save_checkpoint(self.state.epochs_trained, is_best_epoch=True)
-            logger.info(f"Found new best score: {score:.4f}, saving checkpoint...")
+            if not fixed_update_run:
+                self._save_checkpoint(self.state.epochs_trained, is_best_epoch=True)
+            logger.info(f"Found new best score: {score:.4f}.")
         else:
             logger.info(
                 f"Score did not improve from {self.state.best_score:.4f} at epoch {self.state.best_score_epoch}."
@@ -171,6 +188,9 @@ class Trainer:
                 logger.info("Early stopping triggered, stopping training...")
                 should_stop = True
 
+        if fixed_update_run and should_stop:
+            logger.info("Fixed-update training ignores patience and continues to max_steps.")
+            return False
         return should_stop
 
     @staticmethod
@@ -229,7 +249,7 @@ class Trainer:
 
         backups = sorted(destination.parent.glob(f".{destination.name}.previous*"))
         for backup in backups:
-            if is_complete(backup):
+            if is_complete(backup) and self._checkpoint_matches_launch(backup):
                 backup.replace(destination)
                 self._fsync_directory(destination.parent)
                 logger.warning(f"Recovered checkpoint {destination.as_posix()} from an interrupted replacement.")
@@ -285,7 +305,39 @@ class Trainer:
         """Publish a complete recovery generation at an optimizer-update boundary."""
 
         destination = self.checkpoints_dir / f"update_{int(updates):08d}"
-        self._save_accelerate_checkpoint(destination)
+        retention_lock = self.checkpoints_dir / ".retention.lock"
+        with retention_lock.open("a", encoding="utf-8") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            self._save_accelerate_checkpoint(destination)
+            pinned_name = None
+            pin_path = self.checkpoints_dir / ".backup-pin"
+            try:
+                candidate = pin_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                candidate = ""
+            if candidate.startswith("update_") and len(candidate) == 15 and candidate[7:].isdigit():
+                pinned_name = candidate
+
+            checkpoints = [
+                checkpoint
+                for checkpoint in self._complete_update_checkpoint_paths()
+                if self._checkpoint_matches_launch(checkpoint)
+            ]
+            max_update_checkpoints = getattr(self, "max_update_checkpoints", getattr(self, "max_num_checkpoints", 1))
+            retained = checkpoints[-max_update_checkpoints:]
+            retained_names = {checkpoint.name for checkpoint in retained}
+            if pinned_name is not None:
+                retained_names.add(pinned_name)
+            for checkpoint in checkpoints:
+                if checkpoint.name in retained_names:
+                    continue
+                self._remove_path(checkpoint)
+                logger.info(f"Checkpoint {checkpoint.as_posix()} is removed.")
+
+    def _should_save_update_checkpoint(self, updates: int) -> bool:
+        """Return whether the configured update interval ends at this boundary."""
+
+        return self.snapshot_every_updates > 0 and updates > 0 and updates % self.snapshot_every_updates == 0
 
     def _save_accelerate_checkpoint(self, destination):
         temporary = destination.with_name(f".{destination.name}.partial")
@@ -293,9 +345,25 @@ class Trainer:
             self._remove_path(temporary)
         temporary.mkdir(parents=True, exist_ok=True)
 
-        self.accelerator.save_state(temporary, safe_serialization=False)
-        self._write_checkpoint_completion_marker(temporary)
-        self._publish_checkpoint_directory(temporary, destination)
+        try:
+            self.accelerator.save_state(temporary, safe_serialization=False)
+            progress = {
+                "schema": "diarizen-checkpoint-progress-v1",
+                "epochs_trained": int(self.state.epochs_trained),
+                "steps_trained": int(self.state.steps_trained),
+                "updates_trained": int(getattr(self.state, "updates_trained", 0)),
+                "microbatches_in_epoch": int(getattr(self.state, "microbatches_in_epoch", 0)),
+                "training_complete": bool(getattr(self.state, "training_complete", False)),
+                "stop_reason": getattr(self.state, "stop_reason", None),
+                "launch_id": getattr(self, "launch_id", None),
+            }
+            (temporary / "progress.json").write_text(json.dumps(progress, sort_keys=True) + "\n", encoding="utf-8")
+            self._write_checkpoint_completion_marker(temporary)
+            self._publish_checkpoint_directory(temporary, destination)
+        except BaseException:
+            if temporary.exists():
+                self._remove_path(temporary)
+            raise
 
     def _is_ranked_checkpoint_complete(self, checkpoint_dir):
         return checkpoint_directory_is_complete(checkpoint_dir, ("pytorch_model.bin",))
@@ -320,28 +388,63 @@ class Trainer:
 
     def _find_latest_ckpt_path(self):
         """Find the latest checkpoint path."""
-        for checkpoint in self.checkpoints_dir.glob(".epoch_*.previous*"):
+        for checkpoint in tuple(self.checkpoints_dir.glob(".epoch_*.previous*")) + tuple(
+            self.checkpoints_dir.glob(".update_*.previous*")
+        ):
             name = checkpoint.name[1:].split(".previous", 1)[0]
-            if name.startswith("epoch_") and len(name) == 10 and name[6:].isdigit():
+            is_epoch_backup = name.startswith("epoch_") and len(name) == 10 and name[6:].isdigit()
+            is_update_backup = name.startswith("update_") and len(name) == 15 and name[7:].isdigit()
+            if is_epoch_backup or is_update_backup:
                 self._recover_checkpoint_backup(self.checkpoints_dir / name, self._is_complete_checkpoint)
 
         # Pick up all checkpoints with the format `epoch_*`
         checkpoints = sorted(self.checkpoints_dir.glob("epoch_" + ("[0-9]" * 4)))
 
         # Remove files that is not a checkpoint
-        checkpoints = [ckpt for ckpt in checkpoints if self._is_complete_checkpoint(ckpt)]
-        update_checkpoints = sorted(self.checkpoints_dir.glob("update_" + ("[0-9]" * 8)))
-        update_checkpoints = [ckpt for ckpt in update_checkpoints if self._is_complete_checkpoint(ckpt)]
-        if update_checkpoints:
-            return update_checkpoints[-1]
-
-        if len(checkpoints) == 0:
+        checkpoints = [
+            ckpt
+            for ckpt in checkpoints
+            if self._is_complete_checkpoint(ckpt) and self._checkpoint_matches_launch(ckpt)
+        ]
+        update_checkpoints = [
+            ckpt for ckpt in self._complete_update_checkpoint_paths() if self._checkpoint_matches_launch(ckpt)
+        ]
+        candidates = checkpoints + update_checkpoints
+        if not candidates:
             raise FileNotFoundError(f"No checkpoints found in {self.checkpoints_dir.as_posix()}.")
 
-        # Pick up the latest checkpoint
-        ckpt_path = checkpoints[-1]
+        return max(candidates, key=self._checkpoint_progress)
 
-        return ckpt_path
+    @staticmethod
+    def _checkpoint_progress(checkpoint: Path) -> tuple[int, int, int, str]:
+        """Return comparable persisted progress for one complete checkpoint."""
+
+        progress_path = checkpoint / "progress.json"
+        try:
+            progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            progress = None
+        if isinstance(progress, dict) and progress.get("schema") == "diarizen-checkpoint-progress-v1":
+            values = tuple(progress.get(field) for field in ("updates_trained", "steps_trained", "epochs_trained"))
+            if all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in values):
+                return (*values, checkpoint.name)
+        if checkpoint.name.startswith("update_") and checkpoint.name[7:].isdigit():
+            return (int(checkpoint.name[7:]), -1, -1, checkpoint.name)
+        if checkpoint.name.startswith("epoch_") and checkpoint.name[6:].isdigit():
+            return (-1, -1, int(checkpoint.name[6:]), checkpoint.name)
+        return (-1, -1, -1, checkpoint.name)
+
+    def _checkpoint_matches_launch(self, checkpoint: Path) -> bool:
+        """Reject a recovery generation created for another launch."""
+
+        launch_id = getattr(self, "launch_id", None)
+        if launch_id is None:
+            return True
+        try:
+            progress = json.loads((checkpoint / "progress.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return isinstance(progress, dict) and progress.get("launch_id") == launch_id
 
     def _load_checkpoint(self, ckpt_path):
         """load a checkpoint from the checkpints directory.
@@ -357,7 +460,11 @@ class Trainer:
         else:
             ckpt_path = Path(ckpt_path).expanduser().absolute()
 
-        if not ckpt_path.exists() or (ckpt_path.name == "best" and not self._is_complete_checkpoint(ckpt_path)):
+        if (
+            not ckpt_path.exists()
+            or not self._is_complete_checkpoint(ckpt_path)
+            or not self._checkpoint_matches_launch(ckpt_path)
+        ):
             raise FileNotFoundError(f"Checkpoint {ckpt_path.as_posix()} not found.")
 
         self.accelerator.load_state(ckpt_path, map_location="cpu")
@@ -398,6 +505,47 @@ class Trainer:
     def _complete_checkpoint_paths(self):
         checkpoints = sorted(self.checkpoints_dir.glob("epoch_" + ("[0-9]" * 4)))
         return [checkpoint for checkpoint in checkpoints if self._is_complete_checkpoint(checkpoint)]
+
+    def _complete_update_checkpoint_paths(self):
+        checkpoints = sorted(self.checkpoints_dir.glob("update_" + ("[0-9]" * 8)))
+        return [checkpoint for checkpoint in checkpoints if self._is_complete_checkpoint(checkpoint)]
+
+    @staticmethod
+    def _train_data_generator(dataloader):
+        """Return the random sampler generator that owns the epoch order."""
+
+        batch_sampler = getattr(dataloader, "batch_sampler", None)
+        sampler = getattr(batch_sampler, "sampler", None)
+        return getattr(sampler, "generator", None)
+
+    def _prepare_epoch_dataloader(self, train_dataloader, steps_per_epoch: int):
+        """Restore the saved epoch order and omit already consumed microbatches."""
+
+        resume_microbatches = int(getattr(self.state, "microbatches_in_epoch", 0))
+        if resume_microbatches < 0 or resume_microbatches >= steps_per_epoch:
+            raise RuntimeError(
+                f"Checkpoint microbatch offset {resume_microbatches} is outside epoch length {steps_per_epoch}"
+            )
+        data_generator = self._train_data_generator(train_dataloader)
+        epoch_rng_state = getattr(self.state, "epoch_data_rng_state", None)
+        if data_generator is not None and epoch_rng_state is not None:
+            data_generator.set_state(epoch_rng_state)
+        if resume_microbatches:
+            if data_generator is None or epoch_rng_state is None:
+                raise RuntimeError("Mid-epoch checkpoint has no restorable training-data order")
+            return self.accelerator.skip_first_batches(train_dataloader, resume_microbatches), resume_microbatches
+        if data_generator is not None:
+            self.state.epoch_data_rng_state = data_generator.get_state()
+        return train_dataloader, 0
+
+    def _boundary_stop_reason(self, optimizer_updated: bool) -> str | None:
+        """Return the stop reason only at a safe optimizer-update boundary."""
+
+        if not optimizer_updated:
+            return None
+        if self.max_steps > 0 and self.state.updates_trained >= self.max_steps:
+            return "completed"
+        return self._stop_signal
 
     def _save_ranked_checkpoint(self, epoch: int, score: float) -> None:
         """Keep model-only checkpoints for the best validation scores."""
@@ -622,9 +770,15 @@ class Trainer:
             }:
                 logger.info(f"Training loop finished at epoch {self.state.epochs_trained}.")
                 return
+            if self.max_steps > 0 and getattr(self.state, "updates_trained", 0) >= self.max_steps:
+                self.state.training_complete = True
+                self.state.stop_reason = "completed"
+                logger.info(f"Training loop finished at epoch {self.state.epochs_trained}.")
+                return
             if run_hooks is not None and not run_hooks.can_train():
                 logger.info("Training resume is blocked by budget or terminal state.")
                 return
+            self.state.stop_reason = None
 
         # # validation 0 epoch performance
         if self.validation_before_training and not self.resume:
@@ -634,9 +788,14 @@ class Trainer:
             if self.accelerator.is_local_main_process:
                 self._run_early_stop_check(score)
                 self._save_ranked_checkpoint(epoch=0, score=score)
-                self._save_checkpoint(epoch=0, is_best_epoch=False)
+                if self.save_ckpt_interval > 0:
+                    self._save_checkpoint(epoch=0, is_best_epoch=False)
 
-        for epoch in range(self.state.epochs_trained + 1, max_epochs + 1):
+        if self.max_steps > 0:
+            epochs = itertools.count(self.state.epochs_trained + 1)
+        else:
+            epochs = range(self.state.epochs_trained + 1, max_epochs + 1)
+        for epoch in epochs:
             logger.info(f"{'=' * 9} Epoch {epoch} out of {max_epochs} {'=' * 9}")
             logger.info("Begin training...")
 
@@ -645,11 +804,12 @@ class Trainer:
                 self.unwrap_model.wavlm_model.eval()
 
             training_epoch_output = []
+            epoch_dataloader, resume_microbatches = self._prepare_epoch_dataloader(train_dataloader, steps_per_epoch)
 
             # the iter number of progress bar increments by 1 by default whether gradient accumulation is used or not.
             # but we update the description of the progress bar only when the gradients are synchronized across all processes.
             dataloader_bar = tqdm(
-                train_dataloader,
+                epoch_dataloader,
                 desc="",
                 dynamic_ncols=True,
                 bar_format="{l_bar}{r_bar}",
@@ -660,7 +820,10 @@ class Trainer:
             )
 
             self._install_stop_signals()
-            for batch_idx, batch in enumerate(dataloader_bar):
+            paused = False
+            stop_after_epoch = None
+            snapshot_after_epoch = False
+            for batch_idx, batch in enumerate(dataloader_bar, start=resume_microbatches):
                 # accumulate() will automatically skip synchronization if applicable loss is linearly scaled with the optimizer.grad
                 # accumulate() will automatically divide the loss in backward by the number of gradient accumulation steps
                 # However, it won't return this loss, so we need to manually divide the loss by the number of gradient accumulation steps.
@@ -672,44 +835,75 @@ class Trainer:
                     optimizer_updated = (
                         bool(self.accelerator.sync_gradients) and not self.accelerator.optimizer_step_was_skipped
                     )
-                    run_hooks = getattr(self, "run_hooks", None)
-                    if optimizer_updated:
-                        self.state.updates_trained = getattr(self.state, "updates_trained", 0) + 1
-                        if run_hooks is not None:
-                            weight = run_hooks.example_loss_weight(batch)
-                            valid = "Loss" in loss_dict
-                            run_hooks.acknowledge_update(
-                                batch,
-                                optimizer_updated=True,
-                                loss_weight=weight,
-                                valid=valid,
-                            )
-                            self.state.recipe_state = run_hooks.state_dict()
-                            if run_hooks.should_snapshot(self.state.updates_trained):
-                                self._save_update_checkpoint(self.state.updates_trained)
-                                run_hooks.mark_snapshot(self.state.updates_trained)
-                        if self.warmup_steps > 0:
-                            self.lr_scheduler_step()
-
-                        if self.use_one_cycle_lr:
-                            self.lr_one_cycle_scheduler_small.step()
-                            self.lr_one_cycle_scheduler_big.step()
-                    elif run_hooks is not None:
+                self.state.steps_trained += 1
+                self.state.microbatches_in_epoch += 1
+                run_hooks = getattr(self, "run_hooks", None)
+                should_snapshot = False
+                if optimizer_updated:
+                    self.state.updates_trained = getattr(self.state, "updates_trained", 0) + 1
+                    if run_hooks is not None:
+                        weight = run_hooks.example_loss_weight(batch)
+                        valid = "Loss" in loss_dict
                         run_hooks.acknowledge_update(
                             batch,
-                            optimizer_updated=False,
-                            loss_weight=run_hooks.example_loss_weight(batch),
-                            valid=False,
+                            optimizer_updated=True,
+                            loss_weight=weight,
+                            valid=valid,
                         )
+                        should_snapshot = run_hooks.should_snapshot(self.state.updates_trained)
+                        if should_snapshot:
+                            run_hooks.mark_snapshot(self.state.updates_trained)
+                        self.state.recipe_state = run_hooks.state_dict()
+                    else:
+                        should_snapshot = self._should_save_update_checkpoint(self.state.updates_trained)
 
-                self.state.steps_trained += 1
-                if getattr(self, "_stop_signal", None):
-                    self.state.stop_reason = self._stop_signal
+                    if self.warmup_steps > 0:
+                        self.lr_scheduler_step()
+                    if self.use_one_cycle_lr:
+                        self.lr_one_cycle_scheduler_small.step()
+                        self.lr_one_cycle_scheduler_big.step()
+                elif run_hooks is not None:
+                    run_hooks.acknowledge_update(
+                        batch,
+                        optimizer_updated=False,
+                        loss_weight=run_hooks.example_loss_weight(batch),
+                        valid=False,
+                    )
+
+                stop_reason = self._boundary_stop_reason(optimizer_updated)
+                if stop_reason is not None:
+                    self.state.training_complete = self.max_steps > 0 and self.state.updates_trained >= self.max_steps
+                    self.state.stop_reason = stop_reason
+                epoch_complete = self.state.microbatches_in_epoch >= steps_per_epoch
+                if optimizer_updated and epoch_complete:
+                    snapshot_after_epoch = should_snapshot
+                elif optimizer_updated and (should_snapshot or stop_reason is not None):
                     if self.accelerator.is_local_main_process:
                         self._save_update_checkpoint(self.state.updates_trained)
+
+                if stop_reason is not None:
+                    if epoch_complete:
+                        stop_after_epoch = stop_reason
+                    else:
+                        paused = True
                     break
+            if paused:
+                self.accelerator.wait_for_everyone()
+                logger.info(f"Training loop stopped at optimizer update {self.state.updates_trained}.")
+                return
+
             self.state.epochs_trained += 1
+            self.state.microbatches_in_epoch = 0
+            data_generator = self._train_data_generator(train_dataloader)
+            self.state.epoch_data_rng_state = None if data_generator is None else data_generator.get_state()
             self.training_epoch_end(training_epoch_output)
+
+            if stop_after_epoch is not None:
+                if self.accelerator.is_local_main_process:
+                    self._save_update_checkpoint(self.state.updates_trained)
+                self.accelerator.wait_for_everyone()
+                logger.info(f"Training loop stopped after epoch {epoch}: {stop_after_epoch}.")
+                return
 
             # validation updates the trainer state before the resumable checkpoint is captured
             should_stop = False
@@ -735,8 +929,14 @@ class Trainer:
                     logger.info("Validation finished.")
 
             if self.accelerator.is_local_main_process:
-                self.state.training_complete = should_stop or epoch >= max_epochs
-                if epoch % self.save_ckpt_interval == 0 or self.state.training_complete:
+                self.state.training_complete = (
+                    self.state.training_complete or should_stop or self.max_steps <= 0 and epoch >= max_epochs
+                )
+                if snapshot_after_epoch or should_stop:
+                    self._save_update_checkpoint(self.state.updates_trained)
+                if self.save_ckpt_interval > 0 and (
+                    epoch % self.save_ckpt_interval == 0 or self.state.training_complete
+                ):
                     self._save_checkpoint(epoch, is_best_epoch=False)
 
             self.accelerator.wait_for_everyone()
@@ -748,7 +948,6 @@ class Trainer:
             # If any process triggers early stopping, stop training
             if reduced_early_stop_mark != 0:
                 break
-
         logger.info(f"Training loop finished at epoch {self.state.epochs_trained}.")
 
     @torch.no_grad()

@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import torch
 from accelerate import Accelerator
+from torch.utils.data import DataLoader, TensorDataset
 
 
 Accelerator(cpu=True)
@@ -243,8 +244,95 @@ class TrainerStateTest(unittest.TestCase):
             }
         )
         self.assertEqual(state.updates_trained, 0)
+        self.assertEqual(state.microbatches_in_epoch, 0)
+        self.assertIsNone(state.epoch_data_rng_state)
         self.assertEqual(state.cycles_trained, 0)
         self.assertEqual(state.recipe_state, {})
+
+    def test_mid_epoch_resume_restores_order_and_skips_consumed_batches(self):
+        module = load_dual_optimizer_trainer()
+        accelerator = Accelerator(cpu=True)
+        generator = torch.Generator().manual_seed(3407)
+        dataloader = DataLoader(TensorDataset(torch.arange(12)), batch_size=2, shuffle=True, generator=generator)
+        dataloader = accelerator.prepare(dataloader)
+        trainer = module.Trainer.__new__(module.Trainer)
+        trainer.accelerator = accelerator
+        trainer.state = TrainerState(save_max_score=False)
+
+        complete_epoch, start = trainer._prepare_epoch_dataloader(dataloader, len(dataloader))
+        expected = [batch[0].tolist() for batch in complete_epoch]
+        self.assertEqual(start, 0)
+
+        trainer.state.microbatches_in_epoch = 2
+        resumed_epoch, start = trainer._prepare_epoch_dataloader(dataloader, len(dataloader))
+        self.assertEqual(start, 2)
+        self.assertEqual([batch[0].tolist() for batch in resumed_epoch], expected[2:])
+
+    def test_epoch_boundary_resume_restores_next_shuffle_in_fresh_process(self):
+        module = load_dual_optimizer_trainer()
+        accelerator = Accelerator(cpu=True)
+        seed = 3407
+
+        first_generator = torch.Generator().manual_seed(seed)
+        first_dataloader = DataLoader(
+            TensorDataset(torch.arange(12)), batch_size=2, shuffle=True, generator=first_generator
+        )
+        first_dataloader = accelerator.prepare(first_dataloader)
+        trainer = module.Trainer.__new__(module.Trainer)
+        trainer.accelerator = accelerator
+        trainer.state = TrainerState(save_max_score=False)
+
+        first_epoch, _ = trainer._prepare_epoch_dataloader(first_dataloader, len(first_dataloader))
+        list(first_epoch)
+        trainer.state.microbatches_in_epoch = 0
+        trainer.state.epoch_data_rng_state = trainer._train_data_generator(first_dataloader).get_state()
+
+        expected_next_epoch = [batch[0].tolist() for batch in first_dataloader]
+
+        fresh_generator = torch.Generator().manual_seed(seed)
+        fresh_dataloader = DataLoader(
+            TensorDataset(torch.arange(12)), batch_size=2, shuffle=True, generator=fresh_generator
+        )
+        fresh_dataloader = accelerator.prepare(fresh_dataloader)
+        fresh_trainer = module.Trainer.__new__(module.Trainer)
+        fresh_trainer.accelerator = accelerator
+        fresh_trainer.state = TrainerState(save_max_score=False)
+        fresh_trainer.state.epoch_data_rng_state = trainer.state.epoch_data_rng_state.clone()
+
+        resumed_epoch, start = fresh_trainer._prepare_epoch_dataloader(fresh_dataloader, len(fresh_dataloader))
+
+        self.assertEqual(start, 0)
+        self.assertEqual([batch[0].tolist() for batch in resumed_epoch], expected_next_epoch)
+
+    def test_early_stop_patience_cannot_stop_fixed_update_run(self):
+        module = load_dual_optimizer_trainer()
+        trainer = module.Trainer.__new__(module.Trainer)
+        trainer.max_steps = 60_000
+        trainer.max_patience = 1
+        trainer.save_max_score = True
+        trainer.state = SimpleNamespace(
+            best_score=1.0,
+            best_score_epoch=3,
+            patience=1,
+            epochs_trained=4,
+        )
+        trainer._check_improvement = lambda *_args, **_kwargs: False
+
+        self.assertFalse(trainer._run_early_stop_check(2.0))
+        self.assertEqual(trainer.state.patience, 2)
+
+    def test_stop_requests_wait_for_optimizer_boundary_and_maximum_is_exact(self):
+        module = load_dual_optimizer_trainer()
+        trainer = module.Trainer.__new__(module.Trainer)
+        trainer.max_steps = 60_000
+        trainer._stop_signal = "sigterm"
+        trainer.state = SimpleNamespace(updates_trained=59_999)
+
+        self.assertIsNone(trainer._boundary_stop_reason(False))
+        self.assertEqual(trainer._boundary_stop_reason(True), "sigterm")
+        trainer._stop_signal = None
+        trainer.state.updates_trained = 60_000
+        self.assertEqual(trainer._boundary_stop_reason(True), "completed")
 
 
 if __name__ == "__main__":

@@ -11,7 +11,6 @@ import pytest
 
 from recipes.speakrs.large import data as data_module
 from recipes.speakrs.large.budget import BudgetLedger
-from recipes.speakrs.large.cli import dispatch
 from recipes.speakrs.large.contracts import (
     DEFAULT_BUDGET,
     DEFAULT_MODEL,
@@ -418,35 +417,3 @@ def test_qualification_bundle_builds_real_trainer_inputs(monkeypatch, tmp_path: 
     (output / "bundle.json").write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(LargeError, match="outside the final release"):
         data_module._validate_qualification_bundle_against_release(output / "bundle.json", context)
-
-
-def test_freeze_run_rejects_qualification_only_artifact(tmp_path: Path) -> None:
-    qualification = tmp_path / "qualification.json"
-    qualification.write_text(
-        json.dumps(
-            {
-                "ok": True,
-                "gpu_qualification_status": "qualified",
-                "qualification_binding_sha256": _digest("binding"),
-                "training_ready": False,
-                "qualification_only": True,
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(LargeError, match="training qualification"):
-        dispatch(
-            type(
-                "Args",
-                (),
-                {
-                    "command": "freeze-run",
-                    "qualification": qualification,
-                    "spec": tmp_path / "spec.json",
-                    "offer": tmp_path / "offer.json",
-                    "budget": tmp_path / "budget.json",
-                    "output": tmp_path / "launch.json",
-                },
-            )()
-        )

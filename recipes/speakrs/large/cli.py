@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .budget import BudgetLedger
-from .contracts import DEFAULT_BUDGET, LAUNCH_KIND, parse_kinded_lock, parse_qualification_binding
+from .contracts import DEFAULT_BUDGET, parse_qualification_binding
 from .controller import Controller, FakeProvider
 from .errors import LargeError
 from .handoff import package_handoff
@@ -35,6 +35,8 @@ COMMANDS = (
     "archive",
     "status",
     "resume",
+    "backup",
+    "rental-guard",
     "verify-image",
     "package-handoff",
 )
@@ -51,6 +53,8 @@ DATA_COMMANDS = (
     "evict",
     "handoff",
     "qualification-bundle",
+    "training-bundle",
+    "dev-bundle",
     "qualification-binding",
 )
 
@@ -134,10 +138,18 @@ def build_parser() -> argparse.ArgumentParser:
     qualify.add_argument("--output", required=True, type=Path)
 
     freeze = sub.add_parser("freeze-run", help="freeze a launch lock after qualification")
-    freeze.add_argument("--spec", required=True, type=Path)
+    freeze.add_argument("--authorization", required=True, type=Path)
     freeze.add_argument("--qualification", required=True, type=Path)
+    freeze.add_argument("--qualification-binding", required=True, type=Path)
     freeze.add_argument("--offer", required=True, type=Path)
-    freeze.add_argument("--budget", required=True, type=Path)
+    freeze.add_argument("--train-bundle", required=True, type=Path)
+    freeze.add_argument("--dev-bundle", required=True, type=Path)
+    freeze.add_argument("--trainer-config", required=True, type=Path)
+    freeze.add_argument("--initializer", required=True, type=Path)
+    freeze.add_argument("--image-identity", required=True, type=Path)
+    freeze.add_argument("--worker-layout", required=True, type=Path)
+    freeze.add_argument("--predecessor-launch", type=Path)
+    freeze.add_argument("--predecessor-receipt", type=Path)
     freeze.add_argument("--output", required=True, type=Path)
 
     control = sub.add_parser("control", help="trusted controller")
@@ -149,6 +161,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     supervise = sub.add_parser("supervise", help="single worker supervisor")
     supervise.add_argument("--launch", required=True, type=Path)
+    supervise.add_argument("--status", required=True, type=Path)
+    supervise.add_argument("--external-guard-proof", required=True, type=Path)
+    supervise.add_argument("--resume", action="store_true")
 
     select = sub.add_parser("select", help="development selection")
     select.add_argument("--launch", required=True, type=Path)
@@ -164,6 +179,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     resume = sub.add_parser("resume", help="resume from trusted state")
     resume.add_argument("--launch", required=True, type=Path)
+    resume.add_argument("--status", required=True, type=Path)
+    resume.add_argument("--external-guard-proof", required=True, type=Path)
+
+    backup = sub.add_parser("backup", help="copy complete worker checkpoints to trusted storage")
+    backup.add_argument("--launch", required=True, type=Path)
+    backup.add_argument("--poll-seconds", type=int, default=60)
+    backup.add_argument("--once", action="store_true")
+
+    rental_guard = sub.add_parser("rental-guard", help="trusted outside-worker Vast deletion guard")
+    rental_guard.add_argument("--launch", required=True, type=Path)
+    rental_guard.add_argument("--api-key", required=True, type=Path)
+    rental_guard.add_argument("--backup-status", required=True, type=Path)
+    rental_guard.add_argument("--status", required=True, type=Path)
+    rental_guard.add_argument("--receipt", required=True, type=Path)
+    rental_guard.add_argument("--poll-seconds", type=float, default=10.0)
+    rental_guard.add_argument(
+        "--recover",
+        action="store_true",
+        help="resume cleanup after guard interruption without requiring a running instance",
+    )
 
     image = sub.add_parser("verify-image", help="verify a published image digest")
     image.add_argument("--spec", required=True, type=Path)
@@ -234,6 +269,23 @@ def build_parser() -> argparse.ArgumentParser:
     data_bundle.add_argument("--wav-prefix", required=True)
     data_bundle.add_argument("--config", required=True, type=Path)
     data_bundle.add_argument("--output", required=True, type=Path)
+    data_training_bundle = data_sub.add_parser(
+        "training-bundle",
+        help="restore the complete sealed release into resumable trainer inputs",
+    )
+    data_training_bundle.add_argument("--release", required=True, type=Path)
+    data_training_bundle.add_argument("--seal", required=True, type=Path)
+    data_training_bundle.add_argument("--receipt", required=True, type=Path)
+    data_training_bundle.add_argument("--wav-prefix", required=True)
+    data_training_bundle.add_argument("--config", required=True, type=Path)
+    data_training_bundle.add_argument("--output", required=True, type=Path)
+    data_dev_bundle = data_sub.add_parser("dev-bundle", help="build the exact frozen development trainer inputs")
+    data_dev_bundle.add_argument("--audio-root", required=True, type=Path)
+    data_dev_bundle.add_argument("--established-dev", required=True, type=Path)
+    data_dev_bundle.add_argument("--aishell5-dev", required=True, type=Path)
+    data_dev_bundle.add_argument("--wav-prefix", required=True)
+    data_dev_bundle.add_argument("--config", required=True, type=Path)
+    data_dev_bundle.add_argument("--output", required=True, type=Path)
     data_binding = data_sub.add_parser(
         "qualification-binding",
         help="bind the committed release and final restore proof for diagnostic GPU qualification",
@@ -292,6 +344,30 @@ def dispatch(args: argparse.Namespace) -> dict:
 
     command = args.command
     if command == "data":
+        if args.data_command == "dev-bundle":
+            from .data import load_data_spec
+            from .dev_bundle import build_dev_bundle
+
+            return build_dev_bundle(
+                load_data_spec(args.config),
+                args.audio_root,
+                args.established_dev,
+                args.aishell5_dev,
+                args.wav_prefix,
+                args.output,
+            )
+        if args.data_command == "training-bundle":
+            from .data import load_data_spec
+            from .training_bundle import training_bundle_data
+
+            return training_bundle_data(
+                load_data_spec(args.config),
+                args.release,
+                args.seal,
+                args.receipt,
+                args.wav_prefix,
+                args.output,
+            )
         from .data import dispatch_data
 
         return dispatch_data(args)
@@ -373,31 +449,23 @@ def dispatch(args: argparse.Namespace) -> dict:
             qualification_control=qualification_control,
         )
     if command == "freeze-run":
-        qualification = json.loads(args.qualification.read_text(encoding="utf-8"))
-        if (
-            qualification.get("gpu_qualification_status") != "qualified"
-            or not qualification.get("ok")
-            or not qualification.get("qualification_binding_sha256")
-            or qualification.get("training_ready") is not True
-        ):
-            raise LargeError("freeze-run", "cannot freeze a launch lock without training qualification")
-        if qualification.get("qualification_only") is True:
-            raise LargeError("freeze-run", "qualification-only artifact cannot create a training lock")
-        parse_kinded_lock(
-            {
-                "kind": LAUNCH_KIND,
-                "launch_id": "rejected-without-qualification",
-                "offer": json.loads(args.offer.read_text(encoding="utf-8")),
-                "physical_batch": qualification.get("physical_batch"),
-                "accumulation": qualification.get("accumulation"),
-                "affordable_cycles": qualification.get("affordable_cycles"),
-                "worker_deadline": qualification.get("worker_deadline"),
-                "qualification_digest": "missing",
-                "gpu_qualification_status": qualification.get("gpu_qualification_status"),
-            },
-            LAUNCH_KIND,
+        from .training_admission import freeze_training_launch
+
+        return freeze_training_launch(
+            args.authorization,
+            args.qualification,
+            args.qualification_binding,
+            args.offer,
+            args.train_bundle,
+            args.dev_bundle,
+            args.trainer_config,
+            args.initializer,
+            args.image_identity,
+            args.worker_layout,
+            args.predecessor_launch,
+            args.predecessor_receipt,
+            args.output,
         )
-        return {"ok": True}
     if command == "control":
         if bool(args.launch) == bool(args.qualification_lease):
             raise LargeError("control", "--launch and --qualification-lease are mutually exclusive")
@@ -414,13 +482,60 @@ def dispatch(args: argparse.Namespace) -> dict:
                 raise LargeError("control", "qualification control requires --qualification-binding")
             binding = parse_qualification_binding(json.loads(args.qualification_binding.read_text(encoding="utf-8")))
             return controller.control_qualification(lease, binding)
-        parse_kinded_lock(json.loads(args.launch.read_text(encoding="utf-8")), LAUNCH_KIND)
+        from .training_admission import parse_launch_lock
+
+        parse_launch_lock(json.loads(args.launch.read_text(encoding="utf-8")))
         return {"ok": True, "mode": "launch"}
-    if command in {"supervise", "select", "test", "archive", "status", "resume"}:
+    if command == "supervise":
+        from .training_supervisor import supervise_training
+
+        return supervise_training(
+            args.launch,
+            args.status,
+            resume=args.resume,
+            external_guard_proof_path=args.external_guard_proof,
+        )
+    if command == "resume":
+        from .training_supervisor import supervise_training
+
+        return supervise_training(
+            args.launch,
+            args.status,
+            resume=True,
+            external_guard_proof_path=args.external_guard_proof,
+        )
+    if command == "backup":
+        from .remote_backup import backup_remote_once, monitor_remote_backups
+
+        if args.once:
+            receipt = backup_remote_once(args.launch)
+            return {"ok": True, "command": "backup", "receipt": None if receipt is None else receipt.identity()}
+        return monitor_remote_backups(args.launch, args.poll_seconds)
+    if command == "rental-guard":
+        from .training_admission import parse_launch_lock
+        from .vast_guard import arm_rental_guard, monitor_rental_guard
+
+        if not args.recover:
+            launch = parse_launch_lock(json.loads(args.launch.read_text(encoding="utf-8")))
+            arm_rental_guard(
+                launch,
+                api_key_path=args.api_key,
+                status_path=args.status,
+            )
+
+        return monitor_rental_guard(
+            args.launch,
+            api_key_path=args.api_key,
+            backup_status_path=args.backup_status,
+            status_path=args.status,
+            receipt_path=args.receipt,
+            poll_seconds=args.poll_seconds,
+        )
+    if command in {"select", "test", "archive", "status"}:
         payload = json.loads(args.launch.read_text(encoding="utf-8"))
-        parse_kinded_lock(payload, LAUNCH_KIND)
-        if command == "resume" and payload.get("state") == "terminal":
-            raise LargeError("resume", "terminal run cannot restart training")
+        from .training_admission import parse_launch_lock
+
+        parse_launch_lock(payload)
         return {"command": command, "launch_id": payload.get("launch_id")}
     if command == "verify-image":
         spec = load_spec(args.spec)

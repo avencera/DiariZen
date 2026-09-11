@@ -12,14 +12,17 @@ path = "trainer_dual_opt.Trainer"
 
 [trainer.args]
 max_epochs = 100
+max_steps = 60000
 gradient_percentile = 90
 gradient_history_size = 1000
 save_max_score = false
-save_ckpt_interval = 1
+save_ckpt_interval = 0
 max_patience = 10
-max_num_checkpoints = 3
+max_num_checkpoints = 0
 ranked_checkpoint_count = 5
-gradient_accumulation_steps = 32
+snapshot_every_updates = 2000
+max_update_checkpoints = 3
+gradient_accumulation_steps = 8
 validation_interval = 1
 validation_before_training = true
 freeze_wavlm = false
@@ -70,15 +73,15 @@ max_speakers_per_frame = 2
 path = "dataset.DiarizationDataset"
 
 [train_dataset.args]
-scp_file = "../speakrs/data/large_cc_v1/train/wav.scp"
-rttm_file = "../speakrs/data/large_cc_v1/train/rttm"
-uem_file = "../speakrs/data/large_cc_v1/train/all.uem"
+scp_file = "../speakrs/data/training-v1/wav.scp"
+rttm_file = "../speakrs/data/training-v1/all.rttm"
+uem_file = "../speakrs/data/training-v1/all.uem"
 chunk_size = 8
 chunk_shift = 6
 sample_rate = 16000
 
 [train_dataset.dataloader]
-batch_size = 2
+batch_size = 8
 num_workers = 4
 drop_last = true
 pin_memory = true
@@ -87,9 +90,9 @@ pin_memory = true
 path = "dataset.DiarizationDataset"
 
 [validate_dataset.args]
-scp_file = "../speakrs/data/large_cc_v1/dev/AMI/wav.scp"
-rttm_file = "../speakrs/data/large_cc_v1/dev/AMI/rttm"
-uem_file = "../speakrs/data/large_cc_v1/dev/AMI/all.uem"
+scp_file = "../speakrs/data/dev-v1/wav.scp"
+rttm_file = "../speakrs/data/dev-v1/all.rttm"
+uem_file = "../speakrs/data/dev-v1/all.uem"
 chunk_size = 8
 chunk_shift = 8
 sample_rate = 16000

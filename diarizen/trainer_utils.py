@@ -208,6 +208,8 @@ class TrainerState:
         self.best_score = -np.inf if save_max_score else np.inf
         self.best_score_epoch = 0
         self.updates_trained = 0
+        self.microbatches_in_epoch = 0
+        self.epoch_data_rng_state = None
         self.cycles_trained = 0
         self.scoring_phase = "idle"
         self.stop_reason = None
@@ -223,6 +225,8 @@ class TrainerState:
 
         self.patience = state_dict["patience"]
         self.updates_trained = int(state_dict.get("updates_trained", 0))
+        self.microbatches_in_epoch = int(state_dict.get("microbatches_in_epoch", 0))
+        self.epoch_data_rng_state = state_dict.get("epoch_data_rng_state")
         self.cycles_trained = int(state_dict.get("cycles_trained", 0))
         self.scoring_phase = str(state_dict.get("scoring_phase", "idle"))
         self.stop_reason = state_dict.get("stop_reason")
@@ -237,6 +241,8 @@ class TrainerState:
             "best_score": self.best_score,
             "best_score_epoch": self.best_score_epoch,
             "updates_trained": self.updates_trained,
+            "microbatches_in_epoch": self.microbatches_in_epoch,
+            "epoch_data_rng_state": self.epoch_data_rng_state,
             "cycles_trained": self.cycles_trained,
             "scoring_phase": self.scoring_phase,
             "stop_reason": self.stop_reason,
