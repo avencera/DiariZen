@@ -1,0 +1,83 @@
+# Linux AMD64 evaluator worker. Distinct from the training image.
+# Binds the Rust worker, Python evaluator, lockfile, and CloudDeck v3 revision.
+
+FROM rust:1.98-bookworm AS worker
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        pkg-config \
+        libssl-dev \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY .cargo/config.toml .cargo/config.toml
+COPY vendor ./vendor
+COPY Cargo.toml Cargo.lock ./
+COPY crates/validation-worker ./crates/validation-worker
+RUN cargo build --offline --release -p diarizen-validation-worker \
+    && install -m 0755 target/release/diarizen-validation-worker /usr/local/bin/diarizen-validation-worker
+
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
+ARG CLOUDECK_REVISION=cfcf5028606ef436b3288494b07062d5ab7760a7
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    LANG=C.UTF-8 \
+    PYTHONPATH=/opt/diarizen:/opt/diarizen/recipes/diar_ssl \
+    DIARIZEN_ARTIFACT_CACHE=/var/cache/diarizen-validation \
+    CLOUDECK_REVISION=${CLOUDECK_REVISION}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.10 \
+        python3.10-venv \
+        python3.10-dev \
+        python3-pip \
+        ca-certificates \
+        curl \
+        ffmpeg \
+        libsndfile1 \
+        sox \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/cache/diarizen-validation
+
+WORKDIR /opt/diarizen
+
+# keep large dependency layers reusable when worker or evaluator source changes
+RUN python3.10 -m pip install --upgrade pip \
+    && python3.10 -m pip install --no-cache-dir \
+        --index-url ${TORCH_INDEX} \
+        "torch==2.11.0" \
+        "torchaudio==2.11.0" \
+    && python3.10 -m pip install --no-cache-dir \
+        "numpy==1.26.4" \
+        "accelerate==1.6.0" \
+        "torchmetrics==1.9.0" \
+        "toml" \
+        "soundfile" \
+        "scipy" \
+        "pandas" \
+        "tqdm" \
+        "einops" \
+    && python3.10 -m pip install --no-cache-dir "torchcodec==0.13.0"
+
+COPY pyannote-audio ./pyannote-audio
+RUN python3.10 -m pip install --no-cache-dir -e /opt/diarizen/pyannote-audio
+
+COPY pyproject.toml README.md LICENSE MODEL_LICENSE ./
+COPY diarizen ./diarizen
+COPY recipes/diar_ssl ./recipes/diar_ssl
+COPY recipes/speakrs ./recipes/speakrs
+RUN python3.10 -m pip install --no-cache-dir -e /opt/diarizen \
+    && python3.10 -m recipes.speakrs.large.validation.evaluator --help
+
+COPY --from=worker /usr/local/bin/diarizen-validation-worker /usr/local/bin/diarizen-validation-worker
+RUN /usr/local/bin/diarizen-validation-worker self-check
+
+WORKDIR /opt/diarizen
+ENTRYPOINT ["/usr/local/bin/diarizen-validation-worker"]
+CMD ["self-check"]

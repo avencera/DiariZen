@@ -1,0 +1,10 @@
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/praveenperera/cloudeck.git?rev=cfcf5028606ef436b3288494b07062d5ab7760a7"]
+git = "https://github.com/praveenperera/cloudeck.git"
+rev = "cfcf5028606ef436b3288494b07062d5ab7760a7"
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"

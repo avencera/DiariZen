@@ -1,0 +1,25 @@
+[workspace]
+members = ["crates/validation-worker"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+cloudeck-client = { git = "https://github.com/praveenperera/cloudeck.git", rev = "cfcf5028606ef436b3288494b07062d5ab7760a7" }
+cloudeck-core = { git = "https://github.com/praveenperera/cloudeck.git", rev = "cfcf5028606ef436b3288494b07062d5ab7760a7" }
+cloudeck-worker-runtime = { git = "https://github.com/praveenperera/cloudeck.git", rev = "cfcf5028606ef436b3288494b07062d5ab7760a7" }
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+hex = "0.4.3"
+libc = "0.2.189"
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+tar = "0.4.46"
+tempfile = "3.27.0"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
+uuid = { version = "1.24.0", features = ["v7"] }
+zstd = "0.14.0"
