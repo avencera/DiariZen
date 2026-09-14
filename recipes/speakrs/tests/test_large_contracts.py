@@ -222,7 +222,7 @@ class GdriveRangeDownloadTest(unittest.TestCase):
 
 
 class LotusdisViewTest(unittest.TestCase):
-    def test_prefers_jbl_then_rejects_lavalier_only(self):
+    def test_requires_con123_and_rejects_other_views(self):
         import zipfile
         from dataclasses import replace
 
@@ -237,13 +237,14 @@ class LotusdisViewTest(unittest.TestCase):
             "wav/Hijack_S001_T057/Hijack_S001_T057_Lav1.wav",
             "wav/Hijack_S001_T057/Hijack_S001_T057_Bt3m.wav",
             "wav/Hijack_S001_T057/Hijack_S001_T057_Jbl.wav",
+            "wav/Hijack_S001_T057/Hijack_S001_T057_Con123.wav",
             "wav/Hijack_S002_T001/Hijack_S002_T001_Con123.wav",
         ]
-        self.assertTrue(_lotusdis_select_view(members, "Hijack_S001_T057").endswith("Jbl.wav"))
+        self.assertTrue(_lotusdis_select_view(members, "Hijack_S001_T057").endswith("Con123.wav"))
         self.assertTrue(_lotusdis_select_view(members, "Hijack_S002_T001").endswith("Con123.wav"))
         with self.assertRaises(PreparationError):
             _lotusdis_select_view(
-                ["wav/Hijack_S003_T001/Hijack_S003_T001_Lav1.wav"],
+                ["wav/Hijack_S003_T001/Hijack_S003_T001_Jbl.wav"],
                 "Hijack_S003_T001",
             )
         wav = _pcm_s16le_wav((1000).to_bytes(2, "little", signed=True) * 160)
@@ -253,6 +254,7 @@ class LotusdisViewTest(unittest.TestCase):
             with zipfile.ZipFile(archive, "w") as zipped:
                 zipped.writestr("wav/Hijack_S001_T057/Hijack_S001_T057_Lav1.wav", wav)
                 zipped.writestr("wav/Hijack_S001_T057/Hijack_S001_T057_Jbl.wav", wav)
+                zipped.writestr("wav/Hijack_S001_T057/Hijack_S001_T057_Con123.wav", wav)
             base = parse_spec(json.loads(SPEC_PATH.read_text(encoding="utf-8")))
             spec = replace(base, relocation=replace(base.relocation, audio_root=root / "audio"))
             rows = _materialize_lotusdis_audio(
@@ -260,7 +262,7 @@ class LotusdisViewTest(unittest.TestCase):
                 archive,
                 {"train": ("Hijack_S001_T057",), "dev": (), "test": ()},
             )
-            self.assertEqual(rows[0]["device_view"], "jbl")
+            self.assertEqual(rows[0]["device_view"], "con123")
             self.assertEqual(_flac_sample_count(root / "audio" / "LOTUSDIS" / "Hijack_S001_T057.flac"), 160)
 
 

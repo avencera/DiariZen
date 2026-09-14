@@ -53,6 +53,7 @@ from .inventory import (
     SOURCES,
 )
 from .jsonio import atomic_write_text, write_json
+from .lotusdis import parse_lotusdis_textgrid
 from .sampler import coverage_plan
 from .storage import probe_writable_root, require_free_gib, write_resource_plan
 
@@ -86,7 +87,6 @@ RELEASE_FILES = (
     "coverage-plan.json",
     "relocation.json",
 )
-LOTUSDIS_VIEW_PREFERENCE = ("jbl", "bt3m", "bt10m", "con123")
 NOTSOFAR_SIM_MIXTURE_CHANNELS = 7
 NOTSOFAR_SIM_SAMPLE_RATE = 16000
 GDRIVE_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
@@ -1942,7 +1942,7 @@ def _lotusdis_member_identity(name: str) -> tuple[str, str] | None:
 
 
 def _lotusdis_select_view(members: Iterable[str], parent_id: str) -> str:
-    """Pick jbl, then bt3m, bt10m, con123, then the first non-lavalier view."""
+    """Select the Con123 view whose clock matches the publisher TextGrid."""
 
     by_device: dict[str, str] = {}
     for member in members:
@@ -1955,13 +1955,9 @@ def _lotusdis_select_view(members: Iterable[str], parent_id: str) -> str:
         by_device[device] = member
     if not by_device:
         raise PreparationError("LOTUSDIS parent has no audio", {"parent_id": parent_id})
-    for preferred in LOTUSDIS_VIEW_PREFERENCE:
-        if preferred in by_device:
-            return by_device[preferred]
-    eligible = sorted(device for device in by_device if not device.startswith("lav"))
-    if not eligible:
-        raise PreparationError("LOTUSDIS parent has only lavalier views", {"parent_id": parent_id})
-    return by_device[eligible[0]]
+    if "con123" not in by_device:
+        raise PreparationError("LOTUSDIS parent has no Con123 audio", {"parent_id": parent_id})
+    return by_device["con123"]
 
 
 def _extract_sim_tar(archive: Path, audio_root: Path) -> list[str]:
@@ -2451,7 +2447,7 @@ def _materialize_lotusdis_audio(spec, meeting_zip: Path, parts: dict[str, tuple[
                         dest,
                         device_view=identity[1],
                         language="th",
-                        transformations=["preferred_device_view", "mono_16k_flac"],
+                        transformations=["lotusdis_con123_view", "mono_16k_flac"],
                     )
                 )
     return rows
@@ -2859,34 +2855,8 @@ def _notsofar_intervals(split_root: Path) -> tuple[list[RttmInterval], dict[str,
 
 
 def _textgrid_xmax_and_intervals(path: Path, recording_id: str) -> tuple[float, list[RttmInterval]]:
-    text = path.read_text(encoding="utf-8", errors="replace")
-    xmax_match = re.search(r"xmax\s*=\s*([0-9.]+)", text)
-    duration = float(xmax_match.group(1)) if xmax_match else 0.0
-    intervals: list[RttmInterval] = []
-    for name, body in re.findall(
-        r'name\s*=\s*"([^"]+)"(.*?)(?:item \[\d+\]:|\Z)',
-        text,
-        flags=re.S,
-    ):
-        lowered = name.lower()
-        if lowered in {"utterance", "transcript", "text", "ortho"}:
-            continue
-        for xmin, xmax, mark in re.findall(
-            r"xmin\s*=\s*([0-9.]+)\s*xmax\s*=\s*([0-9.]+)\s*text\s*=\s*\"([^\"]*)\"",
-            body,
-        ):
-            label = mark.strip()
-            if not label or label in {"", "<NA>", "sil", "sp", "xxx"}:
-                continue
-            intervals.append(
-                RttmInterval(
-                    recording_id=recording_id,
-                    start=float(xmin),
-                    end=float(xmax),
-                    speaker=name if lowered in {"speaker", "speakers"} else label,
-                )
-            )
-    return duration, intervals
+    parsed = parse_lotusdis_textgrid(path, recording_id)
+    return parsed.duration, list(parsed.intervals)
 
 
 def audit_local_core_sources(
