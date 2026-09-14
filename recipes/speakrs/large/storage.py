@@ -16,8 +16,9 @@ import urllib.request
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, BinaryIO, Protocol
 from xml.etree import ElementTree
 
 from .contracts import (
@@ -45,6 +46,12 @@ DEFAULT_MAX_INVENTORY_RESPONSE_BYTES = 64 * 1024**2
 OPEN_FILE_CHECK_TIMEOUT_SECONDS = 5
 CLOUDFLARE_R2_DEFAULT_ENCRYPTION = "AES-256"
 WRANGLER_R2_REST_MAX_UPLOAD_BYTES = 300 * 1024**2
+# r2 and s3-compatible providers accept a single PutObject body up to 5 GiB
+# this is deliberately a typed, configurable bound so a provider with a
+# smaller safe limit cannot accidentally fall through to multipart creation
+# without conditional semantics
+DEFAULT_S3_SINGLE_PART_MAX_BYTES = 5 * 1024**3
+IMMUTABLE_SHA256_METADATA_HEADER = "x-amz-meta-sha256"
 WRANGLER_VERSION = "4.129.0"
 MARKER_DIRECTORY = "_commits"
 _R2_CONTROL_CANARIES = (
@@ -58,6 +65,176 @@ DELETION_INTENT_STATE = "intent"
 DELETION_COMPLETED_STATE = "completed"
 _SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _ACCOUNT_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+
+
+class ImmutableObjectOutcome(str, Enum):
+    """Result of a conditional immutable object publication."""
+
+    CREATED = "created"
+    ALREADY_PRESENT = "already-present"
+
+
+class ImmutableObjectError(PreparationError):
+    """Base error for the typed immutable-file publication boundary."""
+
+    error_code = "immutable-object"
+
+    def __init__(self, message: str, details: dict[str, object] | None = None) -> None:
+        super().__init__(message, details)
+        self.code = self.error_code
+
+
+class ImmutableObjectConflictError(ImmutableObjectError):
+    """The target exists but does not prove the requested immutable identity."""
+
+    error_code = "immutable-conflict"
+
+
+class ImmutableObjectUnsupportedSizeError(ImmutableObjectError):
+    """The selected adapter cannot atomically create a file of this size."""
+
+    error_code = "immutable-unsupported-size"
+
+
+class ImmutableObjectUnavailableError(ImmutableObjectError):
+    """The provider could not prove the outcome of an immutable publication."""
+
+    error_code = "immutable-unavailable"
+
+
+@dataclass(frozen=True)
+class ImmutableObjectLimits:
+    """Provider limits for conditional single-part immutable publication."""
+
+    max_single_part_bytes: int = DEFAULT_S3_SINGLE_PART_MAX_BYTES
+
+    def __post_init__(self) -> None:
+        _positive_int(self.max_single_part_bytes, "max_single_part_bytes")
+
+
+@dataclass(frozen=True)
+class ImmutableObjectFile:
+    """One validated local file and its expected immutable remote identity."""
+
+    key: str
+    path: Path
+    expected_sha256: str
+    expected_size: int
+    content_type: str = "application/octet-stream"
+
+    @classmethod
+    def from_path(
+        cls,
+        destination: ObjectStoreDestination,
+        key: str,
+        path: Path,
+        *,
+        expected_sha256: str,
+        expected_size: int,
+        content_type: str = "application/octet-stream",
+    ) -> "ImmutableObjectFile":
+        """Validate location, exact local size, and the streamed file digest."""
+
+        upload = cls._from_path_metadata(
+            destination,
+            key,
+            path,
+            expected_sha256=expected_sha256,
+            expected_size=expected_size,
+            content_type=content_type,
+        )
+        upload.verify_local_file()
+        return upload
+
+    @classmethod
+    def _from_path_metadata(
+        cls,
+        destination: ObjectStoreDestination,
+        key: str,
+        path: Path,
+        *,
+        expected_sha256: str,
+        expected_size: int,
+        content_type: str,
+    ) -> "ImmutableObjectFile":
+        prefix = _validate_prefix(destination.prefix, "destination.prefix")
+        key = _validate_key(key)
+        if not key.startswith(prefix + "/"):
+            raise ContractError(
+                "immutable object must stay under the configured destination prefix",
+                {"key": key, "prefix": prefix},
+            )
+        digest = require_content_hash(expected_sha256, "expected sha256")
+        expected_size = _non_negative_int(expected_size, "expected_size")
+        if not isinstance(content_type, str) or not content_type.strip():
+            raise ContractError("immutable object content type must be a non-empty string")
+        path = Path(path)
+        try:
+            stat = path.stat()
+        except OSError as error:
+            raise ContractError("immutable object file is not readable", {"path": str(path)}) from error
+        if not path.is_file():
+            raise ContractError("immutable object file must be a regular file", {"path": str(path)})
+        if stat.st_size != expected_size:
+            raise ContractError(
+                "immutable object file size differs from the expected identity",
+                {"path": str(path), "actual_size": stat.st_size, "expected_size": expected_size},
+            )
+        return cls(
+            key=key,
+            path=path,
+            expected_sha256=digest,
+            expected_size=expected_size,
+            content_type=content_type,
+        )
+
+    def verify_local_file(self) -> None:
+        """Recheck exact size and SHA-256 using bounded streaming reads."""
+
+        try:
+            stat = self.path.stat()
+        except OSError as error:
+            raise ContractError("immutable object file is not readable", {"path": str(self.path)}) from error
+        if stat.st_size != self.expected_size:
+            raise ContractError(
+                "immutable object file changed before publication",
+                {"path": str(self.path), "actual_size": stat.st_size, "expected_size": self.expected_size},
+            )
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with self.path.open("rb") as source:
+                while True:
+                    chunk = source.read(DEFAULT_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    if not isinstance(chunk, bytes):
+                        raise ContractError("immutable object file returned a non-byte chunk")
+                    digest.update(chunk)
+                    size += len(chunk)
+        except OSError as error:
+            raise ContractError("immutable object file could not be read", {"path": str(self.path)}) from error
+        actual = digest.hexdigest()
+        if size != self.expected_size or actual != self.expected_sha256:
+            raise ContractError(
+                "immutable object file digest differs from the expected identity",
+                {
+                    "path": str(self.path),
+                    "actual_size": size,
+                    "expected_size": self.expected_size,
+                    "actual_sha256": actual,
+                    "expected_sha256": self.expected_sha256,
+                },
+            )
+
+
+class ImmutableObjectPublisher(Protocol):
+    """Adapter boundary for conditional immutable file creation."""
+
+    immutable_object_limits: ImmutableObjectLimits
+
+    def put_immutable_file_if_absent(self, upload: ImmutableObjectFile) -> ImmutableObjectOutcome:
+        """Create the object once or verify the existing immutable identity."""
 
 
 def probe_writable_root(root: Path) -> dict[str, object]:
@@ -411,6 +588,109 @@ def put_content_addressed(
     return backend.put_content_addressed(write.key, write.payload, content_type=write.content_type)
 
 
+def _prepare_immutable_object_file(
+    destination: ObjectStoreDestination,
+    key: str,
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_size: int,
+    content_type: str,
+    limits: ImmutableObjectLimits | None = None,
+) -> ImmutableObjectFile:
+    """Build a typed file request, rejecting an unsupported size before hashing."""
+
+    upload = ImmutableObjectFile._from_path_metadata(
+        destination,
+        key,
+        path,
+        expected_sha256=expected_sha256,
+        expected_size=expected_size,
+        content_type=content_type,
+    )
+    if limits is not None and upload.expected_size > limits.max_single_part_bytes:
+        raise ImmutableObjectUnsupportedSizeError(
+            "immutable object exceeds the provider single-part limit",
+            {
+                "key": upload.key,
+                "size": upload.expected_size,
+                "max_single_part_bytes": limits.max_single_part_bytes,
+            },
+        )
+    upload.verify_local_file()
+    return upload
+
+
+class _ExactLengthReader:
+    """Read exactly the declared number of bytes from a seekable file."""
+
+    def __init__(self, source: BinaryIO, length: int) -> None:
+        self._source = source
+        self._remaining = length
+
+    def read(self, size: int = -1) -> bytes:
+        if self._remaining == 0:
+            return b""
+        requested = self._remaining if size is None or size < 0 else min(size, self._remaining)
+        chunk = self._source.read(requested)
+        if not isinstance(chunk, bytes):
+            raise ImmutableObjectError("immutable object stream returned a non-byte chunk")
+        if not chunk:
+            raise ImmutableObjectError("immutable object stream ended before its declared length")
+        self._remaining -= len(chunk)
+        return chunk
+
+
+def _validate_immutable_upload(upload: ImmutableObjectFile, limits: ImmutableObjectLimits) -> None:
+    """Validate one typed upload against its provider's safe single-part bound."""
+
+    if not isinstance(upload, ImmutableObjectFile):
+        raise ContractError("immutable upload must be an ImmutableObjectFile")
+    if not isinstance(limits, ImmutableObjectLimits):
+        raise ContractError("immutable object limits must be an ImmutableObjectLimits")
+    _validate_key(upload.key)
+    canonical_digest = require_content_hash(upload.expected_sha256, "expected sha256")
+    if canonical_digest != upload.expected_sha256:
+        raise ContractError("immutable upload digest must be canonical lowercase hexadecimal")
+    _non_negative_int(upload.expected_size, "expected_size")
+    if not isinstance(upload.content_type, str) or not upload.content_type.strip():
+        raise ContractError("immutable upload content type must be a non-empty string")
+    if upload.expected_size > limits.max_single_part_bytes:
+        raise ImmutableObjectUnsupportedSizeError(
+            "immutable object exceeds the provider single-part limit",
+            {
+                "key": upload.key,
+                "size": upload.expected_size,
+                "max_single_part_bytes": limits.max_single_part_bytes,
+            },
+        )
+    upload.verify_local_file()
+
+
+def publish_immutable_file(
+    backend: ImmutableObjectPublisher,
+    destination: ObjectStoreDestination,
+    key: str,
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_size: int,
+    content_type: str = "application/octet-stream",
+) -> ImmutableObjectOutcome:
+    """Publish one local file with conditional create-once semantics."""
+
+    upload = _prepare_immutable_object_file(
+        destination,
+        key,
+        path,
+        expected_sha256=expected_sha256,
+        expected_size=expected_size,
+        content_type=content_type,
+        limits=backend.immutable_object_limits,
+    )
+    return backend.put_immutable_file_if_absent(upload)
+
+
 def _bounded_chunks(chunks: Iterator[bytes], *, max_bytes: int | None) -> Iterator[bytes]:
     total = 0
     for chunk in chunks:
@@ -713,18 +993,24 @@ def _sigv4_headers(
     endpoint: str,
     bucket: str,
     key: str,
-    payload: bytes,
+    payload: bytes | BinaryIO,
     access_key: str,
     secret_key: str,
     region: str,
     extra_headers: dict[str, str] | None = None,
     query: Mapping[str, str] | None = None,
+    payload_hash: str | None = None,
 ) -> tuple[str, dict[str, str]]:
     parsed = urllib.parse.urlparse(endpoint)
     host = parsed.netloc
     amz_date = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     datestamp = amz_date[:8]
-    payload_hash = hashlib.sha256(payload).hexdigest()
+    if payload_hash is None:
+        if not isinstance(payload, bytes):
+            raise ContractError("streamed SigV4 payloads require an expected SHA-256")
+        payload_hash = hashlib.sha256(payload).hexdigest()
+    else:
+        payload_hash = require_content_hash(payload_hash, "payload sha256")
     object_path = f"/{bucket}/{key}" if key else f"/{bucket}"
     canonical_uri = urllib.parse.quote(object_path, safe="/-_.~")
     canonical_query = _canonical_query(query)
@@ -810,6 +1096,7 @@ class S3CompatibleBackend:
     access_key: str
     secret_key: str
     timeout: int = 60
+    immutable_object_limits: ImmutableObjectLimits = field(default_factory=ImmutableObjectLimits)
 
     @classmethod
     def from_rclone(cls, destination: ObjectStoreDestination) -> S3CompatibleBackend:
@@ -837,11 +1124,12 @@ class S3CompatibleBackend:
         self,
         method: str,
         key: str,
-        payload: bytes = b"",
+        payload: bytes | BinaryIO = b"",
         extra_headers: dict[str, str] | None = None,
         query: Mapping[str, str] | None = None,
         *,
         max_body_bytes: int | None = DEFAULT_MAX_OBJECT_BYTES,
+        payload_hash: str | None = None,
     ) -> tuple[int, bytes, dict[str, str]]:
         if key:
             _validate_key(key)
@@ -856,6 +1144,7 @@ class S3CompatibleBackend:
             region=self.destination.region or "auto",
             extra_headers=extra_headers,
             query=query,
+            payload_hash=payload_hash,
         )
         request = urllib.request.Request(url, data=payload if method in {"PUT", "POST"} else None, method=method)
         for name, value in headers.items():
@@ -919,6 +1208,81 @@ class S3CompatibleBackend:
 
         write = ContentAddressedWrite.validate(self.destination, key, payload, content_type=content_type)
         return self.put_bytes(write.key, write.payload, content_type=write.content_type)
+
+    def put_immutable_file_if_absent(self, upload: ImmutableObjectFile) -> ImmutableObjectOutcome:
+        """Conditionally stream one immutable file without replacing an object."""
+
+        _validate_immutable_upload(upload, self.immutable_object_limits)
+        try:
+            with upload.path.open("rb") as source:
+                if not source.seekable():
+                    raise ContractError("immutable object file must be seekable", {"path": str(upload.path)})
+                source.seek(0)
+                body = _ExactLengthReader(source, upload.expected_size)
+                status, _, _ = self._request(
+                    "PUT",
+                    upload.key,
+                    body,
+                    extra_headers={
+                        "content-type": upload.content_type,
+                        "content-length": str(upload.expected_size),
+                        "if-none-match": "*",
+                        IMMUTABLE_SHA256_METADATA_HEADER: upload.expected_sha256,
+                    },
+                    payload_hash=upload.expected_sha256,
+                )
+        except PreparationError as error:
+            status = (error.details or {}).get("status")
+            if status in {409, 412}:
+                return self._verify_existing_immutable_file(upload)
+            raise
+        except OSError as error:
+            raise ImmutableObjectUnavailableError(
+                "immutable object file could not be opened",
+                {"key": upload.key},
+            ) from error
+        if status in {409, 412}:
+            return self._verify_existing_immutable_file(upload)
+        if not 200 <= status < 300:
+            raise ImmutableObjectUnavailableError(
+                "immutable object provider returned an unexpected status",
+                {"key": upload.key, "status": status},
+            )
+        return ImmutableObjectOutcome.CREATED
+
+    def _verify_existing_immutable_file(self, upload: ImmutableObjectFile) -> ImmutableObjectOutcome:
+        """Verify a raced or pre-existing target using HEAD-only identity evidence."""
+
+        try:
+            metadata = self.head(upload.key)
+        except PreparationError as error:
+            if (error.details or {}).get("status") == 404:
+                raise ImmutableObjectUnavailableError(
+                    "conditional creation was lost and the target is missing",
+                    {"key": upload.key},
+                ) from error
+            raise
+        raw_size = metadata.get("size")
+        try:
+            remote_size = int(raw_size)
+        except (TypeError, ValueError) as error:
+            raise ImmutableObjectConflictError(
+                "existing immutable object has missing or invalid length metadata",
+                {"key": upload.key},
+            ) from error
+        remote_digest = metadata.get("sha256") or metadata.get(IMMUTABLE_SHA256_METADATA_HEADER, "")
+        if remote_size != upload.expected_size or remote_digest != upload.expected_sha256:
+            raise ImmutableObjectConflictError(
+                "existing immutable object does not match the requested identity",
+                {
+                    "key": upload.key,
+                    "expected_size": upload.expected_size,
+                    "actual_size": remote_size,
+                    "expected_sha256": upload.expected_sha256,
+                    "actual_sha256": remote_digest if isinstance(remote_digest, str) else None,
+                },
+            )
+        return ImmutableObjectOutcome.ALREADY_PRESENT
 
     def iter_bytes(
         self,
@@ -991,6 +1355,7 @@ class S3CompatibleBackend:
             "size": headers.get("content-length", ""),
             "encryption": headers.get("x-amz-server-side-encryption", ""),
             "content_type": headers.get("content-type", ""),
+            "sha256": headers.get(IMMUTABLE_SHA256_METADATA_HEADER, ""),
         }
 
     def list_prefix(self, prefix: str, *, max_keys: int | None = DEFAULT_MAX_INVENTORY_KEYS) -> list[str]:
@@ -1297,6 +1662,9 @@ class WranglerR2Backend:
     api_base_url: str = "https://api.cloudflare.com/client/v4"
     # retain the old compatibility argument; direct REST transfers create no local object files
     temporary_root: Path | None = None
+    immutable_object_limits: ImmutableObjectLimits = field(
+        default_factory=lambda: ImmutableObjectLimits(max_single_part_bytes=WRANGLER_R2_REST_MAX_UPLOAD_BYTES)
+    )
     _credentials_cache: tuple[str, str, datetime | None] | None = field(default=None, init=False, repr=False)
 
     def _direct_object_url(self, key: str, account_id: str) -> str:
@@ -1486,6 +1854,20 @@ class WranglerR2Backend:
 
         write = ContentAddressedWrite.validate(self.destination, key, payload, content_type=content_type)
         return self.put_bytes(write.key, write.payload, content_type=write.content_type)
+
+    def put_immutable_file_if_absent(self, upload: ImmutableObjectFile) -> ImmutableObjectOutcome:
+        """Reject unsupported large files instead of using Wrangler's REST body path."""
+
+        _validate_immutable_upload(upload, self.immutable_object_limits)
+        raise ImmutableObjectUnsupportedSizeError(
+            "Wrangler R2 REST cannot provide conditional immutable file creation",
+            {
+                "key": upload.key,
+                "size": upload.expected_size,
+                "max_single_part_bytes": self.immutable_object_limits.max_single_part_bytes,
+                "adapter": "wrangler-rest",
+            },
+        )
 
     def _iter_bytes_once(
         self,
