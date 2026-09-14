@@ -303,6 +303,7 @@ class TrackMetadata:
     genres: tuple[str, ...]
     vocals: str
     artist: str
+    composer: str | None
     annotation_member: str
 
     @property
@@ -848,19 +849,20 @@ def _stage_audio_member(
 
 
 def parse_annotations(text: str, *, source: str, member: str) -> dict[str, TrackMetadata]:
-    """Parse strict ``id genres vocals artist`` publisher rows."""
+    """Parse strict ``id genres vocals artist [composer]`` publisher rows."""
 
     records: dict[str, TrackMetadata] = {}
     for line_number, line in enumerate(text.splitlines(), start=1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        fields = stripped.split(maxsplit=3)
-        if len(fields) != 4 or not TRACK_ID_RE.fullmatch(fields[0]):
+        fields = stripped.split(maxsplit=4)
+        if len(fields) not in {4, 5} or not TRACK_ID_RE.fullmatch(fields[0]):
             raise _fail(
                 "MUSAN ANNOTATIONS row is ambiguous", {"source": source, "member": member, "line": line_number}
             )
-        track_id, genres_text, vocals, artist = fields
+        track_id, genres_text, vocals, artist = fields[:4]
+        composer = fields[4].strip() if len(fields) == 5 else None
         if vocals not in {"Y", "N"} or not genres_text or not artist.strip():
             raise _fail(
                 "MUSAN ANNOTATIONS row has invalid fields",
@@ -871,7 +873,7 @@ def parse_annotations(text: str, *, source: str, member: str) -> dict[str, Track
         genres = tuple(part for part in genres_text.split(",") if part)
         if not genres:
             raise _fail("MUSAN ANNOTATIONS row has no genre", {"track_id": track_id})
-        records[track_id] = TrackMetadata(source, track_id, genres, vocals, artist.strip(), member)
+        records[track_id] = TrackMetadata(source, track_id, genres, vocals, artist.strip(), composer, member)
     if not records:
         raise _fail("MUSAN ANNOTATIONS contains no track rows", {"source": source, "member": member})
     return records
@@ -1085,6 +1087,7 @@ def _track_record(metadata: TrackMetadata, licence: LicenseRecord, staged: Stage
         "split": split,
         "artist": metadata.artist,
         "artist_group": metadata.artist_group,
+        "composer": metadata.composer,
         "genres": list(metadata.genres),
         "vocals": metadata.vocals,
         "source_member": staged.source_member,
