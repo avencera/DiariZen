@@ -4,12 +4,15 @@
 
 import math
 import os
+from pathlib import Path
 from typing import Dict, Iterator
 
 import numpy as np
 import soundfile as sf
 import torch
 from torch.utils.data import Dataset
+
+from diarizen.music_augmentation import MusicAugmenter
 
 
 def get_dtype(value: int) -> str:
@@ -36,9 +39,16 @@ def get_dtype(value: int) -> str:
 
 
 def load_scp(scp_file: str) -> Dict[str, str]:
-    """return dictionary { rec: wav_rxfilename }"""
-    lines = [line.strip().split(None, 1) for line in open(scp_file)]
-    return {x[0]: x[1] for x in lines}
+    """Return ``{recording: audio_path}``, resolving relative paths beside the SCP file."""
+
+    scp_path = Path(scp_file)
+    scp_parent = scp_path.resolve().parent
+    lines = [line.strip().split(None, 1) for line in scp_path.open()]
+    paths = {
+        fields[0]: fields[1] if Path(fields[1]).is_absolute() else str((scp_parent / fields[1]).resolve())
+        for fields in lines
+    }
+    return paths
 
 
 def load_uem(uem_file: str) -> Dict[str, list[tuple[float, float]]] | None:
@@ -140,10 +150,17 @@ class DiarizationDataset(Dataset):
         chunk_size: int = 5,  # seconds
         chunk_shift: int = 5,  # seconds
         sample_rate: int = 16000,
+        music_augmentation_config: str | os.PathLike[str] | None = None,
     ):
         self.chunk_indices = []
 
         self.sample_rate = sample_rate
+
+        self.music_augmenter = (
+            None
+            if music_augmentation_config is None
+            else MusicAugmenter.from_config(music_augmentation_config, sample_rate=sample_rate)
+        )
 
         self.model_rf_step = model_rf_step
         self.model_rf_duration = model_rf_duration
@@ -166,6 +183,12 @@ class DiarizationDataset(Dataset):
                     self.chunk_indices.append((rec, self.rec_scp[rec], start_sec, end_sec))
 
         self.annotations = self.rttm2label(rttm_file)
+
+    @property
+    def chunk_recording_ids(self) -> tuple[str, ...]:
+        """Return the recording identity for every materialized training chunk."""
+
+        return tuple(recording_id for recording_id, _, _, _ in self.chunk_indices)
 
     def get_session_idx(self, session):
         """
@@ -260,5 +283,15 @@ class DiarizationDataset(Dataset):
         for start, end, label in zip(start_idx, end_idx, chunked_annotations["label_idx"]):
             mapped_label = mapping[label]
             mask_label[start : end + 1, mapped_label] = 1
+
+        if self.music_augmenter is not None:
+            data, mask_label = self.music_augmenter.apply(
+                data,
+                mask_label,
+                recording_id=session,
+                chunk_start_sample=int(chunk_start * self.sample_rate),
+                chunk_end_sample=int(chunk_end * self.sample_rate),
+                chunked_annotations=chunked_annotations,
+            )
 
         return data, mask_label, session
