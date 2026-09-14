@@ -20,6 +20,9 @@ sys.path.insert(0, str(REPO))
 
 from recipes.speakrs.large.acceptance import (  # noqa: E402
     QaPath,
+    RttmInterval,
+    SampleClockEndPolicy,
+    SplitIsolationPolicy,
     admit_profiles,
     admit_source_after_automatic_qa,
     assert_policy_frozen_before_measurement,
@@ -34,6 +37,7 @@ from recipes.speakrs.large.acceptance import (  # noqa: E402
     reject_automatic_self_agreement,
     reject_duplicate_channel_accounting,
     reject_target_clipping,
+    repair_label_ends_to_sample_clock,
     select_qa_path,
     verify_decoded_identity,
     verify_expected_rttm,
@@ -42,6 +46,7 @@ from recipes.speakrs.large.contracts import (  # noqa: E402
     DATA_PREPARATION_SCHEMA,
     LabelMethod,
     SourceMembership,
+    data_spec_to_json,
     is_placeholder_hash,
     licence_from_permission,
     parse_data_preparation_spec,
@@ -50,8 +55,10 @@ from recipes.speakrs.large.contracts import (  # noqa: E402
     parse_spec,
     require_content_hash,
 )
+from recipes.speakrs.large.data import _capacity_profiles  # noqa: E402
 from recipes.speakrs.large.errors import ContractError, PreparationError, UnresolvedInputError  # noqa: E402
 from recipes.speakrs.large.prepare import _icsi_split, seal_release  # noqa: E402
+from recipes.speakrs.large.target_capacity import powerset_class_count, target_head_shape  # noqa: E402
 
 
 SPEC_PATH = REPO / "recipes" / "speakrs" / "conf" / "large_cc_v1.json"
@@ -143,6 +150,112 @@ def _rttm(recording: str, *turns: tuple[str, float, float]) -> str:
 
 
 class PlaceholderAndLabelTest(unittest.TestCase):
+    def test_version_two_profiles_bind_explicit_capacity_targets(self):
+        payload = _data_spec_payload(Path("/tmp"))
+        payload["schema_version"] = 2
+        payload["profiles"] = {
+            "sample_rate": 16000,
+            "capacity_targets": [
+                {
+                    "chunk_seconds": 8,
+                    "chunk_shift": 6,
+                    "local_slots": slots,
+                    "max_overlap": slots,
+                    "output_frames": 399,
+                }
+                for slots in (4, 6, 8)
+            ],
+            "selected_target": {
+                "chunk_seconds": 8,
+                "chunk_shift": 6,
+                "local_slots": 6,
+                "max_overlap": 6,
+                "output_frames": 399,
+            },
+            "rf_duration": 0.025,
+            "rf_step": 0.020,
+        }
+
+        parsed = parse_data_preparation_spec(payload)
+
+        self.assertEqual(parsed.schema_version, 2)
+        self.assertEqual(parsed.profiles.selected_target.local_slots, 6)
+        self.assertEqual(data_spec_to_json(parsed)["profiles"], payload["profiles"])
+        self.assertEqual(
+            _capacity_profiles(parsed),
+            tuple(
+                {
+                    "chunk_seconds": 8,
+                    "chunk_shift": 6,
+                    "local_slots": slots,
+                    "max_overlap": slots,
+                    "model_num_frames": 399,
+                }
+                for slots in (4, 6, 8)
+            ),
+        )
+
+    def test_version_two_profiles_require_all_expanded_targets(self):
+        payload = _data_spec_payload(Path("/tmp"))
+        payload["schema_version"] = 2
+        payload["profiles"] = {
+            "sample_rate": 16000,
+            "capacity_targets": [
+                {
+                    "chunk_seconds": 8,
+                    "chunk_shift": 6,
+                    "local_slots": 6,
+                    "max_overlap": 6,
+                    "output_frames": 399,
+                }
+            ],
+            "selected_target": {
+                "chunk_seconds": 8,
+                "chunk_shift": 6,
+                "local_slots": 6,
+                "max_overlap": 6,
+                "output_frames": 399,
+            },
+            "rf_duration": 0.025,
+            "rf_step": 0.020,
+        }
+
+        with self.assertRaisesRegex(ContractError, "4/4, 6/6, and 8/8"):
+            parse_data_preparation_spec(payload)
+
+    def test_expanded_powerset_head_shapes(self):
+        self.assertEqual(powerset_class_count(4, 4), 16)
+        self.assertEqual(powerset_class_count(6, 4), 57)
+        self.assertEqual(powerset_class_count(8, 4), 163)
+        self.assertEqual(powerset_class_count(6, 6), 64)
+        self.assertEqual(powerset_class_count(8, 8), 256)
+        self.assertEqual(target_head_shape(8, 4)["classifier_output_features"], 163)
+        with self.assertRaises(PreparationError):
+            powerset_class_count(4, 5)
+
+    def test_sample_clock_end_repair_is_bounded_and_content_visible(self):
+        interval = RttmInterval("rec", 8.0, 10.032, "speaker")
+        canonical, repairs = repair_label_ends_to_sample_clock(
+            [interval],
+            duration_by_recording={"rec": 10.0},
+            policy=SampleClockEndPolicy("sample-exact-end-intersection-v1", 0.040),
+        )
+        self.assertEqual(canonical, (RttmInterval("rec", 8.0, 10.0, "speaker"),))
+        self.assertAlmostEqual(repairs[0].overrun_seconds, 0.032)
+
+        with self.assertRaises(PreparationError):
+            repair_label_ends_to_sample_clock(
+                [RttmInterval("rec", 8.0, 10.041, "speaker")],
+                duration_by_recording={"rec": 10.0},
+                policy=SampleClockEndPolicy("sample-exact-end-intersection-v1", 0.040),
+            )
+        with self.assertRaisesRegex(PreparationError, "valid speaker interval"):
+            repair_label_ends_to_sample_clock(
+                [RttmInterval("rec", float("nan"), 10.0, "speaker")],
+                duration_by_recording={"rec": 10.0},
+                policy=SampleClockEndPolicy("sample-exact-end-intersection-v1", 0.040),
+            )
+
     def test_placeholder_hashes_cannot_seal(self):
         self.assertTrue(is_placeholder_hash("a" * 64))
         self.assertTrue(is_placeholder_hash("0" * 64))
@@ -228,6 +341,11 @@ class PlaceholderAndLabelTest(unittest.TestCase):
 
 
 class PermissionTest(unittest.TestCase):
+    def test_mit_permission_has_a_distinct_permissive_decision(self):
+        permission = parse_permission_record(_permission_payload("SIMSAMU", "mit"))
+
+        self.assertEqual(licence_from_permission(permission).value, "accepted_permissive")
+
     def test_custom_agreement_cannot_be_relabeled_accepted_cc(self):
         payload = _permission_payload("SSSD", "custom")
         payload["uses"]["commercial_training"] = {
@@ -286,6 +404,21 @@ class SplitHourCapacityTest(unittest.TestCase):
             assert_split_isolation(
                 {"AMI": {"train": ["a"], "dev": ["b"], "test": ["c"]}},
                 speaker_graph={"a": "spk", "c": "spk"},
+            )
+
+    def test_standard_supervised_policy_allows_only_speaker_overlap(self):
+        splits = {"source": {"train": ["train"], "dev": ["dev"], "test": ["test"]}}
+        graph = {"train": "speaker", "dev": "speaker", "test": "other"}
+        assert_split_isolation(
+            splits,
+            speaker_graph=graph,
+            policy=SplitIsolationPolicy.STANDARD_SUPERVISED,
+        )
+        with self.assertRaises(PreparationError):
+            assert_split_isolation(
+                {"source": {"train": ["same"], "dev": ["same"], "test": []}},
+                speaker_graph={"same": "speaker"},
+                policy=SplitIsolationPolicy.STANDARD_SUPERVISED,
             )
 
     def test_duplicate_channel_version_accounting_fails(self):

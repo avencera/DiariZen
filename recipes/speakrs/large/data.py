@@ -15,6 +15,7 @@ import torch
 
 from .acceptance import (
     QaPath,
+    SplitIsolationPolicy,
     assert_policy_frozen_before_measurement,
     assert_split_isolation,
     audit_selection_hours_capacity,
@@ -31,8 +32,10 @@ from .contracts import (
     DEFAULT_MODEL,
     QUALIFICATION_SOURCES,
     BatchState,
+    CapacityTargetProfile,
     DataPreparationSpec,
     EvidenceReference,
+    ExpandedModelProfileSettings,
     LocalCopyState,
     ObjectState,
     QualificationBinding,
@@ -74,10 +77,40 @@ from .storage import (
     restore_object,
     verify_and_commit_batch,
 )
-from .target_capacity import _load_powerset_class
+from .target_capacity import _load_powerset_class, powerset_class_count
 
 
 FORBIDDEN_DATA_ACTIONS = frozenset({"train", "qualify", "rent", "accept-agreement", "submit-form"})
+
+
+def _capacity_profiles(spec: DataPreparationSpec) -> tuple[dict[str, int], ...] | None:
+    if not isinstance(spec.profiles, ExpandedModelProfileSettings):
+        return None
+
+    return tuple(
+        {
+            "chunk_seconds": target.chunk_seconds,
+            "chunk_shift": target.chunk_shift,
+            "local_slots": target.local_slots,
+            "max_overlap": target.max_overlap,
+            "model_num_frames": target.output_frames,
+        }
+        for target in spec.profiles.capacity_targets
+    )
+
+
+def _restore_capacity_targets(spec: DataPreparationSpec) -> tuple[CapacityTargetProfile, ...]:
+    """Return the exact model targets that a cold restore must exercise."""
+
+    if isinstance(spec.profiles, ExpandedModelProfileSettings):
+        return spec.profiles.capacity_targets
+
+    return (
+        CapacityTargetProfile(8, 6, 4, 2, 399),
+        CapacityTargetProfile(8, 6, 4, 4, 399),
+        CapacityTargetProfile(16, 12, 4, 2, 799),
+        CapacityTargetProfile(16, 12, 4, 4, 799),
+    )
 
 
 def load_data_spec(path: Path) -> DataPreparationSpec:
@@ -345,8 +378,9 @@ def verify_data(
     if set(evidence) != required_evidence:
         raise PreparationError("selection evidence closure is incomplete", {"required": sorted(required_evidence)})
     evidence_hashes = {}
+    evidence_paths = {}
     for name, reference in evidence.items():
-        _, evidence_hashes[name] = _verified_reference(reference, name)
+        evidence_paths[name], evidence_hashes[name] = _verified_reference(reference, name)
     if evidence_hashes["terms"] != permission.terms_sha256:
         raise PreparationError("operative terms bytes do not match the permission record")
     qa = manifest.get("qa") or {}
@@ -365,7 +399,42 @@ def verify_data(
     all_parents = {parent for ids in splits.values() for parent in ids}
     if set(speaker_graph) != all_parents or any(not speakers for speakers in speaker_graph.values()):
         raise PreparationError("source speaker graph must cover every frozen parent")
-    assert_split_isolation({source.name: splits}, speaker_graph=speaker_graph)
+    raw_isolation_policy = manifest.get("split_isolation_policy", SplitIsolationPolicy.ZERO_SHOT.value)
+    try:
+        isolation_policy = SplitIsolationPolicy(raw_isolation_policy)
+    except ValueError as error:
+        raise ContractError("unknown split-isolation policy", {"policy": raw_isolation_policy}) from error
+    if isolation_policy is SplitIsolationPolicy.STANDARD_SUPERVISED:
+        split_proof = read_json(evidence_paths["split_provenance"])
+        required_split_proof = {
+            "schema",
+            "policy",
+            "source",
+            "source_version",
+            "splits",
+            "recording_identity",
+            "heldout_use",
+        }
+        if set(split_proof) != required_split_proof:
+            raise PreparationError(
+                "standard supervised split proof is incomplete",
+                {"required": sorted(required_split_proof)},
+            )
+        if (
+            split_proof["schema"] != "speakrs-standard-supervised-split-v1"
+            or split_proof["policy"] != isolation_policy.value
+            or split_proof["source"] != source.name
+            or split_proof["source_version"] != source.version
+            or split_proof["splits"] != splits
+            or split_proof["recording_identity"] != "complete-parent-recording"
+            or split_proof["heldout_use"] != "development-and-evaluation-only"
+        ):
+            raise PreparationError("standard supervised split proof does not bind the selection")
+    assert_split_isolation(
+        {source.name: splits},
+        speaker_graph=speaker_graph,
+        policy=isolation_policy,
+    )
     required_parents = set(splits.get("train") or ())
     declared = manifest.get("selected_parent_ids", list(splits.get("train") or ()))
     if not isinstance(declared, list) or len(set(declared)) != len(declared) or not set(declared) <= required_parents:
@@ -432,6 +501,7 @@ def verify_data(
         duration_by_recording=durations,
         intervals=intervals,
         uem_by_recording=uem_by_recording,
+        profiles=_capacity_profiles(spec),
     )
     admitted = [item for item in audit["capacity"] if item["admitted"]]
     payload = {
@@ -1411,7 +1481,11 @@ def restore_check(
         )
         scp = cache / f"{rec}.scp"
         scp.write_text(f"{rec} {audio_path}\n", encoding="utf-8")
-        for chunk_seconds, shift, frames in ((8, 6, 399), (16, 12, 799)):
+        target_groups: dict[tuple[int, int, int, int], list[int]] = {}
+        for profile in _restore_capacity_targets(spec):
+            key = (profile.chunk_seconds, profile.chunk_shift, profile.local_slots, profile.output_frames)
+            target_groups.setdefault(key, []).append(profile.max_overlap)
+        for (chunk_seconds, shift, local_slots, frames), overlaps in target_groups.items():
             dataset = module.DiarizationDataset(
                 str(scp),
                 str(label_path),
@@ -1429,21 +1503,21 @@ def restore_check(
             )
             for index in sorted({0, len(dataset) - 1, overlap_index}):
                 waveform, target, name = dataset[index]
-                collated = module._collate_fn([(waveform, target, name)], max_speakers_per_chunk=4)
+                collated = module._collate_fn([(waveform, target, name)], max_speakers_per_chunk=local_slots)
                 if tuple(collated["xs"].shape) != (1, 1, chunk_seconds * 16000) or tuple(collated["ts"].shape) != (
                     1,
                     frames,
-                    4,
+                    local_slots,
                 ):
                     raise PreparationError("restored production input has an unexpected tensor shape")
                 if not torch.isfinite(collated["xs"]).all() or not torch.isfinite(collated["ts"]).all():
                     raise PreparationError("restored production input has non-finite values")
                 encodings = []
-                for overlap in (2, 4):
-                    encoder = powerset_class(4, overlap)
+                for overlap in overlaps:
+                    encoder = powerset_class(local_slots, overlap)
                     encoded = encoder.to_powerset(collated["ts"].float())
                     decoded = encoder.to_multilabel(encoded)
-                    if not torch.isfinite(encoded).all() or tuple(decoded.shape) != (1, frames, 4):
+                    if not torch.isfinite(encoded).all() or tuple(decoded.shape) != (1, frames, local_slots):
                         raise PreparationError("restored target encoder produced invalid values")
                     encodings.append({"max_overlap": overlap, "powerset_shape": list(encoded.shape)})
                 results.append(
@@ -1451,6 +1525,8 @@ def restore_check(
                         "recording_id": rec,
                         "chunk_seconds": chunk_seconds,
                         "chunk_shift": shift,
+                        "local_slots": local_slots,
+                        "model_num_frames": frames,
                         "chunk_index": index,
                         "waveform_shape": list(collated["xs"].shape),
                         "target_shape": list(collated["ts"].shape),
@@ -1832,27 +1908,40 @@ def _restore_samples_match_portable(
             return False
         expected_recordings.add(recording_id)
 
-    expected_profiles: set[tuple[int, int]] = set()
+    expected_profiles: set[tuple[int, int, int, int, int]] = set()
     for profile in capacity:
         if not isinstance(profile, Mapping):
             return False
         chunk_seconds = profile.get("chunk_seconds")
+        chunk_shift = profile.get("chunk_shift")
+        local_slots = profile.get("local_slots")
         max_overlap = profile.get("max_overlap")
+        model_num_frames = profile.get("model_num_frames")
         if (
             isinstance(chunk_seconds, bool)
             or not isinstance(chunk_seconds, int)
+            or isinstance(chunk_shift, bool)
+            or not isinstance(chunk_shift, int)
+            or isinstance(local_slots, bool)
+            or not isinstance(local_slots, int)
             or isinstance(max_overlap, bool)
             or not isinstance(max_overlap, int)
+            or isinstance(model_num_frames, bool)
+            or not isinstance(model_num_frames, int)
         ):
             return False
-        expected_profiles.add((chunk_seconds, max_overlap))
+        expected_profiles.add((chunk_seconds, chunk_shift, local_slots, max_overlap, model_num_frames))
     if not expected_profiles or not isinstance(samples, list) or not samples:
         return False
 
-    frame_counts = {8: 399, 16: 799}
-    powerset_channels = {2: 11, 4: 16}
-    shifts = {8: 6, 16: 12}
-    covered: set[tuple[str, int, int]] = set()
+    serialized_profiles = portable.get("profiles")
+    if not isinstance(serialized_profiles, Mapping):
+        return False
+    sample_rate = serialized_profiles.get("sample_rate")
+    if isinstance(sample_rate, bool) or not isinstance(sample_rate, int):
+        return False
+
+    covered: set[tuple[str, int, int, int, int, int]] = set()
     for sample in samples:
         if not isinstance(sample, Mapping) or sample.get("finite") is not True:
             return False
@@ -1863,20 +1952,28 @@ def _restore_samples_match_portable(
             or recording_id not in expected_recordings
             or isinstance(chunk_seconds, bool)
             or not isinstance(chunk_seconds, int)
-            or chunk_seconds not in {chunk for chunk, _ in expected_profiles}
         ):
-            return False
-        if sample.get("chunk_shift") != shifts.get(chunk_seconds):
             return False
         chunk_index = sample.get("chunk_index")
         if isinstance(chunk_index, bool) or not isinstance(chunk_index, int) or chunk_index < 0:
             return False
-        frames = frame_counts.get(chunk_seconds)
-        if sample.get("waveform_shape") != [1, 1, chunk_seconds * 16000] or sample.get("target_shape") != [
-            1,
-            frames,
-            4,
-        ]:
+        target_shape = sample.get("target_shape")
+        if (
+            not isinstance(target_shape, list)
+            or len(target_shape) != 3
+            or target_shape[0] != 1
+            or isinstance(target_shape[1], bool)
+            or not isinstance(target_shape[1], int)
+            or isinstance(target_shape[2], bool)
+            or not isinstance(target_shape[2], int)
+        ):
+            return False
+        frames = target_shape[1]
+        local_slots = target_shape[2]
+        shift = sample.get("chunk_shift")
+        if sample.get("local_slots", local_slots) != local_slots or sample.get("model_num_frames", frames) != frames:
+            return False
+        if sample.get("waveform_shape") != [1, 1, chunk_seconds * sample_rate]:
             return False
         if not isinstance(sample.get("source_path_used"), str):
             return False
@@ -1887,14 +1984,14 @@ def _restore_samples_match_portable(
             not isinstance(speaker_mask, list)
             or len(speaker_mask) != 1
             or not isinstance(speaker_mask[0], list)
-            or len(speaker_mask[0]) != 4
+            or len(speaker_mask[0]) != local_slots
             or any(not isinstance(item, bool) for item in speaker_mask[0])
         ):
             return False
         encodings = sample.get("encodings")
         if not isinstance(encodings, list):
             return False
-        sample_profiles: set[tuple[int, int]] = set()
+        sample_profiles: set[tuple[int, int, int, int, int]] = set()
         for encoding in encodings:
             if not isinstance(encoding, Mapping):
                 return False
@@ -1903,26 +2000,34 @@ def _restore_samples_match_portable(
             if (
                 isinstance(overlap, bool)
                 or not isinstance(overlap, int)
-                or (chunk_seconds, overlap) not in expected_profiles
+                or (chunk_seconds, shift, local_slots, overlap, frames) not in expected_profiles
                 or not isinstance(shape, list)
                 or len(shape) != 3
                 or shape[0] != 1
                 or shape[1] != frames
                 or isinstance(shape[2], bool)
                 or not isinstance(shape[2], int)
-                or shape[2] != powerset_channels.get(overlap)
-                or (chunk_seconds, overlap) in sample_profiles
+                or shape[2] != powerset_class_count(local_slots, overlap)
+                or (chunk_seconds, shift, local_slots, overlap, frames) in sample_profiles
             ):
                 return False
-            sample_profiles.add((chunk_seconds, overlap))
-        if sample_profiles != {profile for profile in expected_profiles if profile[0] == chunk_seconds}:
+            sample_profiles.add((chunk_seconds, shift, local_slots, overlap, frames))
+        expected_sample_profiles = {
+            profile
+            for profile in expected_profiles
+            if profile[0] == chunk_seconds
+            and profile[1] == shift
+            and profile[2] == local_slots
+            and profile[4] == frames
+        }
+        if sample_profiles != expected_sample_profiles:
             return False
-        covered.update((recording_id, chunk, overlap) for chunk, overlap in sample_profiles)
+        covered.update((recording_id, *profile) for profile in sample_profiles)
 
     return covered == {
-        (recording_id, chunk_seconds, max_overlap)
+        (recording_id, chunk_seconds, chunk_shift, local_slots, max_overlap, model_num_frames)
         for recording_id in expected_recordings
-        for chunk_seconds, max_overlap in expected_profiles
+        for chunk_seconds, chunk_shift, local_slots, max_overlap, model_num_frames in expected_profiles
     }
 
 

@@ -127,6 +127,81 @@ def test_final_restore_dispatch_reuses_actual_batch_proof_and_handoff_accepts_in
     assert handoff["complete_release"] is True
 
 
+def test_expanded_profile_restore_proves_each_declared_slot_width(tmp_path):
+    _, raw, release, _ = selection_fixture.__wrapped__(tmp_path)
+    raw["schema_version"] = 2
+    raw["profiles"] = {
+        "sample_rate": 16000,
+        "capacity_targets": [
+            {
+                "chunk_seconds": 8,
+                "chunk_shift": 6,
+                "local_slots": slots,
+                "max_overlap": slots,
+                "output_frames": 399,
+            }
+            for slots in (4, 6, 8)
+        ],
+        "selected_target": {
+            "chunk_seconds": 8,
+            "chunk_shift": 6,
+            "local_slots": 6,
+            "max_overlap": 6,
+            "output_frames": 399,
+        },
+        "rf_duration": 0.025,
+        "rf_step": 0.020,
+    }
+    raw["disk"]["max_cache_bytes"] = 16 * 1024 * 1024
+    raw["disk"]["max_staging_bytes"] = 16 * 1024 * 1024
+    raw["disk"]["staging_root"] = str(release)
+    spec = parse_data_preparation_spec(raw)
+    backend = MemoryBackend()
+    verify_data(spec, release, release / "acceptance.json")
+    upload_data(spec, release, release / "upload.json", backend=backend)
+    verify_remote(
+        spec,
+        release / "upload.json",
+        release / "remote.json",
+        backend=backend,
+        label_policy_id="human-gold-v1",
+        split_id="published-v1",
+    )
+    config = release / "data-preparation.json"
+    write_json(config, data_spec_to_json(spec))
+    dispatch_data(
+        SimpleNamespace(
+            data_command="commit-release",
+            config=config,
+            release=release,
+            receipts=release / "remote.json",
+            output=release / "remote-release.json",
+        ),
+        backend=backend,
+    )
+
+    batch_restore = restore_check(spec, release / "remote.json", release / "batch-restore.json", backend=backend)
+
+    observed = {
+        (sample["local_slots"], encoding["max_overlap"], encoding["powerset_shape"][2])
+        for sample in batch_restore["samples"]
+        for encoding in sample["encodings"]
+    }
+    assert observed == {(4, 4, 16), (6, 6, 64), (8, 8, 256)}
+    result = dispatch_data(
+        _final_restore_args(
+            config,
+            release,
+            release / "remote-release.json",
+            release / "batch-restore.json",
+            release / "final-restore.json",
+        ),
+        backend=backend,
+    )
+    assert result["complete_release"] is True
+    assert result["batches"][0]["reused"] is True
+
+
 def test_final_restore_reads_release_metadata_without_payloads(committed_release):
     from collections import Counter
     from unittest import mock
@@ -407,6 +482,35 @@ def _capacity_manifest(*, speaker_seconds=100.0, lost_seconds=0.0, failed=()):
         "capacity": profiles,
         "admitted_profiles": [item for item in profiles if item["admitted"]],
     }
+
+
+def _expanded_capacity_manifest():
+    profiles = [
+        {
+            "chunk_seconds": 8,
+            "chunk_shift": 6,
+            "model_num_frames": 399,
+            "max_overlap": slots,
+            "local_slots": slots,
+            "speaker_seconds": 100.0,
+            "lost_seconds": 0.0,
+            "loss_fraction": 0.0,
+            "admitted": True,
+        }
+        for slots in (4, 6, 8)
+    ]
+
+    return {"capacity": profiles, "provisional_profiles": profiles}
+
+
+def test_capacity_closure_accepts_the_complete_version_two_grid():
+    closure = parse_capacity_manifest(_expanded_capacity_manifest(), label="expanded")
+
+    assert [profile.key for profile in closure.profiles] == [(8, 4, 4), (8, 6, 6), (8, 8, 8)]
+    assert aggregate_capacity((closure,), label="ICSI").as_list() == closure.as_list()
+    assert common_admitted_profiles({"ICSI": closure}) == [
+        {"chunk_seconds": 8, "max_overlap": slots, "local_slots": slots} for slots in (4, 6, 8)
+    ]
 
 
 def test_capacity_closure_uses_weighted_totals_and_keeps_failed_profiles():

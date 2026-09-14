@@ -97,6 +97,33 @@ def test_verified_existing_activity_needs_no_new_reviewer(selection):
     _load_verified_selection(spec, release)
 
 
+def test_standard_supervised_selection_requires_exact_split_proof(selection):
+    spec, _, release, manifest = selection
+    manifest["speaker_graph"]["IS1009a"] = ["speaker-1"]
+    manifest["split_isolation_policy"] = "disclosed-supervised-recording-disjoint-v1"
+    split_proof_path = Path(manifest["evidence"]["split_provenance"]["path"])
+    split_proof = {
+        "schema": "speakrs-standard-supervised-split-v1",
+        "policy": manifest["split_isolation_policy"],
+        "source": manifest["source"],
+        "source_version": manifest["version"],
+        "splits": {name: list(ids) for name, ids in manifest["splits"].items()},
+        "recording_identity": "complete-parent-recording",
+        "heldout_use": "development-and-evaluation-only",
+    }
+    write_json(split_proof_path, split_proof)
+    manifest["evidence"]["split_provenance"] = _reference(split_proof_path)
+    write_json(release / "selection.json", manifest)
+    verify_data(spec, release, release / "acceptance.json")
+
+    split_proof["splits"]["test"] = []
+    write_json(split_proof_path, split_proof)
+    manifest["evidence"]["split_provenance"] = _reference(split_proof_path)
+    write_json(release / "selection.json", manifest)
+    with pytest.raises(PreparationError, match="does not bind"):
+        verify_data(spec, release, None)
+
+
 def test_selected_parent_closure_rejects_omission(selection):
     spec, _, release, manifest = selection
     manifest["recordings"] = []

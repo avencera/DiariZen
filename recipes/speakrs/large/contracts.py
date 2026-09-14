@@ -125,6 +125,7 @@ class LicenceDecision(str, Enum):
     """Accepted-use decision recorded on every source and recording."""
 
     ACCEPTED_CC = "accepted_cc"
+    ACCEPTED_PERMISSIVE = "accepted_permissive"
     ACCEPTED_CUSTOM = "accepted_custom"
     REJECTED_NC = "rejected_nc"
     REJECTED_PAID = "rejected_paid"
@@ -867,7 +868,12 @@ class RecordingRow:
 
         return (
             not self.rejected
-            and self.licence in {LicenceDecision.ACCEPTED_CC, LicenceDecision.ACCEPTED_CUSTOM}
+            and self.licence
+            in {
+                LicenceDecision.ACCEPTED_CC,
+                LicenceDecision.ACCEPTED_PERMISSIVE,
+                LicenceDecision.ACCEPTED_CUSTOM,
+            }
             and self.split == "train"
             and self.audio_sha256 is not None
             and self.label_sha256 is not None
@@ -1021,7 +1027,8 @@ class CoverageState:
 
 
 DATA_PREPARATION_SCHEMA = "speakrs-data-preparation"
-DATA_PREPARATION_SCHEMA_VERSION = 1
+DATA_PREPARATION_SCHEMA_VERSION = 2
+LEGACY_DATA_PREPARATION_SCHEMA_VERSION = 1
 DATA_FORBIDDEN_FIELDS = frozenset(
     {
         "budget",
@@ -1146,6 +1153,7 @@ class TermsClass(str, Enum):
     CC_BY_SA = "cc-by-sa"
     CC_BY_ND = "cc-by-nd"
     CC0 = "cc0"
+    MIT = "mit"
     CUSTOM = "custom"
     UNINSPECTED = "uninspected"
 
@@ -1311,6 +1319,8 @@ def licence_from_permission(record: PermissionRecord) -> LicenceDecision:
         return LicenceDecision.UNRESOLVED
     if record.terms_class in {TermsClass.CC_BY, TermsClass.CC_BY_SA, TermsClass.CC0}:
         return LicenceDecision.ACCEPTED_CC
+    if record.terms_class is TermsClass.MIT:
+        return LicenceDecision.ACCEPTED_PERMISSIVE
     if record.terms_class is TermsClass.CC_BY_ND:
         return LicenceDecision.UNRESOLVED
     return LicenceDecision.UNRESOLVED
@@ -1489,10 +1499,98 @@ class ModelProfileSettings:
     chunk_shifts: tuple[int, int] = (6, 12)
 
 
-def parse_model_profile_settings(payload: Any, label: str = "profiles") -> ModelProfileSettings:
-    """Parse capacity-profile settings without inheriting training RunSpec fields."""
+@dataclass(frozen=True)
+class CapacityTargetProfile:
+    """One explicit model target measured on one production window grid."""
+
+    chunk_seconds: int
+    chunk_shift: int
+    local_slots: int
+    max_overlap: int
+    output_frames: int
+
+    def __post_init__(self) -> None:
+        if self.chunk_seconds <= 0 or self.chunk_shift <= 0 or self.output_frames <= 0:
+            raise ValueError("capacity target window values must be positive")
+        if self.local_slots <= 0 or not 1 <= self.max_overlap <= self.local_slots:
+            raise ValueError("capacity target overlap must fit its positive local-slot count")
+
+
+@dataclass(frozen=True)
+class ExpandedModelProfileSettings:
+    """Version-2 explicit capacity targets and the selected common target."""
+
+    sample_rate: int
+    capacity_targets: tuple[CapacityTargetProfile, ...]
+    selected_target: CapacityTargetProfile
+    rf_duration: float
+    rf_step: float
+
+    def __post_init__(self) -> None:
+        if not self.capacity_targets or len(set(self.capacity_targets)) != len(self.capacity_targets):
+            raise ValueError("expanded capacity targets must be non-empty and unique")
+        if self.selected_target not in self.capacity_targets:
+            raise ValueError("selected capacity target must be one of the measured targets")
+
+
+def _parse_capacity_target(payload: Any, label: str) -> CapacityTargetProfile:
+    data = _require_object(payload, label)
+    _reject_unknown(data, {"chunk_seconds", "chunk_shift", "local_slots", "max_overlap", "output_frames"}, label)
+    try:
+        return CapacityTargetProfile(
+            chunk_seconds=_require_int(data, "chunk_seconds", label, minimum=1),
+            chunk_shift=_require_int(data, "chunk_shift", label, minimum=1),
+            local_slots=_require_int(data, "local_slots", label, minimum=1),
+            max_overlap=_require_int(data, "max_overlap", label, minimum=1),
+            output_frames=_require_int(data, "output_frames", label, minimum=1),
+        )
+    except ValueError as error:
+        raise ContractError(str(error)) from error
+
+
+def parse_model_profile_settings(
+    payload: Any,
+    label: str = "profiles",
+    *,
+    schema_version: int = LEGACY_DATA_PREPARATION_SCHEMA_VERSION,
+) -> ModelProfileSettings | ExpandedModelProfileSettings:
+    """Parse versioned capacity settings without training RunSpec fields."""
 
     data = _require_object(payload, label)
+    if schema_version == DATA_PREPARATION_SCHEMA_VERSION:
+        _reject_unknown(data, {"sample_rate", "capacity_targets", "selected_target", "rf_duration", "rf_step"}, label)
+        raw_targets = data.get("capacity_targets")
+        if not isinstance(raw_targets, list):
+            raise ContractError("profiles.capacity_targets must be an array")
+        targets = tuple(
+            _parse_capacity_target(item, f"{label}.capacity_targets[{index}]")
+            for index, item in enumerate(raw_targets)
+        )
+        selected = _parse_capacity_target(data.get("selected_target"), f"{label}.selected_target")
+        required = {
+            CapacityTargetProfile(8, 6, 4, 4, 399),
+            CapacityTargetProfile(8, 6, 6, 6, 399),
+            CapacityTargetProfile(8, 6, 8, 8, 399),
+        }
+        if not required <= set(targets):
+            raise ContractError("version-2 profiles must measure 4/4, 6/6, and 8/8 on the frozen 8/6 grid")
+        if data.get("sample_rate") != SAMPLE_RATE:
+            raise ContractError("capacity must use the current model sample rate")
+        if data.get("rf_duration") != 0.025 or data.get("rf_step") != 0.020:
+            raise ContractError("capacity must use the current model receptive-field grid")
+        try:
+            return ExpandedModelProfileSettings(
+                sample_rate=_require_int(data, "sample_rate", label, minimum=1),
+                capacity_targets=targets,
+                selected_target=selected,
+                rf_duration=float(_require_number(data, "rf_duration", label)),
+                rf_step=float(_require_number(data, "rf_step", label)),
+            )
+        except ValueError as error:
+            raise ContractError(str(error)) from error
+    if schema_version != LEGACY_DATA_PREPARATION_SCHEMA_VERSION:
+        raise ContractError("unsupported data-preparation schema version", {"schema_version": schema_version})
+
     _reject_unknown(
         data,
         {
@@ -1557,7 +1655,7 @@ class DataPreparationSpec:
     permissions: dict[str, PermissionRecord]
     qa_policy_path: Path
     frozen_splits: dict[str, dict[str, tuple[str, ...]]]
-    profiles: ModelProfileSettings
+    profiles: ModelProfileSettings | ExpandedModelProfileSettings
     disk: DiskLimits
     r2: ObjectStoreDestination
     permission_records_path: Path
@@ -1599,8 +1697,9 @@ def parse_data_preparation_spec(payload: Any) -> DataPreparationSpec:
     _reject_unknown(data, allowed, "data-spec")
     if data.get("schema") != DATA_PREPARATION_SCHEMA:
         raise ContractError("spec.schema must be speakrs-data-preparation")
-    if int(_require_number(data, "schema_version", "data-spec")) != DATA_PREPARATION_SCHEMA_VERSION:
-        raise ContractError("spec.schema_version must be 1")
+    schema_version = int(_require_number(data, "schema_version", "data-spec"))
+    if schema_version not in {LEGACY_DATA_PREPARATION_SCHEMA_VERSION, DATA_PREPARATION_SCHEMA_VERSION}:
+        raise ContractError("spec.schema_version must be 1 or 2")
     permissions_raw = data.get("permissions")
     if not isinstance(permissions_raw, list) or not permissions_raw:
         raise ContractError("data-spec.permissions must be a non-empty array")
@@ -1625,13 +1724,13 @@ def parse_data_preparation_spec(payload: Any) -> DataPreparationSpec:
         frozen[str(corpus)] = {split: tuple(ids) if isinstance(ids, list) else () for split, ids in split_obj.items()}
     return DataPreparationSpec(
         schema=DATA_PREPARATION_SCHEMA,
-        schema_version=DATA_PREPARATION_SCHEMA_VERSION,
+        schema_version=schema_version,
         release_id=_require_str(data, "release_id", "data-spec"),
         sources=sources,
         permissions=permissions,
         qa_policy_path=Path(_require_str(data, "qa_policy_path", "data-spec")),
         frozen_splits=frozen,
-        profiles=parse_model_profile_settings(data.get("profiles")),
+        profiles=parse_model_profile_settings(data.get("profiles"), schema_version=schema_version),
         disk=parse_disk_limits(data.get("disk")),
         r2=parse_r2_destination(data.get("r2")),
         permission_records_path=Path(_require_str(data, "permission_records_path", "data-spec")),
@@ -1639,6 +1738,40 @@ def parse_data_preparation_spec(payload: Any) -> DataPreparationSpec:
         local_audio_root=_optional_path(data, "local_audio_root"),
         local_source_cache=_optional_path(data, "local_source_cache"),
     )
+
+
+def _capacity_target_to_json(profile: CapacityTargetProfile) -> dict[str, int]:
+    return {
+        "chunk_seconds": profile.chunk_seconds,
+        "chunk_shift": profile.chunk_shift,
+        "local_slots": profile.local_slots,
+        "max_overlap": profile.max_overlap,
+        "output_frames": profile.output_frames,
+    }
+
+
+def _model_profiles_to_json(
+    profiles: ModelProfileSettings | ExpandedModelProfileSettings,
+) -> dict[str, object]:
+    if isinstance(profiles, ExpandedModelProfileSettings):
+        return {
+            "sample_rate": profiles.sample_rate,
+            "capacity_targets": [_capacity_target_to_json(profile) for profile in profiles.capacity_targets],
+            "selected_target": _capacity_target_to_json(profiles.selected_target),
+            "rf_duration": profiles.rf_duration,
+            "rf_step": profiles.rf_step,
+        }
+
+    return {
+        "sample_rate": profiles.sample_rate,
+        "local_slots": profiles.local_slots,
+        "chunk_seconds": list(profiles.chunk_seconds),
+        "max_overlap": list(profiles.max_overlap),
+        "output_frames_8": profiles.output_frames_8,
+        "rf_duration": profiles.rf_duration,
+        "rf_step": profiles.rf_step,
+        "chunk_shifts": list(profiles.chunk_shifts),
+    }
 
 
 def data_spec_to_json(spec: DataPreparationSpec) -> dict[str, object]:
@@ -1690,16 +1823,7 @@ def data_spec_to_json(spec: DataPreparationSpec) -> dict[str, object]:
             corpus: {split: list(ids) for split, ids in splits.items()}
             for corpus, splits in spec.frozen_splits.items()
         },
-        "profiles": {
-            "sample_rate": spec.profiles.sample_rate,
-            "local_slots": spec.profiles.local_slots,
-            "chunk_seconds": list(spec.profiles.chunk_seconds),
-            "max_overlap": list(spec.profiles.max_overlap),
-            "output_frames_8": spec.profiles.output_frames_8,
-            "rf_duration": spec.profiles.rf_duration,
-            "rf_step": spec.profiles.rf_step,
-            "chunk_shifts": list(spec.profiles.chunk_shifts),
-        },
+        "profiles": _model_profiles_to_json(spec.profiles),
         "disk": {
             "staging_root": spec.disk.staging_root.as_posix(),
             "cache_root": spec.disk.cache_root.as_posix(),
@@ -1864,23 +1988,30 @@ class VerifiedSelectionBatch:
         if not isinstance(profiles, list) or (legacy and not profiles):
             raise ContractError("batch profile measurements are missing")
         parsed_profiles = tuple((int(item["chunk_seconds"]), int(item["max_overlap"])) for item in profiles)
+        supported_pairs = {(8, 2), (8, 4), (16, 2), (16, 4), (8, 6), (8, 8)}
         if len(set(parsed_profiles)) != len(parsed_profiles) or any(
-            chunk not in {8, 16} or overlap not in {2, 4} for chunk, overlap in parsed_profiles
+            profile not in supported_pairs for profile in parsed_profiles
         ):
             raise ContractError("acceptance profiles are invalid")
         capacity = data.get("capacity")
-        if not isinstance(capacity, list) or len(capacity) != 4:
-            raise ContractError("batch verification requires all four measured capacity profiles")
+        if not isinstance(capacity, list) or len(capacity) not in {3, 4}:
+            raise ContractError("batch verification requires one complete versioned capacity grid")
         measured_profiles = {
             (
                 _require_int(item, "chunk_seconds", "capacity", minimum=1),
                 _require_int(item, "max_overlap", "capacity", minimum=1),
+                _require_int(item, "local_slots", "capacity", minimum=1),
             )
             for item in capacity
             if isinstance(item, Mapping)
         }
-        if measured_profiles != {(8, 2), (8, 4), (16, 2), (16, 4)}:
+        legacy_grid = {(8, 2, 4), (8, 4, 4), (16, 2, 4), (16, 4, 4)}
+        expanded_grid = {(8, 4, 4), (8, 6, 6), (8, 8, 8)}
+        if frozenset(measured_profiles) not in {frozenset(legacy_grid), frozenset(expanded_grid)}:
             raise ContractError("batch capacity measurements have missing or duplicate profile identities")
+        measured_pairs = {(chunk, overlap) for chunk, overlap, _slots in measured_profiles}
+        if not set(parsed_profiles) <= measured_pairs:
+            raise ContractError("acceptance profiles are not part of the measured capacity grid")
         selected = data.get("selected_parent_ids")
         required = data.get("required_parent_ids")
         if not isinstance(selected, list) or not selected or not isinstance(required, list) or not required:

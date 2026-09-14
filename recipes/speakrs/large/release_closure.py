@@ -11,7 +11,9 @@ from .contracts import CAPACITY_LOSS_LIMIT
 from .errors import PreparationError
 
 
-PROFILE_KEYS = ((8, 2, 4), (8, 4, 4), (16, 2, 4), (16, 4, 4))
+LEGACY_PROFILE_KEYS = ((8, 2, 4), (8, 4, 4), (16, 2, 4), (16, 4, 4))
+EXPANDED_PROFILE_KEYS = ((8, 4, 4), (8, 6, 6), (8, 8, 8))
+SUPPORTED_PROFILE_GRIDS = (LEGACY_PROFILE_KEYS, EXPANDED_PROFILE_KEYS)
 REQUIRED_FIELDS = ("speaker_seconds", "lost_seconds")
 ADDITIVE_FIELDS = (
     "speaker_seconds",
@@ -64,8 +66,8 @@ def _profile_key(value: Mapping[str, Any], *, label: str) -> tuple[int, int, int
         _integer(value.get(name), label=label, field=name, minimum=1)
         for name in ("chunk_seconds", "max_overlap", "local_slots")
     )
-    if values not in PROFILE_KEYS:
-        raise _error("capacity profiles must cover the frozen 8/16 by 2/4 grid", label)
+    if values not in {key for grid in SUPPORTED_PROFILE_GRIDS for key in grid}:
+        raise _error("capacity profile is outside the supported versioned grids", label)
     return values
 
 
@@ -111,13 +113,13 @@ class CapacityProfile:
 
 @dataclass(frozen=True)
 class CapacityClosure:
-    """The four validated profiles for one batch or one source."""
+    """One complete versioned profile grid for a batch or source."""
 
     profiles: tuple[CapacityProfile, ...]
 
     def __post_init__(self) -> None:
-        if tuple(profile.key for profile in self.profiles) != PROFILE_KEYS:
-            raise ValueError("capacity closure profiles must use the frozen profile order")
+        if tuple(profile.key for profile in self.profiles) not in SUPPORTED_PROFILE_GRIDS:
+            raise ValueError("capacity closure profiles must use a supported frozen profile order")
 
     def as_list(self) -> list[dict[str, object]]:
         """Return all profiles, including failed profiles, in frozen order."""
@@ -145,7 +147,7 @@ def _parse_declared_profiles(value: Any, closure: CapacityClosure, *, label: str
         except PreparationError:
             raise _error("portable manifest admitted profile is invalid", label, index=index) from None
         key = (chunk_seconds, max_overlap, local_slots)
-        if key not in PROFILE_KEYS or key in declared:
+        if key not in {profile.key for profile in closure.profiles} or key in declared:
             raise _error("portable manifest admitted profiles are inconsistent", label, index=index)
         declared.append(key)
         profile = next(profile for profile in closure.profiles if profile.key == key)
@@ -157,11 +159,11 @@ def _parse_declared_profiles(value: Any, closure: CapacityClosure, *, label: str
 
 
 def parse_capacity_manifest(value: Mapping[str, Any], *, label: str) -> CapacityClosure:
-    """Parse all four measured profiles and verify their admission claims."""
+    """Parse one complete versioned grid and verify its admission claims."""
 
     capacity = value.get("capacity") if isinstance(value, Mapping) else None
-    if not isinstance(capacity, list) or len(capacity) != len(PROFILE_KEYS):
-        raise _error("portable manifest must contain exactly four capacity profiles", label)
+    if not isinstance(capacity, list) or len(capacity) not in {len(grid) for grid in SUPPORTED_PROFILE_GRIDS}:
+        raise _error("portable manifest must contain one complete versioned capacity grid", label)
 
     by_key: dict[tuple[int, int, int], CapacityProfile] = {}
     for index, item in enumerate(capacity):
@@ -231,9 +233,10 @@ def parse_capacity_manifest(value: Mapping[str, Any], *, label: str) -> Capacity
             admitted=expected_admitted,
             diagnostics=diagnostics,
         )
-    if set(by_key) != set(PROFILE_KEYS):
-        raise _error("capacity profiles must cover the frozen 8/16 by 2/4 grid", label)
-    closure = CapacityClosure(tuple(by_key[key] for key in PROFILE_KEYS))
+    profile_keys = next((grid for grid in SUPPORTED_PROFILE_GRIDS if set(by_key) == set(grid)), None)
+    if profile_keys is None:
+        raise _error("capacity profiles must cover one complete versioned grid", label)
+    closure = CapacityClosure(tuple(by_key[key] for key in profile_keys))
     declared = value.get("admitted_profiles")
     if declared is None:
         declared = value.get("provisional_profiles")
@@ -251,12 +254,16 @@ def aggregate_capacity(
     normalized_records: list[tuple[CapacityProfile, ...]] = []
     for record in records:
         profiles = record.profiles if isinstance(record, CapacityClosure) else tuple(record)
-        if len(profiles) != len(PROFILE_KEYS) or tuple(profile.key for profile in profiles) != PROFILE_KEYS:
+        if tuple(profile.key for profile in profiles) not in SUPPORTED_PROFILE_GRIDS:
             raise _error("capacity measurements have invalid profile identities", label)
         normalized_records.append(profiles)
 
+    profile_keys = tuple(profile.key for profile in normalized_records[0])
+    if any(tuple(profile.key for profile in profiles) != profile_keys for profiles in normalized_records[1:]):
+        raise _error("capacity measurements use different versioned grids", label)
+
     aggregate: list[CapacityProfile] = []
-    for profile_index, key in enumerate(PROFILE_KEYS):
+    for profile_index, key in enumerate(profile_keys):
         rows = [record[profile_index] for record in normalized_records]
         diagnostics: dict[str, float | int] = {}
         for field in ADDITIVE_FIELDS:
@@ -318,10 +325,15 @@ def common_admitted_profiles(capacity_by_source: Mapping[str, CapacityClosure]) 
 
     if not capacity_by_source:
         raise _error("release has no required source capacity", "release")
-    common = set(PROFILE_KEYS)
+    first = capacity_by_source[sorted(capacity_by_source)[0]]
+    first_keys = tuple(profile.key for profile in first.profiles)
+    if any(
+        tuple(profile.key for profile in closure.profiles) != first_keys for closure in capacity_by_source.values()
+    ):
+        raise _error("release sources use different versioned capacity grids", "release")
+    common = set(first_keys)
     for closure in capacity_by_source.values():
         common.intersection_update(profile.key for profile in closure.admitted)
-    first = capacity_by_source[sorted(capacity_by_source)[0]]
     return [
         {
             "chunk_seconds": profile.chunk_seconds,

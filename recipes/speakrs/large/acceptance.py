@@ -28,7 +28,7 @@ from .errors import ContractError, PreparationError, UnresolvedInputError
 from .hashing import sha256_file, sha256_json
 from .target_capacity import CapacityReport as CapacityReport
 from .target_capacity import admit_profiles as admit_profiles
-from .target_capacity import measure_capacity_loss
+from .target_capacity import measure_capacity_loss, target_head_shape
 
 
 ALLOWED_MINIMAL_PURPOSES = frozenset({"train-audio", "train-label", "manifest", "proof"})
@@ -81,6 +81,104 @@ class HourCounts:
     excluded_hours: float
     heldout_hours: float
     rejected_hours: float
+
+
+@dataclass(frozen=True)
+class SampleClockEndPolicy:
+    """Bounded rule for intersecting annotation ends with decoded audio."""
+
+    policy_id: str
+    maximum_end_overrun_seconds: float
+
+    def __post_init__(self) -> None:
+        if not self.policy_id:
+            raise ValueError("sample clock policy_id must be non-empty")
+        if not math.isfinite(self.maximum_end_overrun_seconds) or self.maximum_end_overrun_seconds <= 0:
+            raise ValueError("maximum end overrun must be finite and positive")
+
+
+@dataclass(frozen=True)
+class LabelBoundaryRepair:
+    """One label end intersected with a sample-exact audio boundary."""
+
+    recording_id: str
+    speaker: str
+    original_end: float
+    canonical_end: float
+
+    @property
+    def overrun_seconds(self) -> float:
+        """Return the removed interval beyond available decoded samples."""
+
+        return self.original_end - self.canonical_end
+
+
+def repair_label_ends_to_sample_clock(
+    intervals: Sequence[RttmInterval],
+    *,
+    duration_by_recording: Mapping[str, float],
+    policy: SampleClockEndPolicy,
+) -> tuple[tuple[RttmInterval, ...], tuple[LabelBoundaryRepair, ...]]:
+    """Intersect bounded label ends with sample-exact decoded audio.
+
+    The rule changes no interval that is fully within the decoded signal. It
+    rejects missing durations, intervals that start after audio, and overruns
+    above the declared tolerance.
+    """
+
+    canonical = []
+    repairs = []
+    for interval in intervals:
+        if (
+            not interval.recording_id
+            or not interval.speaker
+            or not math.isfinite(interval.start)
+            or not math.isfinite(interval.end)
+            or interval.start < 0
+            or interval.end <= interval.start
+        ):
+            raise PreparationError(
+                "sample clock repair requires a valid speaker interval",
+                {"recording_id": interval.recording_id},
+            )
+        duration = duration_by_recording.get(interval.recording_id)
+        if duration is None or not math.isfinite(duration) or duration <= 0:
+            raise PreparationError(
+                "sample clock repair requires a positive decoded duration",
+                {"recording_id": interval.recording_id},
+            )
+        overrun = interval.end - duration
+        if overrun <= 0:
+            canonical.append(interval)
+            continue
+        if interval.start >= duration or overrun > policy.maximum_end_overrun_seconds:
+            raise PreparationError(
+                "label end exceeds the sample clock repair bound",
+                {
+                    "recording_id": interval.recording_id,
+                    "overrun_seconds": overrun,
+                    "maximum_end_overrun_seconds": policy.maximum_end_overrun_seconds,
+                },
+            )
+        canonical.append(
+            RttmInterval(
+                recording_id=interval.recording_id,
+                start=interval.start,
+                end=duration,
+                speaker=interval.speaker,
+                redacted=interval.redacted,
+            )
+        )
+        repairs.append(
+            LabelBoundaryRepair(
+                recording_id=interval.recording_id,
+                speaker=interval.speaker,
+                original_end=interval.end,
+                canonical_end=duration,
+            )
+        )
+
+    return tuple(canonical), tuple(repairs)
 
 
 def load_qa_policy(path: Path) -> dict[str, Any]:
@@ -137,6 +235,13 @@ class QaPath(str, Enum):
 
     EXISTING_HUMAN_ACTIVITY = "existing-human-activity"
     HUMAN_REFERENCE_PILOT = "human-reference-pilot"
+
+
+class SplitIsolationPolicy(str, Enum):
+    """Versioned split-isolation rule for one supervised source."""
+
+    ZERO_SHOT = "global-speaker-disjoint-v1"
+    STANDARD_SUPERVISED = "disclosed-supervised-recording-disjoint-v1"
 
 
 def select_qa_path(
@@ -434,8 +539,9 @@ def assert_split_isolation(
     *,
     speaker_graph: Mapping[str, str | Sequence[str]] | None = None,
     time_index: Mapping[tuple[str, str], tuple[float, float]] | None = None,
+    policy: SplitIsolationPolicy = SplitIsolationPolicy.ZERO_SHOT,
 ) -> None:
-    """Reject parent, speaker, and time leakage into train."""
+    """Reject leakage under a versioned zero-shot or supervised policy."""
 
     for corpus, parts in splits.items():
         train = set(parts.get("train", ()))
@@ -449,7 +555,7 @@ def assert_split_isolation(
         if set(parts.get("dev", ())) & set(parts.get("test", ())):
             raise PreparationError("development and test parents overlap", {"corpus": corpus})
         frozen_test = set(parts.get("test", ()))
-        if speaker_graph:
+        if speaker_graph and policy is SplitIsolationPolicy.ZERO_SHOT:
 
             def speakers(parents):
                 values = [speaker_graph[parent] for parent in parents if parent in speaker_graph]
@@ -575,6 +681,7 @@ def audit_selection_hours_capacity(
     duration_by_recording: Mapping[str, float],
     intervals: Sequence[RttmInterval],
     uem_by_recording: Mapping[str, Sequence[tuple[float, float]]] | None = None,
+    profiles: Sequence[Mapping[str, int]] | None = None,
 ) -> dict[str, Any]:
     """Count hours and capacity on known UEM regions without accepting the source"""
 
@@ -599,7 +706,13 @@ def audit_selection_hours_capacity(
         if item.recording_id in train_ids:
             by_recording[item.recording_id].append(item)
     capacity = []
-    for profile in CAPACITY_PROFILES:
+    selected_profiles = tuple(profiles or CAPACITY_PROFILES)
+    for profile in selected_profiles:
+        chunk_seconds = int(profile["chunk_seconds"])
+        chunk_shift = int(profile.get("chunk_shift", {8: 6, 16: 12}[chunk_seconds]))
+        model_num_frames = int(profile.get("model_num_frames", {8: 399, 16: 799}[chunk_seconds]))
+        max_overlap = int(profile["max_overlap"])
+        local_slots = int(profile["local_slots"])
         speaker_seconds = 0.0
         lost_seconds = 0.0
         slot_lost_seconds = 0.0
@@ -615,10 +728,11 @@ def audit_selection_hours_capacity(
                     by_recording.get(recording_id, ()),
                     duration=duration,
                     uem=region,
-                    chunk_seconds=int(profile["chunk_seconds"]),
-                    max_overlap=int(profile["max_overlap"]),
-                    local_slots=int(profile["local_slots"]),
-                    chunk_shift={8: 6, 16: 12}[int(profile["chunk_seconds"])],
+                    chunk_seconds=chunk_seconds,
+                    max_overlap=max_overlap,
+                    local_slots=local_slots,
+                    chunk_shift=chunk_shift,
+                    model_num_frames=model_num_frames,
                     recording_id=recording_id,
                 )
                 speaker_seconds += report.speaker_seconds
@@ -630,17 +744,18 @@ def audit_selection_hours_capacity(
         loss_fraction = 0.0 if speaker_seconds <= 0 else lost_seconds / speaker_seconds
         capacity.append(
             {
-                "chunk_seconds": int(profile["chunk_seconds"]),
-                "max_overlap": int(profile["max_overlap"]),
-                "local_slots": int(profile["local_slots"]),
+                "chunk_seconds": chunk_seconds,
+                "max_overlap": max_overlap,
+                "local_slots": local_slots,
                 "speaker_seconds": speaker_seconds,
                 "lost_seconds": lost_seconds,
                 "slot_lost_seconds": slot_lost_seconds,
                 "encoded_lost_seconds": encoded_lost_seconds,
                 "overlap_limit_excess_seconds": overlap_lost_seconds,
                 "chunks": chunks,
-                "chunk_shift": {8: 6, 16: 12}[int(profile["chunk_seconds"])],
-                "model_num_frames": {8: 399, 16: 799}[int(profile["chunk_seconds"])],
+                "chunk_shift": chunk_shift,
+                "model_num_frames": model_num_frames,
+                "head": target_head_shape(local_slots, max_overlap),
                 "loss_fraction": loss_fraction,
                 "admitted": loss_fraction <= CAPACITY_LOSS_LIMIT,
             }

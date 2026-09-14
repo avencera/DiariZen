@@ -33,6 +33,39 @@ DEFAULT_RF_STEP = float(DEFAULT_DATA_PROFILES.rf_step)
 DEFAULT_CHUNK_SHIFTS = dict(zip(DEFAULT_DATA_PROFILES.chunk_seconds, DEFAULT_DATA_PROFILES.chunk_shifts))
 
 
+def powerset_class_count(local_slots: int, max_overlap: int) -> int:
+    """Return the exact class count for one powerset target head."""
+
+    if local_slots < 1:
+        raise PreparationError("powerset local_slots must be positive")
+    if max_overlap < 1 or max_overlap > local_slots:
+        raise PreparationError(
+            "powerset max_overlap must be between one and local_slots",
+            {"local_slots": local_slots, "max_overlap": max_overlap},
+        )
+
+    return sum(math.comb(local_slots, active) for active in range(max_overlap + 1))
+
+
+def target_head_shape(local_slots: int, max_overlap: int, hidden_size: int = 256) -> dict[str, int]:
+    """Describe classifier shape and parameter memory for a capacity target."""
+
+    if hidden_size < 1:
+        raise PreparationError("target head hidden_size must be positive")
+    classes = powerset_class_count(local_slots, max_overlap)
+    parameters = classes * hidden_size + classes
+
+    return {
+        "local_slots": local_slots,
+        "max_overlap": max_overlap,
+        "powerset_classes": classes,
+        "classifier_input_features": hidden_size,
+        "classifier_output_features": classes,
+        "classifier_parameters": parameters,
+        "classifier_fp32_bytes": parameters * 4,
+    }
+
+
 @dataclass(frozen=True)
 class CapacityReport:
     """Capacity loss for one window and target-encoder profile.
