@@ -348,6 +348,7 @@ def test_diagnostic_qualification_promotes_only_through_bounded_authorization(tm
     assert parsed["max_updates"] == 60_000
     assert parsed["physical_batch"] == 8
     assert parsed["artifacts"]["qualification"]["sha256"] == sha256_file(paths["qualification"])
+    assert parsed["validation_config"] == {"mode": "inline", "stopping_policy": "legacy"}
 
 
 def test_modified_qualification_cannot_use_existing_authorization(tmp_path: Path) -> None:

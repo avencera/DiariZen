@@ -14,8 +14,8 @@ from diarizen.trainer_utils import (
     AutoClipGradHistory,
     raise_for_non_finite_loss,
     reject_fp16_dual_optimizer,
-    scalar_to_float,
 )
+from diarizen.validation_metrics import finalize_validation_metrics, update_validation_batch_metrics
 
 
 logger = get_logger(__name__)
@@ -78,36 +78,18 @@ class Trainer(BaseTrainer):
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         xs, target = batch["xs"], batch["ts"]
-
-        y_pred = self.model(xs)
-        # powerset
-        multilabel = self.unwrap_model.powerset.to_multilabel(y_pred)
-        permutated_target, _ = permutate(multilabel, target)
-        permutated_target_powerset = self.unwrap_model.powerset.to_powerset(permutated_target.float())
-
-        loss = nll_loss(y_pred, torch.argmax(permutated_target_powerset, dim=-1))
-        self.unwrap_model.validation_metric.update(
-            torch.transpose(multilabel, 1, 2),
-            torch.transpose(target, 1, 2),
+        loss = update_validation_batch_metrics(
+            model=self.model,
+            powerset=self.unwrap_model.powerset,
+            metric=self.unwrap_model.validation_metric,
+            features=xs,
+            target=target,
         )
-
         return {"Loss": loss.detach().float()}
 
     def validation_epoch_end(self, validation_epoch_output):
         loss_items = [step_out["Loss"] for step_out in validation_epoch_output]
-        metric_means = {"Loss": sum(map(scalar_to_float, loss_items)) / len(loss_items)}
-        try:
-            computed_metrics = self.unwrap_model.validation_metric.compute()
-            metric_means.update(
-                {
-                    "DER": scalar_to_float(computed_metrics["DiarizationErrorRate"]),
-                    "FA": scalar_to_float(computed_metrics["DiarizationErrorRate/FalseAlarm"]),
-                    "Miss": scalar_to_float(computed_metrics["DiarizationErrorRate/Miss"]),
-                    "Confusion": scalar_to_float(computed_metrics["DiarizationErrorRate/Confusion"]),
-                }
-            )
-        finally:
-            self.unwrap_model.validation_metric.reset()
+        metric_means = finalize_validation_metrics(loss_items, self.unwrap_model.validation_metric).to_training_dict()
 
         if self.accelerator.is_local_main_process:
             for key, metric_mean in metric_means.items():

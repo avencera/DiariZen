@@ -14,6 +14,7 @@ import toml
 from .errors import ContractError, RuntimeGateError
 from .hashing import require_mapping, sha256_file, sha256_json
 from .jsonio import read_json, write_json
+from .validation.config import ValidationConfigError, parse_validation_config
 
 
 AUTHORIZATION_SCHEMA = "speakrs-training-authorization-v1"
@@ -524,6 +525,10 @@ def freeze_training_launch(
     if trainer_config_path.name != posixpath.basename(worker_paths["trainer_config"]):
         raise RuntimeGateError("local and worker trainer config names differ")
     config = toml.load(trainer_config_path)
+    try:
+        validation_config = parse_validation_config(config)
+    except (TypeError, ValueError, ValidationConfigError) as error:
+        raise RuntimeGateError("trainer validation configuration is invalid") from error
     if require_mapping(config.get("finetune"), "trainer finetune").get("finetune") is not False:
         raise RuntimeGateError("trainer must start from the qualified WavLM initializer")
     if require_mapping(config.get("trainer"), "trainer config trainer").get("path") != "trainer_dual_opt.Trainer":
@@ -698,6 +703,7 @@ def freeze_training_launch(
         "updates_per_cycle": authorization.updates_per_cycle,
         "max_updates": authorization.max_updates,
         "spend_ceiling_usd": authorization.spend_ceiling_usd,
+        "validation_config": validation_config.to_dict(),
     }
     launch_id = sha256_json(durable_core)
     recovery: dict[str, object] | None = None
@@ -793,4 +799,11 @@ def parse_launch_lock(payload: Any) -> Mapping[str, Any]:
     if sha256_json(durable_core) != launch_id:
         raise ContractError("durable launch digest does not match its content")
     TrainingAuthorization.parse(require_mapping(data.get("authorization"), "launch authorization"))
+    try:
+        validation_config = data.get("validation_config")
+        if "validation_config" in data and validation_config is None:
+            raise ValidationConfigError("launch validation configuration must be an object")
+        parse_validation_config(validation_config)
+    except (TypeError, ValueError, ValidationConfigError) as error:
+        raise ContractError("launch validation configuration is invalid") from error
     return data

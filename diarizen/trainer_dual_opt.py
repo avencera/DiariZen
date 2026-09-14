@@ -2,6 +2,8 @@
 # Copyright 2024 Hong Kong Polytechnic University (author: Xiang Hao, haoxiangsnr@gmail.com)
 # Copyright 2024 Brno University of Technology (author: Jiangyu Han, ihan@fit.vut.cz)
 
+from __future__ import annotations
+
 import fcntl
 import itertools
 import json
@@ -12,6 +14,7 @@ import signal
 import sys
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pandas as pd
 import toml
@@ -35,6 +38,16 @@ from diarizen.trainer_utils import (
 from diarizen.utils import prepare_empty_dir, print_env
 
 
+if TYPE_CHECKING:
+    from recipes.speakrs.large.recovery import RecoveryGeneration
+    from recipes.speakrs.large.validation.contracts import (
+        TrainingCompletion,
+        TrainingFailure,
+        TrainingRunStateValue,
+    )
+    from recipes.speakrs.large.validation.trainer_bridge import AcceptEarlyStop, SelectionFailed, TrainerBridge
+
+
 logger = get_logger(__name__)
 
 
@@ -47,6 +60,7 @@ class Trainer:
         model,
         optimizer_small,
         optimizer_big,
+        validation_bridge: TrainerBridge | None = None,
     ):
         """Create an instance of BaseTrainer for training, validation, and fine-tuning."""
         self.config = config
@@ -70,6 +84,21 @@ class Trainer:
 
         # Trainer.train args
         self.trainer_config = config["trainer"]["args"]
+        from recipes.speakrs.large.validation.config import (
+            ExternalValidationConfig,
+            ValidationMode,
+            parse_validation_config,
+        )
+        from recipes.speakrs.large.validation.trainer_bridge import TrainerBridge
+
+        self.validation_config = parse_validation_config(config)
+        if self.validation_config.mode is ValidationMode.EXTERNAL and not isinstance(
+            self.validation_config, ExternalValidationConfig
+        ):
+            raise ValueError("external validation must use its typed configuration")
+        if self.validation_config.mode is ValidationMode.EXTERNAL and not isinstance(validation_bridge, TrainerBridge):
+            raise ValueError("external validation requires a typed TrainerBridge")
+        self.validation_bridge = validation_bridge
         self.debug = self.trainer_config.get("debug", False)
         self.max_steps = self.trainer_config.get("max_steps", 0)
         self.max_epochs = self.trainer_config.get("max_epochs", sys.maxsize)
@@ -100,6 +129,8 @@ class Trainer:
         self.gradient_accumulation_steps = self.trainer_config.get("gradient_accumulation_steps", 1)
 
         self.validation_before_training = self.trainer_config.get("validation_before_training", False)
+        if isinstance(self.validation_config, ExternalValidationConfig):
+            self.validation_before_training = False
 
         self.lr_decay = self.trainer_config.get("lr_decay", False)
         self.lr_decay_patience = self.trainer_config.get("lr_decay_patience", 2)
@@ -138,6 +169,7 @@ class Trainer:
         self.run_hooks = None
         self._stop_signal = None
         self.launch_id = os.environ.get("SPEAKRS_LAUNCH_ID")
+        self._loaded_checkpoint_path = None
 
         # Others
         pd.set_option("display.float_format", lambda x: "%.3f" % x)
@@ -468,6 +500,7 @@ class Trainer:
             raise FileNotFoundError(f"Checkpoint {ckpt_path.as_posix()} not found.")
 
         self.accelerator.load_state(ckpt_path, map_location="cpu")
+        self._loaded_checkpoint_path = ckpt_path
 
         logger.info(f"Checkpoint on epoch {self.state.epochs_trained} is loaded.")
 
@@ -507,8 +540,10 @@ class Trainer:
         return [checkpoint for checkpoint in checkpoints if self._is_complete_checkpoint(checkpoint)]
 
     def _complete_update_checkpoint_paths(self):
-        checkpoints = sorted(self.checkpoints_dir.glob("update_" + ("[0-9]" * 8)))
-        return [checkpoint for checkpoint in checkpoints if self._is_complete_checkpoint(checkpoint)]
+        checkpoints = list(self.checkpoints_dir.glob("update_" + ("[0-9]" * 8)))
+        checkpoints.extend(self.checkpoints_dir.glob("update_????????_generation_????????"))
+        complete = [checkpoint for checkpoint in checkpoints if self._is_complete_checkpoint(checkpoint)]
+        return sorted(set(complete), key=self._checkpoint_progress)
 
     @staticmethod
     def _train_data_generator(dataloader):
@@ -698,6 +733,378 @@ class Trainer:
 
         return bar_desc
 
+    def _external_progress_payload(
+        self,
+        generation: RecoveryGeneration,
+        run_state: TrainingRunStateValue,
+    ) -> dict[str, object]:
+        """Build the boundary progress document for one external generation."""
+
+        from recipes.speakrs.large.validation.trainer_bridge import TrainerBridgeError
+
+        bridge = self.validation_bridge
+        if bridge is None:
+            raise TrainerBridgeError("external validation bridge is not configured")
+        payload: dict[str, object] = {
+            "schema": "diarizen-checkpoint-progress-v1",
+            "mode": "external",
+            "epochs_trained": int(self.state.epochs_trained),
+            "steps_trained": int(self.state.steps_trained),
+            "updates_trained": int(getattr(self.state, "updates_trained", 0)),
+            "microbatches_in_epoch": int(getattr(self.state, "microbatches_in_epoch", 0)),
+            "training_complete": bool(getattr(self.state, "training_complete", False)),
+            "stop_reason": getattr(self.state, "stop_reason", None),
+            "launch_id": getattr(self, "launch_id", None),
+            "training_run_state": run_state.to_dict(),
+            "selection_state": bridge.selection_payload(),
+            "published_snapshots": bridge.published_snapshot_payload(),
+            "generation": generation.name,
+        }
+        return payload
+
+    def _external_run_state(
+        self,
+        generation: RecoveryGeneration,
+        completion: TrainingCompletion | None = None,
+        failure: TrainingFailure | None = None,
+    ) -> TrainingRunStateValue:
+        """Build the typed active or terminal run state for one generation."""
+
+        from recipes.speakrs.large.validation.contracts import (
+            ActiveTrainingRun,
+            CompletedTrainingRun,
+            FailedTrainingRun,
+            ResumableTrainingProgress,
+            Sha256Digest,
+            canonical_digest,
+        )
+        from recipes.speakrs.large.validation.publication import derive_recovery_generation_id
+        from recipes.speakrs.large.validation.trainer_bridge import TrainerBridgeError
+
+        bridge = self.validation_bridge
+        if bridge is None:
+            raise TrainerBridgeError("external validation bridge is not configured")
+        progress_identity = {
+            "updates": generation.updates,
+            "selection_revision": bridge.selection_revision,
+            "recovery_generation_id": derive_recovery_generation_id(generation).value,
+            "generation_sequence": generation.sequence,
+        }
+        progress = ResumableTrainingProgress(
+            updates=generation.updates,
+            selection_revision=bridge.selection_revision,
+            recovery_generation_id=derive_recovery_generation_id(generation),
+            generation_sequence=generation.sequence,
+            progress_digest=Sha256Digest(canonical_digest(progress_identity)),
+        )
+        if failure is not None:
+            return FailedTrainingRun(failure)
+        if completion is not None:
+            return CompletedTrainingRun(completion)
+        return ActiveTrainingRun(progress)
+
+    def _save_external_generation(
+        self,
+        *,
+        updates: int,
+        completion: TrainingCompletion | None = None,
+        failure: TrainingFailure | None = None,
+    ) -> Path:
+        """Write one complete canonical recovery generation for external mode."""
+
+        from recipes.speakrs.large.recovery import next_generation, publish_generation
+
+        generation = next_generation(self.checkpoints_dir, updates)
+        destination = self.checkpoints_dir / generation.name
+        temporary = self.checkpoints_dir / f".{generation.name}.partial"
+        if temporary.exists():
+            self._remove_path(temporary)
+        temporary.mkdir(parents=True, exist_ok=True)
+        if completion is not None:
+            self.state.training_complete = True
+            self.state.stop_reason = "completed"
+        if failure is not None:
+            self.state.training_complete = True
+            self.state.stop_reason = "failed"
+        try:
+            self.accelerator.save_state(temporary, safe_serialization=False)
+            run_state = self._external_run_state(generation, completion, failure)
+            payload = self._external_progress_payload(generation, run_state)
+            progress_path = temporary / "progress.json"
+            progress_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+            publish_generation(temporary, destination)
+        except BaseException:
+            if temporary.exists():
+                self._remove_path(temporary)
+            raise
+        return destination
+
+    def _external_publish_generation(self, updates: int) -> Path:
+        """Persist and publish one active boundary generation."""
+
+        from recipes.speakrs.large.validation.trainer_bridge import TrainerBridgeError
+
+        path = self.checkpoints_dir / "external-generation-unavailable"
+        if self.accelerator.is_local_main_process:
+            path = self._save_external_generation(updates=updates)
+        bridge = self.validation_bridge
+        if bridge is None:
+            raise TrainerBridgeError("external validation bridge is not configured")
+        if self.accelerator.is_local_main_process:
+            bridge.publish_boundary(path)
+        self.accelerator.wait_for_everyone()
+        bridge.refresh_published_snapshots()
+        return path
+
+    def _external_terminal_generation(
+        self,
+        updates: int,
+        *,
+        completion: TrainingCompletion | None = None,
+        failure: TrainingFailure | None = None,
+    ) -> None:
+        """Persist one typed terminal outcome in a fresh generation."""
+
+        from recipes.speakrs.large.validation.trainer_bridge import TrainerBridgeSelectionFailure
+
+        if self.accelerator.is_local_main_process:
+            self._save_external_generation(updates=updates, completion=completion, failure=failure)
+        self.accelerator.wait_for_everyone()
+
+        if failure is not None:
+            raise TrainerBridgeSelectionFailure(failure)
+
+    def _external_terminal_decision(self, decision: SelectionFailed | AcceptEarlyStop) -> None:
+        """Persist a trusted terminal decision at the current update boundary."""
+
+        from recipes.speakrs.large.validation.trainer_bridge import (
+            SelectionFailed,
+            TrainerBridgeError,
+        )
+
+        bridge = self.validation_bridge
+        if bridge is None:
+            raise TrainerBridgeError("external validation bridge is not configured")
+        if isinstance(decision, SelectionFailed):
+            self._external_terminal_generation(
+                int(getattr(self.state, "updates_trained", 0)),
+                failure=decision.failure,
+            )
+            return
+        self._external_terminal_generation(
+            int(getattr(self.state, "updates_trained", 0)),
+            completion=decision.completion,
+        )
+
+    def _train_external(self, train_dataloader: DataLoader):
+        """Train while the trusted external controller owns validation policy."""
+
+        from recipes.speakrs.large.validation.contracts import (
+            ActiveTrainingRun,
+            CompletedTrainingRun,
+            FailedTrainingRun,
+            MaxUpdatesReached,
+        )
+        from recipes.speakrs.large.validation.trainer_bridge import (
+            AcceptEarlyStop,
+            SelectionFailed,
+            TrainerBridgeError,
+            TrainerBridgeSelectionFailure,
+        )
+
+        bridge = self.validation_bridge
+        if bridge is None:
+            raise TrainerBridgeError("external validation bridge is not configured")
+        if self.launch_id is not None and bridge.campaign.training_launch_id != self.launch_id:
+            raise TrainerBridgeError("external validation campaign belongs to another training launch")
+        steps_per_epoch = len(train_dataloader)
+        update_steps_per_epoch = max(steps_per_epoch // self.gradient_accumulation_steps, 1)
+        max_steps = bridge.campaign.max_updates
+        if self.max_steps > 0 and self.max_steps != max_steps:
+            raise ValueError("trainer max_steps must match the external validation campaign")
+        if bridge.campaign.updates_per_complete_epoch != update_steps_per_epoch:
+            raise ValueError("external validation epoch updates do not match the training dataloader")
+        max_epochs = max_steps // update_steps_per_epoch + int(max_steps % update_steps_per_epoch > 0)
+
+        if self.warmup_steps > 0:
+            self.create_schedulers(max_steps=max_steps)
+        if self.use_one_cycle_lr:
+            self.create_lr_one_cycle_scheduler(max_steps=max_steps * self.accelerator.num_processes)
+
+        resumed = False
+        if self.resume:
+            self._load_checkpoint(ckpt_path="latest")
+            resumed = True
+            checkpoint_path = self._loaded_checkpoint_path
+            if checkpoint_path is None:
+                raise TrainerBridgeError("external resume did not identify its checkpoint")
+            run_state = bridge.load_training_run_state(checkpoint_path)
+            if isinstance(run_state, CompletedTrainingRun):
+                logger.info("External training checkpoint is already complete.")
+                return
+            if isinstance(run_state, FailedTrainingRun):
+                raise TrainerBridgeSelectionFailure(run_state.failure)
+            if not isinstance(run_state, ActiveTrainingRun):
+                raise TrainerBridgeError("external resume checkpoint is not active")
+            if run_state.progress.updates != self.state.updates_trained:
+                raise TrainerBridgeError("external resume progress disagrees with the accelerate state")
+            if self.state.microbatches_in_epoch == 0:
+                updates = self.state.updates_trained
+                is_boundary = updates == 0 or updates % bridge.campaign.updates_per_complete_epoch == 0
+                if is_boundary and updates <= bridge.campaign.max_updates:
+                    bridge.publish_boundary(checkpoint_path)
+                bridge.observe_selection()
+            self.state.stop_reason = None
+
+        if not resumed or self.state.updates_trained == 0:
+            if not bridge.has_published_boundary(0):
+                self._external_publish_generation(0)
+            decision = bridge.await_epoch_zero()
+            if isinstance(decision, SelectionFailed | AcceptEarlyStop):
+                self._external_terminal_decision(decision)
+                return
+
+        if self.state.updates_trained >= max_steps:
+            if not bridge.has_published_boundary(max_steps):
+                self._external_publish_generation(max_steps)
+            decision = bridge.await_final_result(max_steps)
+            if isinstance(decision, SelectionFailed):
+                self._external_terminal_decision(decision)
+                return
+            self._external_terminal_generation(max_steps, completion=MaxUpdatesReached())
+            return
+
+        resume_mid_epoch = resumed and self.state.microbatches_in_epoch > 0
+        epochs = itertools.count(self.state.epochs_trained + 1)
+        for epoch in epochs:
+            if resume_mid_epoch:
+                decision = bridge.observe_selection()
+            else:
+                decision = bridge.await_epoch_start(epoch)
+            if isinstance(decision, SelectionFailed | AcceptEarlyStop):
+                self._external_terminal_decision(decision)
+                return
+            resume_mid_epoch = False
+
+            logger.info(f"{'=' * 9} Epoch {epoch} out of {max_epochs} {'=' * 9}")
+            logger.info("Begin training...")
+            self.set_models_to_train_mode()
+            if self.freeze_wavlm:
+                self.unwrap_model.wavlm_model.eval()
+
+            training_epoch_output = []
+            epoch_dataloader, resume_microbatches = self._prepare_epoch_dataloader(train_dataloader, steps_per_epoch)
+            dataloader_bar = tqdm(
+                epoch_dataloader,
+                desc="",
+                dynamic_ncols=True,
+                bar_format="{l_bar}{r_bar}",
+                colour="green",
+                disable=not self.accelerator.is_local_main_process,
+                position=0,
+                leave=True,
+            )
+            self._install_stop_signals()
+            terminal_decision: SelectionFailed | AcceptEarlyStop | None = None
+            hit_max_updates = False
+            paused = False
+            for batch_idx, batch in enumerate(dataloader_bar, start=resume_microbatches):
+                with self.accelerator.accumulate(self.model):
+                    loss_dict = self.training_step(batch, batch_idx)
+                    training_epoch_output.append(loss_dict)
+                    optimizer_updated = (
+                        bool(self.accelerator.sync_gradients) and not self.accelerator.optimizer_step_was_skipped
+                    )
+                self.state.steps_trained += 1
+                self.state.microbatches_in_epoch += 1
+                run_hooks = getattr(self, "run_hooks", None)
+                if optimizer_updated:
+                    self.state.updates_trained = getattr(self.state, "updates_trained", 0) + 1
+                    if run_hooks is not None:
+                        weight = run_hooks.example_loss_weight(batch)
+                        run_hooks.acknowledge_update(
+                            batch,
+                            optimizer_updated=True,
+                            loss_weight=weight,
+                            valid="Loss" in loss_dict,
+                        )
+                        self.state.recipe_state = run_hooks.state_dict()
+                    if self.warmup_steps > 0:
+                        self.lr_scheduler_step()
+                    if self.use_one_cycle_lr:
+                        self.lr_one_cycle_scheduler_small.step()
+                        self.lr_one_cycle_scheduler_big.step()
+
+                    observed = bridge.observe_selection()
+                    if isinstance(observed, SelectionFailed):
+                        terminal_decision = observed
+                        break
+                    if self.state.updates_trained >= max_steps:
+                        hit_max_updates = True
+                        break
+                    if isinstance(observed, AcceptEarlyStop):
+                        terminal_decision = observed
+                        break
+                    if self._stop_signal is not None:
+                        paused = True
+                        self.state.stop_reason = self._stop_signal
+                        break
+                elif run_hooks is not None:
+                    run_hooks.acknowledge_update(
+                        batch,
+                        optimizer_updated=False,
+                        loss_weight=run_hooks.example_loss_weight(batch),
+                        valid=False,
+                    )
+
+            epoch_complete = self.state.microbatches_in_epoch >= steps_per_epoch
+            if not epoch_complete and not hit_max_updates and not paused and terminal_decision is None:
+                raise TrainerBridgeError("external training epoch ended before its dataloader boundary")
+            if epoch_complete:
+                self.state.epochs_trained += 1
+                self.state.microbatches_in_epoch = 0
+                data_generator = self._train_data_generator(train_dataloader)
+                self.state.epoch_data_rng_state = None if data_generator is None else data_generator.get_state()
+                self.training_epoch_end(training_epoch_output)
+
+            if paused:
+                if epoch_complete:
+                    if self.state.updates_trained % bridge.campaign.updates_per_complete_epoch != 0:
+                        raise TrainerBridgeError("external complete epoch does not match its campaign slot")
+                    self._external_publish_generation(self.state.updates_trained)
+                else:
+                    self._save_external_generation(updates=self.state.updates_trained)
+                    self.accelerator.wait_for_everyone()
+                return
+
+            if terminal_decision is not None:
+                if epoch_complete:
+                    if self.state.updates_trained % bridge.campaign.updates_per_complete_epoch != 0:
+                        raise TrainerBridgeError("external complete epoch does not match its campaign slot")
+                    self._external_publish_generation(self.state.updates_trained)
+                self._external_terminal_decision(terminal_decision)
+                return
+
+            if hit_max_updates:
+                if not bridge.has_published_boundary(max_steps):
+                    self._external_publish_generation(max_steps)
+                decision = bridge.await_final_result(max_steps)
+                if isinstance(decision, SelectionFailed):
+                    self._external_terminal_decision(decision)
+                    return
+                self._external_terminal_generation(max_steps, completion=MaxUpdatesReached())
+                return
+
+            if self.state.updates_trained % bridge.campaign.updates_per_complete_epoch != 0:
+                raise TrainerBridgeError("external complete epoch does not match its campaign slot")
+            self._external_publish_generation(self.state.updates_trained)
+            observed = bridge.observe_selection()
+            if isinstance(observed, SelectionFailed | AcceptEarlyStop):
+                self._external_terminal_decision(observed)
+                return
+
+        raise TrainerBridgeError("external training exited without a terminal campaign outcome")
+
     def train(self, train_dataloader: DataLoader, validation_dataloader):
         """Train loop entry point.
 
@@ -723,6 +1130,11 @@ class Trainer:
                         "loss": loss,
                     }
         """
+        from recipes.speakrs.large.validation.config import ExternalValidationConfig
+
+        if isinstance(getattr(self, "validation_config", None), ExternalValidationConfig):
+            return self._train_external(train_dataloader)
+
         early_stop_mark = torch.zeros(1, device=self.device)
 
         # Setting up training control variables

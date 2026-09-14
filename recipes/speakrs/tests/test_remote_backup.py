@@ -105,6 +105,65 @@ def test_remote_script_filters_complete_generations_by_launch_id(tmp_path: Path)
     assert json.loads(result.stdout)["generation"] == current.name
 
 
+def test_remote_script_orders_later_same_update_generation_sequence(tmp_path: Path) -> None:
+    first = _checkpoint(tmp_path, 20, "current-launch")
+    first = first.rename(tmp_path / "update_00000020_generation_00000001")
+    second = _checkpoint(tmp_path, 20, "current-launch")
+    second = second.rename(tmp_path / "update_00000020_generation_00000002")
+
+    result = subprocess.run(
+        [sys.executable, "-", str(tmp_path), "list", "-", "current-launch"],
+        input=remote_backup.REMOTE_CHECKPOINT_SCRIPT,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert json.loads(result.stdout)["generation"] == second.name
+
+
+def test_remote_script_reads_legacy_v1_only_for_update_only_names(tmp_path: Path) -> None:
+    payload = tmp_path / "update_00000020"
+    payload.mkdir()
+    (payload / "progress.json").write_text(
+        json.dumps({"updates_trained": 20, "launch_id": "current-launch"}), encoding="utf-8"
+    )
+    files = {path.name: path.stat().st_size for path in payload.iterdir()}
+    (payload / ".files.json").write_text(json.dumps({"version": 1, "files": files}), encoding="utf-8")
+    (payload / ".complete").write_text("complete\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, "-", str(tmp_path), "list", "-", "current-launch"],
+        input=remote_backup.REMOTE_CHECKPOINT_SCRIPT,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert json.loads(result.stdout)["generation"] == payload.name
+
+
+def test_remote_script_rejects_v1_manifest_for_canonical_generation(tmp_path: Path) -> None:
+    payload = tmp_path / "update_00000020_generation_00000001"
+    payload.mkdir()
+    (payload / "progress.json").write_text(
+        json.dumps({"updates_trained": 20, "launch_id": "current-launch"}), encoding="utf-8"
+    )
+    files = {path.name: path.stat().st_size for path in payload.iterdir()}
+    (payload / ".files.json").write_text(json.dumps({"version": 1, "files": files}), encoding="utf-8")
+    (payload / ".complete").write_text("complete\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, "-", str(tmp_path), "list", "-", "current-launch"],
+        input=remote_backup.REMOTE_CHECKPOINT_SCRIPT,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert json.loads(result.stdout)["generation"] is None
+
+
 def test_ssh_list_uses_a_nonempty_generation_sentinel(tmp_path: Path, monkeypatch) -> None:
     launch = _launch(tmp_path / "worker", tmp_path / "trusted")
 

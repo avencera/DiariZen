@@ -1,0 +1,39 @@
+{
+  "schema": "diarizen-validation-evaluator-profile-v1",
+  "profile_id": "diarizen-validation-rtx-5060-ti",
+  "host_profile": {
+    "schema": "speakrs-evaluator-capability-profile-v1",
+    "accepted_gpu_names": ["RTX 5060 Ti"],
+    "minimum_gpu_memory_bytes": 17179869184,
+    "minimum_cuda_version": "12.8",
+    "minimum_system_ram_bytes": 34359738368,
+    "minimum_cpu_cores": 4,
+    "minimum_free_disk_bytes": 34359738368
+  },
+  "capacity_limit": 1,
+  "network_policy": "egress",
+  "download_egress": true,
+  "reusable_storage_credentials": false,
+  "github_credentials": false,
+  "registry_push_credentials": false,
+  "artifact_issuer_credentials": false,
+  "capabilities": {
+    "cancellation": "cooperative",
+    "max_payload_bytes": 1048576,
+    "max_result_bytes": 65536,
+    "progress": null,
+    "proof_schemas": [1],
+    "protocol_versions": [3],
+    "request_schemas": [1],
+    "result_schemas": [1],
+    "resume": "unit_boundary",
+    "workload_family": "diarizen-validation"
+  },
+  "capability_identity": {
+    "protocol_version": 3,
+    "workload_family": "diarizen-validation",
+    "request_schema": 1,
+    "result_schema": 1,
+    "proof_schema": 1
+  }
+}

@@ -17,7 +17,24 @@ from .controller import scrubbed_worker_environment
 from .errors import RuntimeGateError
 from .hashing import sha256_file
 from .jsonio import read_json, write_json
+from .recovery import RecoveryGeneration, is_generation_dir, parse_generation_name
 from .training_admission import DESTROY_REQUEST_RESERVE_SECONDS, parse_launch_lock, verify_bundle_contents
+from .validation.config import (
+    ExternalValidationConfig,
+    InlineValidationConfig,
+    ValidationConfigError,
+    parse_validation_config,
+)
+from .validation.contracts import (
+    AcceptedEarlyStop,
+    CompletedTrainingRun,
+    FailedTrainingRun,
+    MaxUpdatesReached,
+    TrainingFailureKind,
+    TrainingRunStateValue,
+    ValidationContractError,
+    training_run_state_from_dict,
+)
 
 
 CHECKPOINT_SHUTDOWN_SECONDS = 900
@@ -35,6 +52,10 @@ VAST_API_KEY_PATH = Path("/root/.vast_api_key")
 EXTERNAL_GUARD_STATUS_SCHEMA = "speakrs-vast-rental-guard-status-v1"
 EXTERNAL_GUARD_PROOF_MAX_AGE_SECONDS = 120.0
 EXTERNAL_GUARD_PROOF_CLOCK_SKEW_SECONDS = 5.0
+SUPERVISOR_COMPLETED_MAX_UPDATES = "completed_max_updates"
+SUPERVISOR_COMPLETED_EARLY_STOP = "completed_early_stop"
+SUPERVISOR_FAILED_VALIDATION = "failed_validation"
+SUPERVISOR_EXITED_INCOMPLETE = "exited_incomplete"
 
 
 VAST_RENTAL_WATCHDOG_SCRIPT = r"""
@@ -524,20 +545,105 @@ print(json.dumps({
     return launch
 
 
-def _latest_progress(checkpoint_root: Path, launch_id: str | None = None) -> dict[str, object] | None:
+def _generation_identity(path: Path) -> RecoveryGeneration | None:
+    try:
+        return parse_generation_name(path.name)
+    except ValueError:
+        return None
+
+
+def _progress_candidates(checkpoint_root: Path) -> list[Path]:
+    if not checkpoint_root.is_dir():
+        return []
+    candidates = [path for path in checkpoint_root.iterdir() if path.is_dir() and is_generation_dir(path)]
+
+    def sort_key(path: Path) -> tuple[int, int, int, str]:
+        identity = _generation_identity(path)
+        if identity is not None:
+            return identity.updates, identity.sequence, 0, path.name
+        return int(path.name[7:]), 0, -1, path.name
+
+    return sorted(candidates, key=sort_key, reverse=True)
+
+
+def _latest_progress(
+    checkpoint_root: Path,
+    launch_id: str | None = None,
+) -> dict[str, object] | None:
+    """Return the newest complete checkpoint using immutable generation order."""
+
     from diarizen.trainer_utils import checkpoint_directory_is_complete
 
-    candidates = sorted(checkpoint_root.glob("update_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]"))
-    for candidate in reversed(candidates):
-        if not checkpoint_directory_is_complete(candidate, REQUIRED_RECOVERY_FILES):
+    for candidate in _progress_candidates(checkpoint_root):
+        identity = _generation_identity(candidate)
+        if not checkpoint_directory_is_complete(
+            candidate,
+            REQUIRED_RECOVERY_FILES,
+            require_hashed_manifest=identity is not None,
+        ):
             continue
         try:
             progress = json.loads((candidate / "progress.json").read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError):
             continue
-        if isinstance(progress, dict) and (launch_id is None or progress.get("launch_id") == launch_id):
-            return {"generation": candidate.name, **progress}
+        if not isinstance(progress, dict) or (launch_id is not None and progress.get("launch_id") != launch_id):
+            continue
+        updates = progress.get("updates_trained")
+        if isinstance(updates, bool) or not isinstance(updates, int) or updates < 0:
+            continue
+        if identity is not None and identity.updates != updates:
+            continue
+        if identity is None and int(candidate.name[7:]) != updates:
+            continue
+        return {"generation": candidate.name, **progress}
     return None
+
+
+def _typed_training_state(progress: Mapping[str, object]) -> tuple[TrainingRunStateValue | None, bool]:
+    """Parse the typed run state and distinguish absent from invalid state."""
+
+    raw = progress.get("training_run_state")
+    if raw is None:
+        return None, False
+    try:
+        return training_run_state_from_dict(raw), True
+    except (TypeError, ValueError, ValidationContractError):
+        return None, False
+
+
+def _external_terminal_status(progress: Mapping[str, object] | None) -> tuple[str | None, bool, bool]:
+    """Return terminal status, state validity, and terminality for external progress."""
+
+    if progress is None:
+        return None, False, False
+    state, valid = _typed_training_state(progress)
+    if not valid or state is None:
+        return None, valid, False
+    if isinstance(state, CompletedTrainingRun):
+        if isinstance(state.completion, MaxUpdatesReached):
+            return SUPERVISOR_COMPLETED_MAX_UPDATES, True, True
+        if isinstance(state.completion, AcceptedEarlyStop):
+            return SUPERVISOR_COMPLETED_EARLY_STOP, True, True
+        return None, False, True
+    if isinstance(state, FailedTrainingRun):
+        if state.failure.kind is TrainingFailureKind.SELECTION_FAILURE:
+            return SUPERVISOR_FAILED_VALIDATION, True, True
+        return None, True, True
+    return None, True, False
+
+
+def _launch_validation_config(launch: Mapping[str, Any]) -> InlineValidationConfig | ExternalValidationConfig:
+    """Parse the immutable validation configuration frozen during admission."""
+
+    if "validation_config" not in launch:
+        return InlineValidationConfig()
+    raw_config = launch["validation_config"]
+    if raw_config is None:
+        raise RuntimeGateError("launch validation configuration is invalid")
+    try:
+        return parse_validation_config(raw_config)
+    except (TypeError, ValueError, ValidationConfigError) as error:
+        raise RuntimeGateError("launch validation configuration is invalid") from error
 
 
 def _signal_process_group(process: subprocess.Popen, signum: signal.Signals) -> None:
@@ -595,6 +701,44 @@ def supervise_training(
         raise RuntimeGateError("external Vast rental guard proof path is invalid") from error
     external_guard_proof = _verify_external_guard_proof(launch, proof_path)
     paths = launch["worker_paths"]
+    checkpoint_root = Path(paths["checkpoint_root"])
+    experiment_root = Path(paths["experiment_root"])
+    launch_id = str(launch["launch_id"])
+    attempt_id = str(launch["attempt_id"])
+    validation_config = _launch_validation_config(launch)
+    external_mode = isinstance(validation_config, ExternalValidationConfig)
+    resume_progress = _latest_progress(checkpoint_root, launch_id)
+    if external_mode and resume_progress is not None:
+        terminal_status, state_valid, is_terminal = _external_terminal_status(resume_progress)
+    else:
+        terminal_status, state_valid, is_terminal = None, True, False
+    if resume:
+        if resume_progress is None:
+            raise RuntimeGateError("resume has no complete checkpoint for this launch")
+        if external_mode and (is_terminal or not state_valid):
+            ended_at = datetime.now(timezone.utc).isoformat()
+            result = {
+                "schema": "speakrs-training-supervisor-status-v1",
+                "launch_id": launch_id,
+                "attempt_id": attempt_id,
+                "state": terminal_status or SUPERVISOR_EXITED_INCOMPLETE,
+                "return_code": 1 if terminal_status == SUPERVISOR_FAILED_VALIDATION else 0,
+                "started_at": ended_at,
+                "ended_at": ended_at,
+                "stop_reason": None,
+                "checkpoint": resume_progress,
+                "resume": True,
+                "external_guard_proof": external_guard_proof,
+                "rental_watchdog": None,
+                "optimizer_updates": 0,
+                "slot_republished": False,
+                "work_performed": False,
+                "training_state_valid": state_valid,
+            }
+            write_json(status_path, result)
+            return result
+    elif experiment_root.exists() and any(experiment_root.iterdir()):
+        raise RuntimeGateError("fresh launch experiment directory is not empty")
     command = [
         sys.executable,
         "-m",
@@ -611,15 +755,6 @@ def supervise_training(
     ]
     if resume:
         command.append("--resume")
-    checkpoint_root = Path(paths["checkpoint_root"])
-    experiment_root = Path(paths["experiment_root"])
-    launch_id = str(launch["launch_id"])
-    attempt_id = str(launch["attempt_id"])
-    if resume:
-        if _latest_progress(checkpoint_root, launch_id) is None:
-            raise RuntimeGateError("resume has no complete checkpoint for this launch")
-    elif experiment_root.exists() and any(experiment_root.iterdir()):
-        raise RuntimeGateError("fresh launch experiment directory is not empty")
     watchdog = _arm_rental_watchdog(launch, launch_path)
     environment = _worker_environment(launch)
     started_at = datetime.now(timezone.utc).isoformat()
@@ -685,21 +820,29 @@ def supervise_training(
             signal.signal(signum, handler)
     assert process is not None
     progress = _latest_progress(checkpoint_root, launch_id)
-    updates = int(progress.get("updates_trained", 0)) if progress else 0
-    if updates >= int(launch["max_updates"]):
-        state = "completed"
-    elif stop_reason is not None and progress is not None:
-        state = "paused"
-    elif return_code != 0:
-        state = "failed"
+    if external_mode:
+        state, state_valid, _ = _external_terminal_status(progress)
+        state = state or SUPERVISOR_EXITED_INCOMPLETE
     else:
-        state = "exited-incomplete"
+        updates = int(progress.get("updates_trained", 0)) if progress else 0
+        if updates >= int(launch["max_updates"]):
+            state = "completed"
+        elif stop_reason is not None and progress is not None:
+            state = "paused"
+        elif return_code != 0:
+            state = "failed"
+        else:
+            state = "exited-incomplete"
+        state_valid = True
+    reported_return_code = return_code
+    if state == SUPERVISOR_FAILED_VALIDATION and reported_return_code == 0:
+        reported_return_code = 1
     result = {
         "schema": "speakrs-training-supervisor-status-v1",
         "launch_id": launch["launch_id"],
         "attempt_id": launch["attempt_id"],
         "state": state,
-        "return_code": return_code,
+        "return_code": reported_return_code,
         "started_at": started_at,
         "ended_at": datetime.now(timezone.utc).isoformat(),
         "stop_reason": stop_reason,
@@ -707,6 +850,9 @@ def supervise_training(
         "resume": resume,
         "external_guard_proof": external_guard_proof,
         "rental_watchdog": watchdog,
+        "slot_republished": False,
+        "work_performed": True,
+        "training_state_valid": state_valid,
     }
     write_json(status_path, result)
     return result

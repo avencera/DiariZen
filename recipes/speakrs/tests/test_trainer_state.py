@@ -212,8 +212,10 @@ class TrainerStateTest(unittest.TestCase):
         trainer._write_validation_metrics = lambda values: None
 
         with (
-            patch.object(module, "permutate", side_effect=lambda unused_prediction, expected: (expected, None)),
-            patch.object(module, "nll_loss", return_value=torch.tensor(0.0)),
+            patch(
+                "diarizen.validation_step.permutate", side_effect=lambda unused_prediction, expected: (expected, None)
+            ),
+            patch("diarizen.validation_step.nll_loss", return_value=torch.tensor(0.0)),
         ):
             outputs = [
                 trainer.validation_step({"xs": torch.tensor([[[1.0, 0.0]]]), "ts": torch.tensor([[[1.0, 0.0]]])}, 0),
