@@ -1,0 +1,273 @@
+:root {
+  color-scheme: dark;
+  --void: #0e1116;
+  --steel: #171c25;
+  --line: #2a3344;
+  --text: #e8eef8;
+  --mute: #8b97ab;
+  --led: #3fd0c2;
+  --ch-a: #6ea8ff;
+  --ch-b: #ff8a6b;
+  --danger: #ff5d6c;
+  --focus: #f4d35e;
+  font-family: "Avenir Next", "Segoe UI", ui-sans-serif, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background: var(--void);
+  color: var(--text);
+}
+
+.skip-link {
+  position: absolute;
+  left: -999px;
+}
+
+.skip-link:focus {
+  left: 1rem;
+  top: 1rem;
+  background: var(--led);
+  color: #081014;
+  padding: 0.4rem 0.7rem;
+}
+
+.mast {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: baseline;
+  padding: 0.9rem 1.2rem 0.4rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.mast-title {
+  display: flex;
+  gap: 0.9rem;
+  align-items: baseline;
+}
+
+.mast-title strong {
+  color: var(--led);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.mast-meta,
+.progress-split {
+  color: var(--mute);
+  font-variant-numeric: tabular-nums;
+}
+
+.mast-meta {
+  display: flex;
+  gap: 0.8rem;
+  flex-wrap: wrap;
+}
+
+.progress-split {
+  margin: 0;
+  padding: 0.35rem 1.2rem 0.7rem;
+  font-size: 0.92rem;
+}
+
+.banner {
+  margin: 0;
+  padding: 0.55rem 1.2rem;
+  background: #3a1d24;
+  color: var(--text);
+  border-bottom: 1px solid var(--danger);
+}
+
+#workspace {
+  display: grid;
+  gap: 0.9rem;
+  padding: 0.8rem 1.2rem 2rem;
+}
+
+.desk,
+.transcript,
+.actions,
+.defects,
+.edit,
+.modal {
+  background: var(--steel);
+  border: 1px solid var(--line);
+  padding: 0.85rem;
+}
+
+.transport {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  align-items: center;
+  margin-bottom: 0.7rem;
+}
+
+#waveform {
+  width: 100%;
+  height: 280px;
+  display: block;
+  background: #0a0d12;
+  border: 1px solid var(--line);
+  cursor: crosshair;
+}
+
+.clock {
+  font-variant-numeric: tabular-nums;
+  min-width: 8rem;
+}
+
+.play {
+  min-width: 5.5rem;
+  background: var(--led);
+  color: #081014;
+  border-color: var(--led);
+  font-weight: 700;
+}
+
+.solo.is-on {
+  border-color: var(--led);
+  color: var(--led);
+}
+
+.ch-a {
+  color: var(--ch-a);
+}
+
+.ch-b {
+  color: var(--ch-b);
+}
+
+button,
+select,
+textarea,
+input {
+  font: inherit;
+  color: var(--text);
+  background: #121722;
+  border: 1px solid var(--line);
+  padding: 0.42rem 0.7rem;
+}
+
+button:focus,
+select:focus,
+textarea:focus,
+input:focus,
+.word:focus {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--led);
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+h2 {
+  margin: 0 0 0.6rem;
+  font-size: 1rem;
+  font-weight: 650;
+}
+
+h2 small {
+  color: var(--mute);
+  font-weight: 500;
+  margin-left: 0.4rem;
+}
+
+.word-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.28rem;
+  min-height: 4rem;
+}
+
+.word {
+  border: 1px solid var(--line);
+  padding: 0.12rem 0.38rem;
+  cursor: pointer;
+  background: transparent;
+}
+
+.word.speaker_a {
+  color: var(--ch-a);
+}
+
+.word.speaker_b {
+  color: var(--ch-b);
+}
+
+.word.active {
+  background: #243044;
+}
+
+.actions,
+.action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  align-items: center;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.defect-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(8rem, 1fr));
+  gap: 0.6rem;
+  margin-bottom: 0.6rem;
+}
+
+.interval {
+  display: grid;
+  grid-template-columns: 7rem 5rem 5rem auto;
+  gap: 0.4rem;
+  margin-bottom: 0.4rem;
+  align-items: center;
+}
+
+.modal[hidden] {
+  display: none;
+}
+
+.audio-status {
+  min-height: 1.2rem;
+  margin: 0.45rem 0 0;
+  color: var(--mute);
+  font-size: 0.92rem;
+}
+
+.audio-status.is-bad {
+  color: var(--danger);
+}
+
+#save-status.failed {
+  color: var(--danger);
+}
+
+#save-status.saved {
+  color: var(--led);
+}
+
+@media (max-width: 800px) {
+  .defect-grid,
+  .interval {
+    grid-template-columns: 1fr 1fr;
+  }
+  .mast {
+    flex-direction: column;
+  }
+}
