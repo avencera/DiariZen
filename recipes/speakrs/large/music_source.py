@@ -63,6 +63,16 @@ def _fail(message: str, details: Mapping[str, Any] | None = None) -> Preparation
     return PreparationError(message, dict(details or {}))
 
 
+class InvalidAudioError(PreparationError):
+    """An individual source track that cannot enter the canonical pool."""
+
+
+def _audio_fail(message: str, details: Mapping[str, Any] | None = None) -> InvalidAudioError:
+    """Build an error that permits rejection of one invalid audio track."""
+
+    return InvalidAudioError(message, dict(details or {}))
+
+
 def _safe_component(value: str, label: str) -> str:
     """Validate one path component that this recipe owns."""
 
@@ -83,8 +93,7 @@ def safe_archive_path(name: str) -> PurePosixPath:
     path = PurePosixPath(name)
     if path.is_absolute() or ".." in path.parts or "." in path.parts:
         raise _fail("MUSAN archive member path contains traversal", {"path": name})
-    # Tar directory names conventionally have a trailing slash, which
-    # PurePosixPath removes.  Empty components elsewhere are not accepted.
+    # permit conventional directory suffixes without admitting noncanonical file paths
     if any(not part for part in path.parts):
         raise _fail("MUSAN archive member path contains an empty component", {"path": name})
     if name.endswith("/"):
@@ -236,6 +245,7 @@ class PreparationConfig:
     max_metadata_bytes: int = DEFAULT_MAX_METADATA_BYTES
     http_timeout_seconds: int = DEFAULT_HTTP_TIMEOUT_SECONDS
     split_seed: str = "musan-instrumental-music-v1"
+    metadata_dir: Path | None = None
     log_path: Path | None = None
 
     def __post_init__(self) -> None:
@@ -248,6 +258,11 @@ class PreparationConfig:
             raise _fail("music output must use a visible directory name", {"output": str(output)})
         if output.exists() and output.is_symlink():
             raise _fail("music output must not be a symlink", {"output": str(output)})
+        if self.metadata_dir is not None:
+            metadata_dir = Path(self.metadata_dir).expanduser().resolve()
+            if metadata_dir.is_symlink() or not metadata_dir.is_dir():
+                raise _fail("bootstrap metadata directory is unavailable or unsafe", {"path": str(metadata_dir)})
+            object.__setattr__(self, "metadata_dir", metadata_dir)
         if not isinstance(self.source_url, str) or not self.source_url.startswith("https://"):
             raise _fail("MUSAN source URL must use HTTPS")
         if not isinstance(self.checksum_url, str) or not self.checksum_url.startswith("https://"):
@@ -516,7 +531,7 @@ def _inspect_and_encode(source: Path, destination: Path, block_frames: int = 64 
     try:
         source_info = sf.info(source.as_posix())
     except (OSError, RuntimeError, TypeError) as error:
-        raise _fail("source WAV cannot be decoded", {"path": str(source), "error": str(error)}) from error
+        raise _audio_fail("source WAV cannot be decoded", {"path": str(source), "error": str(error)}) from error
     if (
         source_info.format.upper() != "WAV"
         or int(source_info.samplerate) != TARGET_SAMPLE_RATE
@@ -524,7 +539,7 @@ def _inspect_and_encode(source: Path, destination: Path, block_frames: int = 64 
         or int(source_info.frames) <= 0
         or str(source_info.subtype).upper() != "PCM_16"
     ):
-        raise _fail(
+        raise _audio_fail(
             "source audio does not meet the 16 kHz mono PCM-16 WAV contract",
             {
                 "path": str(source),
@@ -557,23 +572,27 @@ def _inspect_and_encode(source: Path, destination: Path, block_frames: int = 64 
                 if samples.size == 0:
                     break
                 if samples.shape[1] != TARGET_CHANNELS or not np.isfinite(samples.astype(np.float64)).all():
-                    raise _fail("source audio contains invalid decoded samples", {"path": str(source)})
+                    raise _audio_fail("source audio contains invalid decoded samples", {"path": str(source)})
                 source_digest.update(np.asarray(samples, dtype="<i2").tobytes(order="C"))
                 values = samples.astype(np.float64, copy=False)
                 sample_count += int(samples.shape[0])
                 sum_squares += float(np.square(values).sum())
                 peak_abs = max(peak_abs, int(np.abs(samples).max()))
                 output_file.write(samples)
-    except PreparationError:
+    except InvalidAudioError:
         raise
     except (OSError, RuntimeError, TypeError) as error:
-        raise _fail("source audio failed during PCM decoding", {"path": str(source), "error": str(error)}) from error
+        raise _audio_fail(
+            "source audio failed during PCM decoding", {"path": str(source), "error": str(error)}
+        ) from error
 
     if sample_count != int(source_info.frames):
-        raise _fail(
+        raise _audio_fail(
             "source WAV decoded frame count differs from its header",
             {"expected": source_info.frames, "actual": sample_count},
         )
+    if sum_squares <= 0.0:
+        raise _audio_fail("music track has zero decoded energy", {"path": str(source)})
     source_facts = PcmFacts(
         sample_count=sample_count,
         sample_rate=TARGET_SAMPLE_RATE,
@@ -755,8 +774,8 @@ def _stage_audio_member(
     if candidate.exists() or sidecar.exists():
         if candidate.is_symlink() or sidecar.is_symlink():
             raise _fail("staged candidate path is a symlink", {"track_id": track_id})
-        # Existing candidates are resumable only when the incoming member
-        # hash proves the exact same source bytes.
+        # existing candidates are resumable only when the incoming member
+        # hash proves the exact same source bytes
         incoming_digest = hashlib.sha256()
         received = 0
         while True:
@@ -899,7 +918,8 @@ def _license_name(line: str) -> tuple[str | None, bool]:
         return f"{name} {version}" if version else name, False
     upper = line.upper()
     if "ATTRIBUTION" in upper and ("LICENSE" in upper or "LICENCE" in upper):
-        version_match = re.search(r"\b\d+(?:\.\d+)?\b", line)
+        attribution_text = line[upper.index("ATTRIBUTION") :]
+        version_match = re.search(r"\b\d+(?:\.\d+)?\b", attribution_text)
         version = version_match.group(0) if version_match else None
         name = "CC BY-SA" if "SHARE" in upper and "ALIKE" in upper else "CC BY"
         return f"{name} {version}" if version else name, False
@@ -968,10 +988,58 @@ def parse_license_records(
                 result[track_id] = None
             else:
                 result[track_id] = LicenseRecord(assigned.name, assigned.url, assigned.text, member)
-    # IDs omitted from the publisher file remain explicitly unresolved.
+    # omitted IDs remain unresolved rather than inheriting an unrelated grant
     for track_id in allowed:
         result.setdefault(track_id, None)
     return result
+
+
+def _eligible_tracks_from_metadata(
+    source: str,
+    metadata: Mapping[str, str],
+    members: Mapping[str, str],
+) -> set[str]:
+    """Return track IDs that have no vocals and one explicit usable grant."""
+
+    annotations = parse_annotations(metadata["ANNOTATIONS"], source=source, member=members["ANNOTATIONS"])
+    licenses = parse_license_records(
+        metadata["LICENSE"],
+        source=source,
+        member=members["LICENSE"],
+        track_ids=annotations,
+    )
+    return {
+        track_id
+        for track_id, annotation in annotations.items()
+        if annotation.vocals == "N" and _license_is_usable(licenses.get(track_id))
+    }
+
+
+def _load_bootstrap_metadata(config: PreparationConfig) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, str]]]:
+    """Load bounded publisher metadata used only to filter earlier archive audio."""
+
+    if config.metadata_dir is None:
+        return {}, {}
+    text: dict[str, dict[str, str]] = {}
+    members: dict[str, dict[str, str]] = {}
+    pattern = re.compile(r"^([A-Za-z0-9.-]+)_(ANNOTATIONS|LICENSE|README)$")
+    for path in sorted(config.metadata_dir.iterdir(), key=lambda item: item.name):
+        match = pattern.fullmatch(path.name)
+        if match is None:
+            continue
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > config.max_metadata_bytes:
+            raise _fail("bootstrap metadata file is unavailable, unsafe, or too large", {"path": str(path)})
+        source, leaf = match.groups()
+        try:
+            payload = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise _fail("bootstrap metadata file is unreadable", {"path": str(path)}) from error
+        text.setdefault(source, {})[leaf] = payload
+        members.setdefault(source, {})[leaf] = f"musan/music/{source}/{leaf}"
+    for source, source_text in text.items():
+        if "ANNOTATIONS" not in source_text or "LICENSE" not in source_text:
+            raise _fail("bootstrap source lacks ANNOTATIONS or LICENSE", {"source": source})
+    return text, members
 
 
 def _license_is_usable(record: LicenseRecord | None) -> bool:
@@ -1254,10 +1322,7 @@ def _build_manifests(
     collections = []
     for source in collection_sources:
         source_tracks = [(metadata, licence) for metadata, licence, _ in tracks if metadata.source == source]
-        licenses = {
-            (licence.name, licence.url, licence.publisher_member)
-            for _, licence in source_tracks
-        }
+        licenses = {(licence.name, licence.url, licence.publisher_member) for _, licence in source_tracks}
         collections.append(
             {
                 "source": source,
@@ -1266,7 +1331,9 @@ def _build_manifests(
                 "license_mode": "per_track",
                 "licenses": [
                     {"name": name, "url": url, "publisher_member": publisher_member}
-                    for name, url, publisher_member in sorted(licenses, key=lambda value: tuple(item or "" for item in value))
+                    for name, url, publisher_member in sorted(
+                        licenses, key=lambda value: tuple(item or "" for item in value)
+                    )
                 ],
             }
         )
@@ -1328,8 +1395,7 @@ def _publish(
                 raise _fail("published source metadata conflicts with the selected source", {"path": str(destination)})
         else:
             _atomic_bytes(destination, source_path.read_bytes())
-    # Build the full manifest before either view.  The file itself is the
-    # binding identity used by the two split-scoped consumers.
+    # build the full manifest first so both split views bind the same identity
     full_path = output / "manifest.json"
     _atomic_json(full_path, full)
     full_digest = sha256_file(full_path)
@@ -1414,7 +1480,11 @@ def prepare_stream(
     rejected: list[dict[str, Any]] = []
     metadata_sources: dict[str, dict[str, str]] = {}
     metadata_text: dict[str, dict[str, str]] = {}
-    eligible_by_source: dict[str, set[str]] = {}
+    bootstrap_text, bootstrap_members = _load_bootstrap_metadata(config)
+    eligible_by_source = {
+        source: _eligible_tracks_from_metadata(source, source_text, bootstrap_members[source])
+        for source, source_text in bootstrap_text.items()
+    }
     started = time.monotonic()
     try:
         with tarfile.open(fileobj=archive_hash, mode="r|gz", bufsize=config.block_bytes) as archive:
@@ -1453,25 +1523,20 @@ def prepare_stream(
                         _atomic_bytes(destination, payload)
                     metadata_sources.setdefault(source, {})[leaf] = member.name
                     try:
-                        metadata_text.setdefault(source, {})[leaf] = payload.decode("utf-8")
+                        decoded = payload.decode("utf-8")
                     except UnicodeDecodeError as error:
                         raise _fail("source metadata member is not UTF-8", {"path": member.name}) from error
+                    bootstrap = bootstrap_text.get(source, {}).get(leaf)
+                    if bootstrap is not None and bootstrap != decoded:
+                        raise _fail("archive metadata differs from bootstrap metadata", {"path": member.name})
+                    metadata_text.setdefault(source, {})[leaf] = decoded
                     source_text = metadata_text[source]
                     if "ANNOTATIONS" in source_text and "LICENSE" in source_text:
-                        annotations = parse_annotations(
-                            source_text["ANNOTATIONS"], source=source, member=metadata_sources[source]["ANNOTATIONS"]
+                        eligible_by_source[source] = _eligible_tracks_from_metadata(
+                            source,
+                            source_text,
+                            metadata_sources[source],
                         )
-                        licenses = parse_license_records(
-                            source_text["LICENSE"],
-                            source=source,
-                            member=metadata_sources[source]["LICENSE"],
-                            track_ids=annotations,
-                        )
-                        eligible_by_source[source] = {
-                            track_id
-                            for track_id, annotation in annotations.items()
-                            if annotation.vocals == "N" and _license_is_usable(licenses.get(track_id))
-                        }
                     log.write("metadata_staged", source=source, member=member.name, bytes=len(payload))
                     continue
                 if path.suffix.lower() != ".wav" or not TRACK_ID_RE.fullmatch(path.stem):
@@ -1493,7 +1558,7 @@ def prepare_stream(
                 with member_stream:
                     try:
                         result = _stage_audio_member(config, source, track_id, member, member_stream, log)
-                    except PreparationError as error:
+                    except InvalidAudioError as error:
                         rejected.append(
                             {
                                 "source": source,
@@ -1661,6 +1726,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     prepare_parser.add_argument("--max-staging-gib", type=float, default=7.0)
     prepare_parser.add_argument("--minimum-free-gib", type=float, default=100.0)
     prepare_parser.add_argument("--block-size-mib", type=float, default=1.0)
+    prepare_parser.add_argument("--metadata-dir", type=Path, default=None)
     prepare_parser.add_argument("--log-file", type=Path, default=None)
     return parser.parse_args(argv)
 
@@ -1681,6 +1747,7 @@ def main(argv: list[str] | None = None) -> int:
         max_staging_bytes=max_staging,
         minimum_free_bytes=minimum_free,
         block_bytes=block_bytes,
+        metadata_dir=args.metadata_dir,
         log_path=args.log_file or _default_log_path(),
     )
     result = prepare(config)
