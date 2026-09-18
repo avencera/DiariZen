@@ -10,7 +10,6 @@ represented in the derivation manifest on the 16 kHz sample clock.
 from __future__ import annotations
 
 import argparse
-import bisect
 import hashlib
 import json
 import math
@@ -47,6 +46,7 @@ MUSIC_MANIFEST_NAME = "training-manifest.json"
 DATASET_VERSION = "music-long-gaps-v1"
 DEFAULT_SEED = 2_026_0914
 DEFAULT_MAX_PARENTS_PER_SOURCE = 10
+MAX_TOTAL_PARENTS = 50
 DEFAULT_MAX_TASK_BYTES = 2 * 1024**3
 DEFAULT_MIN_FREE_BYTES = 100 * 1024**3
 TARGET_MUSIC_RMS_DBFS = -24.0
@@ -437,6 +437,9 @@ def _verify_bundle(bundle_root: Path) -> tuple[Mapping[str, object], list[Parent
         if len(fields) != 2 or fields[0] in wav_rows:
             raise _fail("wav.scp row is malformed or duplicated", line=line_number)
         wav_rows[fields[0]] = fields[1]
+    unknown_wav = sorted(set(wav_rows) - bundle_ids)
+    if unknown_wav:
+        raise _fail("wav.scp contains unknown recordings", unknown_recordings=unknown_wav)
 
     bundle_sha256 = sha256_file(bundle_path)
     source_names: set[str] = set()
@@ -451,6 +454,15 @@ def _verify_bundle(bundle_root: Path) -> tuple[Mapping[str, object], list[Parent
         audio_path = _safe_path(root, audio_relative, "recording audio_path")
         expected_audio = _require_digest(row.get("audio_sha256"), "recording audio_sha256")
         sample_rate, channels, frames = _verify_audio(audio_path, expected_audio, f"recording {parent_id} audio")
+        audio_size = audio_path.stat().st_size
+        declared_audio_size = _safe_int(row.get("audio_size"), "recording audio_size", minimum=1)
+        if declared_audio_size != audio_size:
+            raise _fail(
+                "recording audio size does not match its bundle record",
+                parent_id=parent_id,
+                expected=declared_audio_size,
+                actual=audio_size,
+            )
         if parent_id not in wav_rows:
             raise _fail("recording is missing from wav.scp", parent_id=parent_id)
         scp_path = wav_rows[parent_id]
@@ -472,9 +484,9 @@ def _verify_bundle(bundle_root: Path) -> tuple[Mapping[str, object], list[Parent
         label_dir = root / "labels" / source
         rttm_file = label_dir / f"{rttm_sha256}.rttm"
         uem_file = label_dir / f"{uem_sha256}.uem"
-        if rttm_file.is_file() and sha256_file(rttm_file) != rttm_sha256:
+        if not rttm_file.is_file() or sha256_file(rttm_file) != rttm_sha256:
             raise _fail("recording RTTM object hash mismatch", parent_id=parent_id)
-        if uem_file.is_file() and sha256_file(uem_file) != uem_sha256:
+        if not uem_file.is_file() or sha256_file(uem_file) != uem_sha256:
             raise _fail("recording UEM object hash mismatch", parent_id=parent_id)
         recordings.append(
             ParentRecording(
@@ -489,7 +501,7 @@ def _verify_bundle(bundle_root: Path) -> tuple[Mapping[str, object], list[Parent
                 uem_manifest_sha256=_require_digest(manifests["uem"], "bundle uem hash"),
                 audio_path=audio_path,
                 audio_sha256=expected_audio,
-                audio_size=audio_path.stat().st_size,
+                audio_size=audio_size,
                 rttm_sha256=rttm_sha256,
                 uem_sha256=uem_sha256,
                 sample_rate=sample_rate,
@@ -547,6 +559,14 @@ def load_music_tracks(pool_root: Path) -> tuple[MusicTrack, ...]:
         raise _fail("instrumental pool manifest failed its strict schema checks", path=str(manifest_path)) from error
     tracks: list[MusicTrack] = []
     for track in manifest.eligible_tracks:
+        sample_rate, channels, frames = _verify_audio(track.path, track.sha256, f"music track {track.track_id}")
+        if frames != track.sample_count:
+            raise _fail(
+                "instrumental track frame count differs from its strict manifest",
+                track_id=track.track_id,
+                expected=track.sample_count,
+                actual=frames,
+            )
         item = {
             "track_id": track.track_id,
             "path": track.relative_path,
@@ -572,9 +592,9 @@ def load_music_tracks(pool_root: Path) -> tuple[MusicTrack, ...]:
                 source_path=track.source_member,
                 split=track.split,
                 no_vocals=True,
-                sample_rate=track.sample_rate,
-                channels=track.channels,
-                frames=track.sample_count,
+                sample_rate=sample_rate,
+                channels=channels,
+                frames=frames,
                 manifest_record=dict(item),
             )
         )
@@ -592,20 +612,12 @@ def _speech_frames(
     parent: ParentRecording,
     start_frame: int,
     end_frame: int,
-    label_starts: Sequence[int] | None = None,
 ) -> int:
-    if label_starts is None:
-        label_starts = tuple(label.start_frame for label in parent.labels)
-    first = max(0, bisect.bisect_left(label_starts, start_frame) - 1)
-    last = bisect.bisect_left(label_starts, end_frame)
-    return sum(
-        _intersects(start_frame, end_frame, label.start_frame, label.end_frame) for label in parent.labels[first:last]
-    )
+    return sum(_intersects(start_frame, end_frame, label.start_frame, label.end_frame) for label in parent.labels)
 
 
 def _window_candidates(parent: ParentRecording) -> list[SpeechExcerpt]:
     candidates: set[tuple[int, int]] = set()
-    label_starts = tuple(label.start_frame for label in parent.labels)
     for region in parent.uem:
         length = region.end_frame - region.start_frame
         if length < EXCERPT_MIN_FRAMES:
@@ -636,13 +648,10 @@ def _window_candidates(parent: ParentRecording) -> list[SpeechExcerpt]:
             end = start + target
             if start < region.start_frame or end > region.end_frame:
                 continue
-            speech = _speech_frames(parent, start, end, label_starts)
+            speech = _speech_frames(parent, start, end)
             if speech > 0:
                 candidates.add((start, end))
-    return [
-        SpeechExcerpt(start, end, _speech_frames(parent, start, end, label_starts))
-        for start, end in sorted(candidates)
-    ]
+    return [SpeechExcerpt(start, end, _speech_frames(parent, start, end)) for start, end in sorted(candidates)]
 
 
 def select_speech_excerpts(parent: ParentRecording, *, count: int = 3) -> tuple[SpeechExcerpt, ...]:
@@ -656,11 +665,20 @@ def select_speech_excerpts(parent: ParentRecording, *, count: int = 3) -> tuple[
     selected: list[SpeechExcerpt] = []
     remaining = list(candidates)
     while remaining and len(selected) < count:
+        non_overlapping = [
+            candidate
+            for candidate in remaining
+            if all(
+                candidate.end_frame <= prior.start_frame or candidate.start_frame >= prior.end_frame
+                for prior in selected
+            )
+        ]
+        choices = non_overlapping or remaining
         if not selected:
-            choice = max(remaining, key=lambda item: (item.speech_frames, -item.start_frame))
+            choice = max(choices, key=lambda item: (item.speech_frames, -item.start_frame))
         else:
             choice = max(
-                remaining,
+                choices,
                 key=lambda item: (
                     min(abs(item.start_frame - prior.start_frame) for prior in selected),
                     item.speech_frames,
@@ -758,29 +776,51 @@ def _select_music(
     eligible.sort(key=lambda item: item.track_id)
     track = eligible[_stable_int(seed, parent_id, variant, segment_index) % len(eligible)]
     available = track.frames - duration_frames
-    start = _stable_int(seed, "music-offset", parent_id, variant, segment_index, track.track_id) % (available + 1)
-    end = start + duration_frames
-    try:
-        samples = sf.read(str(track.path), start=start, stop=end, dtype="int16", always_2d=False)[0]
-    except (OSError, RuntimeError) as error:
-        raise _fail("instrumental track excerpt cannot be decoded", track_id=track.track_id) from error
-    if len(samples) != duration_frames:
-        raise _fail("instrumental track excerpt has the wrong frame count", track_id=track.track_id)
-    _rendered, gain_linear, gain_db, source_rms_dbfs, output_rms_dbfs, source_peak = _music_gain(
-        samples, track.track_id
-    )
-    output_peak = float(np.max(np.abs(_rendered.astype(np.float64) / 32768.0)))
-    return MusicSelection(
-        track=track,
-        start_frame=start,
-        end_frame=end,
-        gain_linear=gain_linear,
-        gain_db=gain_db,
-        source_rms_dbfs=source_rms_dbfs,
-        output_rms_dbfs=output_rms_dbfs,
-        source_peak=source_peak,
-        output_peak=output_peak,
-    )
+    preferred = _stable_int(seed, "music-offset", parent_id, variant, segment_index, track.track_id) % (available + 1)
+    span = available + 1
+    step = _stable_int(seed, "music-offset-step", parent_id, variant, segment_index, track.track_id) % span or 1
+    offsets: list[int] = []
+    seen: set[int] = set()
+    for index in range(min(32, span)):
+        offset = (preferred + index * step) % span
+        if offset not in seen:
+            seen.add(offset)
+            offsets.append(offset)
+    for offset in (0, available):
+        if offset not in seen:
+            seen.add(offset)
+            offsets.append(offset)
+    last_error: MusicSequenceError | None = None
+    for start in offsets:
+        end = start + duration_frames
+        try:
+            samples = sf.read(str(track.path), start=start, stop=end, dtype="int16", always_2d=False)[0]
+        except (OSError, RuntimeError, ValueError) as error:
+            raise _fail("instrumental track excerpt cannot be decoded", track_id=track.track_id) from error
+        if len(samples) != duration_frames:
+            raise _fail("instrumental track excerpt has the wrong frame count", track_id=track.track_id)
+        try:
+            rendered, gain_linear, gain_db, source_rms_dbfs, output_rms_dbfs, source_peak = _music_gain(
+                samples, track.track_id
+            )
+        except MusicSequenceError as error:
+            last_error = error
+            continue
+        output_peak = float(np.max(np.abs(rendered.astype(np.float64) / 32768.0)))
+        return MusicSelection(
+            track=track,
+            start_frame=start,
+            end_frame=end,
+            gain_linear=gain_linear,
+            gain_db=gain_db,
+            source_rms_dbfs=source_rms_dbfs,
+            output_rms_dbfs=output_rms_dbfs,
+            source_peak=source_peak,
+            output_peak=output_peak,
+        )
+    if last_error is not None:
+        raise last_error
+    raise _fail("instrumental track has no usable excerpt", track_id=track.track_id)
 
 
 def _read_music(selection: MusicSelection) -> np.ndarray:
@@ -861,10 +901,11 @@ def _rttm_line(label: OutputLabel) -> str:
     return f"SPEAKER {label.recording_id} 1 {start} {duration} <NA> <NA> {label.speaker} <NA> <NA>\n"
 
 
-def _write_json(path: Path, payload: object, before_write: Callable[[], None] | None = None) -> None:
+def _write_json(path: Path, payload: object, before_write: Callable[[int], None] | None = None) -> None:
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     if before_write is not None:
-        before_write()
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        before_write(len(text.encode("utf-8")) + 64 * 1024)
+    path.write_text(text, encoding="utf-8")
 
 
 def _write_audio(
@@ -872,12 +913,12 @@ def _write_audio(
     segments: Sequence[SegmentPlan],
     parent: ParentRecording,
     excerpts: Sequence[SpeechExcerpt],
-    before_write: Callable[[], None] | None = None,
+    before_write: Callable[[int], None] | None = None,
 ) -> tuple[tuple[OutputLabel, ...], list[dict[str, object]]]:
     labels: list[OutputLabel] = []
     mappings: list[dict[str, object]] = []
     if before_write is not None:
-        before_write()
+        before_write(64 * 1024)
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with sf.SoundFile(
@@ -951,9 +992,9 @@ def _write_audio(
                 if len(samples) != segment.output_end_frame - segment.output_start_frame:
                     raise _fail("rendered segment has the wrong frame count", kind=segment.kind)
                 if before_write is not None:
-                    before_write()
+                    before_write(int(np.asarray(samples).nbytes) + 64 * 1024)
                 destination.write(np.asarray(samples, dtype=np.int16))
-    except (OSError, RuntimeError) as error:
+    except (OSError, RuntimeError, ValueError) as error:
         raise _fail("output audio could not be written", path=str(path)) from error
     return tuple(
         sorted(labels, key=lambda item: (item.output_start_frame, item.output_end_frame, item.speaker))
@@ -966,6 +1007,7 @@ def _segment_manifest(segment: SegmentPlan) -> dict[str, object]:
         "output_start_frame": segment.output_start_frame,
         "output_end_frame": segment.output_end_frame,
         "duration_frames": segment.output_end_frame - segment.output_start_frame,
+        "duration_seconds": (segment.output_end_frame - segment.output_start_frame) / SAMPLE_RATE,
         "output_start_seconds": _frame_seconds(segment.output_start_frame),
         "output_end_seconds": _frame_seconds(segment.output_end_frame),
     }
@@ -990,10 +1032,50 @@ def _segment_manifest(segment: SegmentPlan) -> dict[str, object]:
                 "source_peak": selection.source_peak,
                 "output_peak": selection.output_peak,
                 "looped": False,
+                "manifest_record": dict(selection.track.manifest_record),
             }
         )
     if segment.kind == "silence":
         result["digital_zero"] = True
+    return result
+
+
+def _inserted_interval_manifest(segment: SegmentPlan) -> dict[str, object]:
+    if segment.kind not in {"silence", "music"}:
+        raise ValueError("only inserted segments have inserted interval records")
+    result: dict[str, object] = {
+        "kind": segment.kind,
+        "output_start_frame": segment.output_start_frame,
+        "output_end_frame": segment.output_end_frame,
+        "duration_frames": segment.output_end_frame - segment.output_start_frame,
+        "duration_seconds": (segment.output_end_frame - segment.output_start_frame) / SAMPLE_RATE,
+        "rttm_rows": 0,
+    }
+    if segment.kind == "silence":
+        result["digital_zero"] = True
+        return result
+    if segment.music is None:
+        raise ValueError("music segment has no selection")
+    selection = segment.music
+    result.update(
+        {
+            "track_id": selection.track.track_id,
+            "audio_sha256": selection.track.audio_sha256,
+            "pcm_sha256": selection.track.pcm_sha256,
+            "source_sha256": selection.track.source_sha256,
+            "source_path": selection.track.source_path,
+            "source_start_frame": selection.start_frame,
+            "source_end_frame": selection.end_frame,
+            "gain_linear": selection.gain_linear,
+            "gain_db": selection.gain_db,
+            "source_rms_dbfs": selection.source_rms_dbfs,
+            "output_rms_dbfs": selection.output_rms_dbfs,
+            "source_peak": selection.source_peak,
+            "output_peak": selection.output_peak,
+            "looped": False,
+            "manifest_record": dict(selection.track.manifest_record),
+        }
+    )
     return result
 
 
@@ -1046,6 +1128,8 @@ def _identity_payload(
                 "parent_id": parent.parent_id,
                 "bundle_sha256": parent.bundle_sha256,
                 "audio_sha256": parent.audio_sha256,
+                "bundle_path": str(parent.bundle_path),
+                "audio_path": str(parent.audio_path),
             }
             for parent in parents
         ],
@@ -1073,6 +1157,12 @@ def _select_parents(recordings: Sequence[ParentRecording], max_per_source: int) 
     selected: list[ParentRecording] = []
     for source in sorted(by_source):
         selected.extend(sorted(by_source[source], key=lambda item: item.parent_id)[:max_per_source])
+    if len(selected) > MAX_TOTAL_PARENTS:
+        raise _fail(
+            "selected parents exceed the bounded total",
+            selected_count=len(selected),
+            max_total_parents=MAX_TOTAL_PARENTS,
+        )
     if not selected:
         raise _fail("no eligible speech parents were found")
     return tuple(selected)
@@ -1085,6 +1175,16 @@ def _nearest_existing(path: Path) -> Path:
     return current
 
 
+def filesystem_free_bytes(path: Path) -> int:
+    """Return free bytes on the filesystem that will receive a write."""
+
+    probe = _nearest_existing(Path(path).resolve())
+    try:
+        return shutil.disk_usage(probe).free
+    except OSError as error:
+        raise _fail("cannot inspect free space", path=str(probe)) from error
+
+
 def combined_free_bytes(paths: Iterable[Path]) -> int:
     """Return free bytes across distinct filesystems containing the inputs."""
 
@@ -1094,13 +1194,13 @@ def combined_free_bytes(paths: Iterable[Path]) -> int:
         probe = _nearest_existing(Path(path).resolve())
         try:
             device = os.stat(probe).st_dev
-            usage = shutil.disk_usage(probe)
+            free = filesystem_free_bytes(probe)
         except OSError as error:
             raise _fail("cannot inspect free space", path=str(probe)) from error
         if device in seen_devices:
             continue
         seen_devices.add(device)
-        total += usage.free
+        total += free
     return total
 
 
@@ -1125,19 +1225,19 @@ def _write_manifest_files(
     parents: Sequence[ParentRecording],
     tracks: Sequence[MusicTrack],
     identity: Mapping[str, object],
-    before_write: Callable[[], None] | None = None,
+    before_write: Callable[[int], None] | None = None,
 ) -> dict[str, object]:
     wav_rows = "".join(f"{item['recording_id']} {item['audio_path']}\n" for item in outputs)
     rttm_rows = "".join(item["rttm_text"] for item in outputs)
     uem_rows = "".join(item["uem_text"] for item in outputs)
     if before_write is not None:
-        before_write()
+        before_write(len(wav_rows.encode("utf-8")) + 64 * 1024)
     (stage / "wav.scp").write_text(wav_rows, encoding="utf-8")
     if before_write is not None:
-        before_write()
+        before_write(len(rttm_rows.encode("utf-8")) + 64 * 1024)
     (stage / "all.rttm").write_text(rttm_rows, encoding="utf-8")
     if before_write is not None:
-        before_write()
+        before_write(len(uem_rows.encode("utf-8")) + 64 * 1024)
     (stage / "all.uem").write_text(uem_rows, encoding="utf-8")
     public_outputs = [
         {key: value for key, value in item.items() if key not in {"rttm_text", "uem_text"}} for item in outputs
@@ -1167,6 +1267,7 @@ def _write_manifest_files(
                     "source_sha256": track.source_sha256,
                     "split": track.split,
                     "no_vocals": track.no_vocals,
+                    "manifest_record": dict(track.manifest_record),
                 }
                 for track in tracks
             ],
@@ -1185,14 +1286,14 @@ def _write_manifest_files(
     _write_json(stage / "derivation.json", manifest, before_write)
     ready_digest = sha256_file(stage / "derivation.json")
     if before_write is not None:
-        before_write()
-    (stage / "READY").write_text(
+        before_write(128 * 1024)
+    ready_text = (
         json.dumps(
             {"schema": SCHEMA, "schema_version": SCHEMA_VERSION, "derivation_sha256": ready_digest}, sort_keys=True
         )
-        + "\n",
-        encoding="utf-8",
+        + "\n"
     )
+    (stage / "READY").write_text(ready_text, encoding="utf-8")
     return manifest
 
 
@@ -1213,6 +1314,8 @@ def _existing_ready(output: Path, identity: Mapping[str, object]) -> dict[str, o
     if manifest.get("input_identity_sha256") != sha256_json(dict(identity)):
         raise _fail("output exists for different inputs", path=str(output))
     ready = _read_json(ready_path, "READY")
+    if ready.get("schema") != SCHEMA or ready.get("schema_version") != SCHEMA_VERSION:
+        raise _fail("ready output marker has an unsupported schema", path=str(ready_path))
     if ready.get("derivation_sha256") != sha256_file(manifest_path):
         raise _fail("output READY marker does not match its derivation manifest", path=str(output))
     manifests = manifest.get("manifests")
@@ -1220,7 +1323,10 @@ def _existing_ready(output: Path, identity: Mapping[str, object]) -> dict[str, o
         raise _fail("ready output has no manifest hashes", path=str(output))
     for key, filename in (("wav_scp", "wav.scp"), ("rttm", "all.rttm"), ("uem", "all.uem")):
         expected = manifests.get(key)
-        actual = sha256_file(output / filename)
+        manifest_file = output / filename
+        if not manifest_file.is_file():
+            raise _fail("ready output manifest file is missing", file=filename)
+        actual = sha256_file(manifest_file)
         if expected != actual:
             raise _fail("ready output manifest hash mismatch", file=filename)
     outputs = manifest.get("outputs")
@@ -1230,6 +1336,8 @@ def _existing_ready(output: Path, identity: Mapping[str, object]) -> dict[str, o
         if not isinstance(item, Mapping):
             raise _fail("ready output recording is not an object", path=str(output))
         audio_path = _safe_path(output, item.get("audio_path"), "ready output audio_path")
+        if not audio_path.is_file():
+            raise _fail("ready output audio file is missing", path=str(audio_path))
         expected_audio = _require_digest(item.get("audio_sha256"), "ready output audio_sha256")
         if sha256_file(audio_path) != expected_audio:
             raise _fail("ready output audio hash mismatch", path=str(audio_path))
@@ -1250,12 +1358,19 @@ def prepare_music_sequences(
 
     if isinstance(max_parents_per_source, bool) or max_parents_per_source <= 0:
         raise ValueError("max_parents_per_source must be positive")
+    if max_parents_per_source > DEFAULT_MAX_PARENTS_PER_SOURCE:
+        raise ValueError(f"max_parents_per_source must not exceed {DEFAULT_MAX_PARENTS_PER_SOURCE}")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("seed must be an integer")
     if isinstance(max_task_bytes, bool) or max_task_bytes <= 0:
         raise ValueError("max_task_bytes must be positive")
     if isinstance(min_free_bytes, bool) or min_free_bytes < 0:
         raise ValueError("min_free_bytes must not be negative")
-    output = Path(output).resolve()
-    music_pool = Path(music_pool).resolve()
+    output = Path(output).expanduser()
+    if output.is_symlink():
+        raise _fail("output must not be a symlink", path=str(output))
+    output = output.resolve()
+    music_pool = Path(music_pool).expanduser().resolve()
     if bundle_paths is None:
         bundle_paths = DEFAULT_BUNDLES
     parents = load_parent_recordings(bundle_paths)
@@ -1275,11 +1390,19 @@ def prepare_music_sequences(
         return existing
     resource_roots = [output, music_pool, *(parent.bundle_root for parent in selected_parents)]
 
-    def ensure_free_space() -> None:
+    def ensure_free_space(required_bytes: int = 0) -> None:
+        if isinstance(required_bytes, bool) or required_bytes < 0:
+            raise ValueError("required_bytes must not be negative")
         available = combined_free_bytes(resource_roots)
-        if available < min_free_bytes:
+        output_available = filesystem_free_bytes(output)
+        required = min_free_bytes + required_bytes
+        if available < required or output_available < required:
             raise _fail(
-                "combined free space is below the preparation bound", available=available, required=min_free_bytes
+                "combined free space is below the preparation bound",
+                available=available,
+                required=min_free_bytes,
+                output_available=output_available,
+                required_write_bytes=required_bytes,
             )
 
     ensure_free_space()
@@ -1327,13 +1450,13 @@ def prepare_music_sequences(
     stage = output.with_name(f".{output.name}.partial")
     if stage.exists():
         raise _fail("incomplete output staging directory already exists", path=str(stage))
-    ensure_free_space()
+    ensure_free_space(64 * 1024)
     stage.mkdir(parents=True)
     stage_created = True
     output_rows: list[dict[str, object]] = []
     try:
         for parent, output_id, excerpts, segments in plan_rows:
-            ensure_free_space()
+            ensure_free_space(segments[-1].output_end_frame * 2 + 64 * 1024)
             audio_relative = Path("audio") / f"{output_id}.flac"
             audio_path = stage / audio_relative
             labels, mappings = _write_audio(audio_path, segments, parent, excerpts, ensure_free_space)
@@ -1353,13 +1476,7 @@ def prepare_music_sequences(
                     "segments": [_segment_manifest(segment) for segment in segments],
                     "source_interval_mappings": mappings,
                     "inserted_intervals": [
-                        {
-                            "kind": segment.kind,
-                            "output_start_frame": segment.output_start_frame,
-                            "output_end_frame": segment.output_end_frame,
-                            "duration_seconds": (segment.output_end_frame - segment.output_start_frame) / SAMPLE_RATE,
-                            "rttm_rows": 0,
-                        }
+                        _inserted_interval_manifest(segment)
                         for segment in segments
                         if segment.kind in {"silence", "music"}
                     ],
@@ -1418,7 +1535,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_task_bytes=args.max_task_bytes,
             min_free_bytes=args.min_free_bytes,
         )
-    except MusicSequenceError as error:
+    except PreparationError as error:
         print(json.dumps({"ok": False, "error": str(error), "details": error.details}, indent=2, sort_keys=True))
         return 1
     result = {

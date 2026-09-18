@@ -183,6 +183,7 @@ def test_prepare_renders_variants_gaps_and_full_uem(tmp_path: Path) -> None:
     rttm_ids = {line.split()[1] for line in all_rttm.splitlines()}
     assert wav_ids == uem_ids == {row["recording_id"] for row in manifest["outputs"]}
     assert rttm_ids <= wav_ids
+    assert {line.split()[7] for line in all_rttm.splitlines()} <= {"meeting-01::speaker_a", "meeting-01::speaker_b"}
     rttm_frames = {}
     for line in all_rttm.splitlines():
         fields = line.split()
@@ -215,7 +216,18 @@ def test_prepare_renders_variants_gaps_and_full_uem(tmp_path: Path) -> None:
                     dtype="int16",
                 )
                 assert np.count_nonzero(samples) == 0
+            else:
+                assert inserted["track_id"] == "music-01"
+                assert inserted["audio_sha256"] == manifest["music_pool"]["tracks"][0]["audio_sha256"]
+                assert inserted["pcm_sha256"] == manifest["music_pool"]["tracks"][0]["pcm_sha256"]
+                assert inserted["source_sha256"] == "b" * 64
+                assert inserted["manifest_record"]["license"]["spdx"] == "CC-BY-4.0"
         assert all(segment["output_end_frame"] > segment["output_start_frame"] for segment in row["segments"])
+        for mapping in row["source_interval_mappings"]:
+            if mapping["kind"] == "speech_excerpt":
+                assert mapping["output_end_frame"] - mapping["output_start_frame"] == (
+                    mapping["source_end_frame"] - mapping["source_start_frame"]
+                )
         assert row["parent_id"] == "meeting-01"
     by_variant = {row["recording_id"].rsplit("__", 1)[-1]: row for row in manifest["outputs"]}
     assert [segment["kind"] for segment in by_variant["leading_music"]["segments"]] == [
@@ -246,6 +258,12 @@ def test_prepare_renders_variants_gaps_and_full_uem(tmp_path: Path) -> None:
         "speech",
         "speech",
     ]
+    assert {
+        segment["duration_seconds"]
+        for row in manifest["outputs"]
+        for segment in row["segments"]
+        if segment["kind"] in {"silence", "music"}
+    } >= {10.0, 30.0, 60.0}
 
     again = prepare_music_sequences(
         output=output,
