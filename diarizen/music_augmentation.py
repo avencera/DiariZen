@@ -25,6 +25,7 @@ MUSIC_AUGMENTATION_SCHEMA = "speakrs-music-augmentation-v1"
 MUSIC_MANIFEST_SCHEMA = "speakrs-instrumental-music-v1"
 PROPORTION_TOTAL = 1_000_000
 EXPECTED_SAMPLE_RATE = 16_000
+MAX_MUSIC_CROP_ATTEMPTS = 8
 _SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
 _MODULUS = 1 << 64
 MusicMode = Literal["clean", "mixed", "mixed_no_speech", "music_only"]
@@ -32,6 +33,10 @@ MusicMode = Literal["clean", "mixed", "mixed_no_speech", "music_only"]
 
 class MusicAugmentationError(ValueError):
     """Raised when an augmentation configuration, manifest, or sample is invalid."""
+
+
+class UnusableMusicCropError(MusicAugmentationError):
+    """Raised when one verified music crop cannot satisfy the requested policy."""
 
 
 def _finite_number(value: object, field_name: str) -> float:
@@ -572,12 +577,24 @@ class MusicAugmentationReceipt:
     speech_rms: float
     music_rms: float
     peak: float
+    attempt_index: int = 0
+    attempt_count: int = 1
 
     def __post_init__(self) -> None:
         if not self.recording_id:
             raise MusicAugmentationError("receipt recording_id must be non-empty")
         if self.chunk_start_sample < 0 or self.chunk_end_sample <= self.chunk_start_sample:
             raise MusicAugmentationError("receipt chunk bounds are invalid")
+        if (
+            isinstance(self.attempt_index, bool)
+            or not isinstance(self.attempt_index, int)
+            or isinstance(self.attempt_count, bool)
+            or not isinstance(self.attempt_count, int)
+            or self.attempt_index < 0
+            or self.attempt_count <= 0
+            or self.attempt_index >= self.attempt_count
+        ):
+            raise MusicAugmentationError("receipt crop attempt index/count are invalid")
         for field_name in (
             "speech_gain",
             "music_gain",
@@ -620,6 +637,8 @@ class MusicAugmentationReceipt:
             "speech_rms": self.speech_rms,
             "music_rms": self.music_rms,
             "peak": self.peak,
+            "attempt_index": self.attempt_index,
+            "attempt_count": self.attempt_count,
         }
 
 
@@ -650,11 +669,11 @@ class MusicAugmenter:
 
         return cls(load_music_augmentation_config(path), sample_rate=sample_rate)
 
-    def _draw(self, purpose: str, recording_id: str, start: int, end: int) -> int:
-        payload = f"music-augmentation-v1\0{self.config.seed}\0{purpose}\0{recording_id}\0{start}\0{end}".encode(
-            "utf-8"
-        )
-        return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+    def _draw(self, purpose: str, recording_id: str, start: int, end: int, *, attempt: int = 0) -> int:
+        payload = f"music-augmentation-v1\0{self.config.seed}\0{purpose}\0{recording_id}\0{start}\0{end}"
+        if attempt:
+            payload += f"\0attempt\0{attempt}"
+        return int.from_bytes(hashlib.sha256(payload.encode("utf-8")).digest()[:8], "big")
 
     def _mode(self, recording_id: str, start: int, end: int) -> MusicMode:
         draw = self._draw("mode", recording_id, start, end) % PROPORTION_TOTAL
@@ -664,7 +683,14 @@ class MusicAugmenter:
             return "mixed"
         return "music_only"
 
-    def _track_and_offset(self, recording_id: str, start: int, end: int) -> tuple[MusicTrack, int]:
+    def _track_and_offset(
+        self,
+        recording_id: str,
+        start: int,
+        end: int,
+        *,
+        attempt: int = 0,
+    ) -> tuple[MusicTrack, int]:
         if not self._tracks:
             raise MusicAugmentationError("music manifest has no eligible train tracks")
         sample_count = end - start
@@ -673,9 +699,9 @@ class MusicAugmenter:
             raise MusicAugmentationError(
                 f"no music track is long enough for the requested chunk ({sample_count} samples)"
             )
-        track = candidates[self._draw("track", recording_id, start, end) % len(candidates)]
+        track = candidates[self._draw("track", recording_id, start, end, attempt=attempt) % len(candidates)]
         max_offset = track.sample_count - sample_count
-        offset = self._draw("offset", recording_id, start, end) % (max_offset + 1)
+        offset = self._draw("offset", recording_id, start, end, attempt=attempt) % (max_offset + 1)
         return track, offset
 
     def _read_music(self, track: MusicTrack, offset: int, sample_count: int) -> np.ndarray:
@@ -695,7 +721,7 @@ class MusicAugmenter:
         if not np.all(np.isfinite(music)):
             raise MusicAugmentationError(f"music track contains nonfinite samples: {track.track_id}")
         if _rms(music) <= 0:
-            raise MusicAugmentationError(f"music track chunk has zero energy: {track.track_id}")
+            raise UnusableMusicCropError(f"music track chunk has zero energy: {track.track_id}")
         return music
 
     def apply(
@@ -719,6 +745,105 @@ class MusicAugmenter:
             chunked_annotations=chunked_annotations,
         )
         return transformed_x, transformed_y
+
+    def _apply_music_crop(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        *,
+        recording_id: str,
+        chunk_start_sample: int,
+        chunk_end_sample: int,
+        requested_mode: MusicMode,
+        reference_mask: np.ndarray,
+        speech_rms: float,
+        requested_snr_db: float | None,
+        requested_music_rms_dbfs: float | None,
+        attempt: int,
+        attempt_count: int,
+    ) -> tuple[np.ndarray, np.ndarray, MusicAugmentationReceipt]:
+        """Apply one verified crop; only typed crop-policy failures are retryable."""
+
+        sample_count = chunk_end_sample - chunk_start_sample
+        track, offset = self._track_and_offset(
+            recording_id,
+            chunk_start_sample,
+            chunk_end_sample,
+            attempt=attempt,
+        )
+        music = self._read_music(track, offset, sample_count)
+        music_reference = reference_mask if requested_mode == "mixed" and reference_mask.any() else None
+        music_rms = _rms(music, music_reference)
+        if music_rms <= 0:
+            raise UnusableMusicCropError(f"music track has zero reference energy: {track.track_id}")
+
+        measured_snr_db = None
+        measured_music_rms_dbfs = None
+        speech_gain = 1.0
+        if requested_mode == "mixed" and reference_mask.any():
+            if requested_snr_db is None:
+                raise MusicAugmentationError("mixed crop is missing its requested SNR")
+            music_gain = speech_rms / (10.0 ** (requested_snr_db / 20.0) * music_rms)
+            output_mode: MusicMode = "mixed"
+        else:
+            output_mode = "mixed_no_speech" if requested_mode == "mixed" else "music_only"
+            speech_gain = 0.0 if output_mode == "music_only" else 1.0
+            if requested_music_rms_dbfs is None:
+                raise MusicAugmentationError("non-speech crop is missing its requested music level")
+            music_gain = (10.0 ** (requested_music_rms_dbfs / 20.0)) / music_rms
+
+        music_matrix = np.broadcast_to(music, x.shape)
+        if output_mode == "music_only":
+            output = np.array(music_matrix * music_gain, dtype=np.float64, copy=True)
+        else:
+            output = np.array(np.asarray(x, dtype=np.float64) + music_matrix * music_gain, dtype=np.float64, copy=True)
+        if not np.all(np.isfinite(output)):
+            raise MusicAugmentationError("augmented audio contains nonfinite samples")
+        peak_before_scale = float(np.max(np.abs(output))) if output.size else 0.0
+        if not math.isfinite(peak_before_scale):
+            raise MusicAugmentationError("augmented audio contains nonfinite samples")
+        global_scale = 0.99 / peak_before_scale if peak_before_scale > 0.99 else 1.0
+        if global_scale != 1.0:
+            output *= global_scale
+        peak = float(np.max(np.abs(output))) if output.size else 0.0
+
+        if output_mode == "mixed":
+            measured_speech_rms = speech_rms * speech_gain * global_scale
+            measured_music_rms = music_rms * music_gain * global_scale
+            if measured_speech_rms <= 0 or measured_music_rms <= 0:
+                raise MusicAugmentationError("mixed audio has zero reference energy")
+            measured_snr_db = 20.0 * math.log10(measured_speech_rms / measured_music_rms)
+        else:
+            measured_music_rms_dbfs = _dbfs(music_rms * music_gain * global_scale)
+            if measured_music_rms_dbfs is None or not (
+                self.config.min_no_speech_rms_dbfs - 1e-6
+                <= measured_music_rms_dbfs
+                <= self.config.max_no_speech_rms_dbfs + 1e-6
+            ):
+                raise UnusableMusicCropError("music RMS level is infeasible under the 0.99 peak bound")
+
+        receipt = MusicAugmentationReceipt(
+            mode=output_mode,
+            requested_mode=requested_mode,
+            recording_id=recording_id,
+            chunk_start_sample=chunk_start_sample,
+            chunk_end_sample=chunk_end_sample,
+            music_track_id=track.track_id,
+            music_offset_sample=offset,
+            speech_gain=speech_gain,
+            music_gain=music_gain,
+            global_scale=global_scale,
+            requested_snr_db=requested_snr_db,
+            measured_snr_db=measured_snr_db,
+            requested_music_rms_dbfs=requested_music_rms_dbfs,
+            measured_music_rms_dbfs=measured_music_rms_dbfs,
+            speech_rms=speech_rms,
+            music_rms=music_rms,
+            peak=peak,
+            attempt_index=attempt,
+            attempt_count=attempt_count,
+        )
+        return output, np.zeros_like(y) if output_mode == "music_only" else y, receipt
 
     def apply_with_receipt(
         self,
@@ -775,11 +900,11 @@ class MusicAugmenter:
                 speech_rms=_rms(x),
                 music_rms=0.0,
                 peak=source_peak,
+                attempt_index=0,
+                attempt_count=1,
             )
             return x, y, receipt
 
-        track, offset = self._track_and_offset(recording_id, chunk_start_sample, chunk_end_sample)
-        music = self._read_music(track, offset, sample_count)
         reference_mask = speech_reference_mask(
             chunked_annotations,
             chunk_start_sample=chunk_start_sample,
@@ -789,16 +914,8 @@ class MusicAugmenter:
         if requested_mode == "mixed" and not reference_mask.any() and np.any(y != 0):
             raise MusicAugmentationError("positive targets require a non-empty speech reference union")
         speech_rms = _rms(x, reference_mask) if reference_mask.any() else 0.0
-        music_reference = reference_mask if requested_mode == "mixed" and reference_mask.any() else None
-        music_rms = _rms(music, music_reference)
-        if music_rms <= 0:
-            raise MusicAugmentationError(f"music track has zero reference energy: {track.track_id}")
-
         requested_snr_db = None
         requested_music_rms_dbfs = None
-        measured_snr_db = None
-        measured_music_rms_dbfs = None
-        speech_gain = 1.0
         if requested_mode == "mixed" and reference_mask.any():
             if speech_rms <= 0:
                 raise MusicAugmentationError("labelled speech has zero source energy")
@@ -807,69 +924,36 @@ class MusicAugmenter:
                 self.config.min_snr_db,
                 self.config.max_snr_db,
             )
-            music_gain = speech_rms / (10.0 ** (requested_snr_db / 20.0) * music_rms)
-            output_mode: MusicMode = "mixed"
         else:
-            output_mode = "mixed_no_speech" if requested_mode == "mixed" else "music_only"
-            speech_gain = 0.0 if output_mode == "music_only" else 1.0
-            level_purpose = "silent-level" if output_mode == "mixed_no_speech" else "music-only-level"
+            level_purpose = "silent-level" if requested_mode == "mixed" else "music-only-level"
             requested_music_rms_dbfs = _uniform(
                 self._draw(level_purpose, recording_id, chunk_start_sample, chunk_end_sample),
                 self.config.min_no_speech_rms_dbfs,
                 self.config.max_no_speech_rms_dbfs,
             )
-            music_gain = (10.0 ** (requested_music_rms_dbfs / 20.0)) / music_rms
-
-        music_matrix = np.broadcast_to(music, x.shape)
-        if output_mode == "music_only":
-            output = np.array(music_matrix * music_gain, dtype=np.float64, copy=True)
-        else:
-            output = np.array(np.asarray(x, dtype=np.float64) + music_matrix * music_gain, dtype=np.float64, copy=True)
-        if not np.all(np.isfinite(output)):
-            raise MusicAugmentationError("augmented audio contains nonfinite samples")
-        peak_before_scale = float(np.max(np.abs(output))) if output.size else 0.0
-        if not math.isfinite(peak_before_scale):
-            raise MusicAugmentationError("augmented audio contains nonfinite samples")
-        global_scale = 0.99 / peak_before_scale if peak_before_scale > 0.99 else 1.0
-        if global_scale != 1.0:
-            output *= global_scale
-        peak = float(np.max(np.abs(output))) if output.size else 0.0
-
-        if output_mode == "mixed":
-            measured_speech_rms = speech_rms * speech_gain * global_scale
-            measured_music_rms = music_rms * music_gain * global_scale
-            if measured_speech_rms <= 0 or measured_music_rms <= 0:
-                raise MusicAugmentationError("mixed audio has zero reference energy")
-            measured_snr_db = 20.0 * math.log10(measured_speech_rms / measured_music_rms)
-        elif output_mode in {"mixed_no_speech", "music_only"}:
-            measured_music_rms_dbfs = _dbfs(music_rms * music_gain * global_scale)
-            if measured_music_rms_dbfs is None or not (
-                self.config.min_no_speech_rms_dbfs - 1e-6
-                <= measured_music_rms_dbfs
-                <= self.config.max_no_speech_rms_dbfs + 1e-6
-            ):
-                raise MusicAugmentationError("music RMS level is infeasible under the 0.99 peak bound")
-
-        receipt = MusicAugmentationReceipt(
-            mode=output_mode,
-            requested_mode=requested_mode,
-            recording_id=recording_id,
-            chunk_start_sample=chunk_start_sample,
-            chunk_end_sample=chunk_end_sample,
-            music_track_id=track.track_id,
-            music_offset_sample=offset,
-            speech_gain=speech_gain,
-            music_gain=music_gain,
-            global_scale=global_scale,
-            requested_snr_db=requested_snr_db,
-            measured_snr_db=measured_snr_db,
-            requested_music_rms_dbfs=requested_music_rms_dbfs,
-            measured_music_rms_dbfs=measured_music_rms_dbfs,
-            speech_rms=speech_rms,
-            music_rms=music_rms,
-            peak=peak,
-        )
-        return output, np.zeros_like(y) if output_mode == "music_only" else y, receipt
+        last_error: UnusableMusicCropError | None = None
+        for attempt in range(MAX_MUSIC_CROP_ATTEMPTS):
+            try:
+                return self._apply_music_crop(
+                    x,
+                    y,
+                    recording_id=recording_id,
+                    chunk_start_sample=chunk_start_sample,
+                    chunk_end_sample=chunk_end_sample,
+                    requested_mode=requested_mode,
+                    reference_mask=reference_mask,
+                    speech_rms=speech_rms,
+                    requested_snr_db=requested_snr_db,
+                    requested_music_rms_dbfs=requested_music_rms_dbfs,
+                    attempt=attempt,
+                    attempt_count=attempt + 1,
+                )
+            except UnusableMusicCropError as error:
+                last_error = error
+        detail = "" if last_error is None else f"; last crop was unusable: {last_error}"
+        raise MusicAugmentationError(
+            f"no viable music crop after {MAX_MUSIC_CROP_ATTEMPTS} attempts{detail}"
+        ) from last_error
 
     def receipt_for(
         self,
@@ -896,6 +980,7 @@ class MusicAugmenter:
 
 __all__ = [
     "EXPECTED_SAMPLE_RATE",
+    "MAX_MUSIC_CROP_ATTEMPTS",
     "MUSIC_AUGMENTATION_SCHEMA",
     "MUSIC_MANIFEST_SCHEMA",
     "MusicAugmentationConfig",
@@ -906,6 +991,7 @@ __all__ = [
     "MusicManifest",
     "MusicMode",
     "MusicTrack",
+    "UnusableMusicCropError",
     "load_music_augmentation_config",
     "load_music_manifest",
     "speech_reference_mask",

@@ -11,10 +11,12 @@ import pytest
 import soundfile as sf
 
 from diarizen.music_augmentation import (
+    MAX_MUSIC_CROP_ATTEMPTS,
     MUSIC_AUGMENTATION_SCHEMA,
     MUSIC_MANIFEST_SCHEMA,
     MusicAugmentationError,
     MusicAugmenter,
+    UnusableMusicCropError,
     load_music_augmentation_config,
 )
 from recipes.diar_ssl.dataset import DiarizationDataset, _collate_fn
@@ -251,7 +253,10 @@ def test_high_crest_music_rejects_infeasible_bounded_level(
     if mixed:
         y = np.empty((12, 0), dtype=np.uint8)
 
-    with pytest.raises(MusicAugmentationError, match="infeasible"):
+    with pytest.raises(
+        MusicAugmentationError,
+        match=rf"no viable music crop after {MAX_MUSIC_CROP_ATTEMPTS} attempts.*infeasible",
+    ) as error:
         augmenter.apply_with_receipt(
             x,
             y,
@@ -260,6 +265,71 @@ def test_high_crest_music_rejects_infeasible_bounded_level(
             chunk_end_sample=SAMPLE_COUNT,
             chunked_annotations=annotations,
         )
+    assert isinstance(error.value.__cause__, UnusableMusicCropError)
+
+
+def test_retry_chooses_later_viable_crop_deterministically(tmp_path: Path) -> None:
+    _, manifest_path = _write_music_fixture(tmp_path)
+    invalid_path = tmp_path / "impulse.wav"
+    impulse = np.zeros(SAMPLE_COUNT, dtype=np.float64)
+    impulse[123] = 0.5
+    sf.write(invalid_path, impulse, SAMPLE_RATE, subtype="PCM_16")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    invalid_track = dict(manifest["tracks"][0])
+    invalid_track.update(
+        {
+            "track_id": "impulse-invalid",
+            "path": invalid_path.name,
+            "sha256": _file_sha256(invalid_path),
+            "pcm_sha256": _pcm_sha256(invalid_path),
+            "sample_count": SAMPLE_COUNT,
+        }
+    )
+    manifest["tracks"].append(invalid_track)
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    augmenter = MusicAugmenter.from_config(
+        _write_config(tmp_path, manifest_path, clean=0, mixed=0, music_only=1_000_000)
+    )
+    x, y, annotations = _speech_source()
+    recording_id = next(
+        f"retry-{index}"
+        for index in range(10_000)
+        if augmenter._track_and_offset("retry-" + str(index), 0, SAMPLE_COUNT, attempt=0)[0].track_id
+        == "impulse-invalid"
+        and augmenter._track_and_offset("retry-" + str(index), 0, SAMPLE_COUNT, attempt=1)[0].track_id == "toy-music"
+    )
+
+    first_x, first_y, first_receipt = augmenter.apply_with_receipt(
+        x,
+        y,
+        recording_id=recording_id,
+        chunk_start_sample=0,
+        chunk_end_sample=SAMPLE_COUNT,
+        chunked_annotations=annotations,
+    )
+    augmenter.apply_with_receipt(
+        x,
+        y,
+        recording_id="other-recording",
+        chunk_start_sample=0,
+        chunk_end_sample=SAMPLE_COUNT,
+        chunked_annotations=annotations,
+    )
+    second_x, second_y, second_receipt = augmenter.apply_with_receipt(
+        x,
+        y,
+        recording_id=recording_id,
+        chunk_start_sample=0,
+        chunk_end_sample=SAMPLE_COUNT,
+        chunked_annotations=annotations,
+    )
+
+    assert first_receipt.music_track_id == "toy-music"
+    assert first_receipt.attempt_index == 1
+    assert first_receipt.attempt_count == 2
+    assert first_receipt == second_receipt
+    assert first_x.tobytes() == second_x.tobytes()
+    assert first_y.tobytes() == second_y.tobytes() == np.zeros_like(y).tobytes()
 
 
 def test_mixed_rejects_labelled_speech_with_zero_source_energy(tmp_path: Path) -> None:
