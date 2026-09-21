@@ -173,6 +173,31 @@ def test_hard_parent_is_storable_without_provisional_profile_admission(selection
     assert uploaded["ok"] is True
 
 
+def test_upload_resumes_only_the_unrecorded_objects(selection):
+    spec, _, release, _ = selection
+    verify_data(spec, release, release / "acceptance.json")
+    backend = MemoryBackend()
+    upload_path = release / "upload.json"
+    first = upload_data(spec, release, upload_path, backend=backend)
+    partial = {**first, "ok": False, "uploaded": first["uploaded"][:1]}
+    write_json(upload_path, partial)
+
+    class CountingBackend(MemoryBackend):
+        def __init__(self):
+            super().__init__()
+            self.put_keys = []
+
+        def put_bytes(self, key, payload, *, content_type="application/octet-stream"):
+            self.put_keys.append(key)
+            return super().put_bytes(key, payload, content_type=content_type)
+
+    resumed_backend = CountingBackend()
+    resumed = upload_data(spec, release, upload_path, backend=resumed_backend)
+
+    assert resumed["ok"] is True
+    assert len(resumed_backend.put_keys) == len(first["expected_objects"]) - 1
+
+
 @pytest.mark.parametrize("changed", ["configuration", "manifest", "evidence", "audio", "receipt"])
 def test_acceptance_invalidation(selection, changed):
     spec, raw, release, manifest = selection

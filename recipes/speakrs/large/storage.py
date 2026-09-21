@@ -2326,16 +2326,31 @@ def backend_from_destination(destination: ObjectStoreDestination) -> StorageBack
 
 
 def object_key(source: str, version: str, selection: str, digest: str, ext: str) -> str:
-    """Return a content-addressed immutable key."""
+    """Return a content-addressed immutable key.
 
-    for value, label in ((source, "source"), (version, "version"), (selection, "selection")):
-        if not isinstance(value, str) or not _SEGMENT_RE.fullmatch(value):
+    Human source names may contain spaces or Unicode. Their key segments use a
+    readable slug plus a source-string digest so remote identity remains
+    deterministic without turning metadata names into path syntax.
+    """
+
+    def key_segment(value: str, label: str) -> str:
+        if not isinstance(value, str) or not value:
             raise ContractError(f"object key {label} is invalid")
+        if _SEGMENT_RE.fullmatch(value):
+            return value
+        slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip(".-")
+        readable = slug or "segment"
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+        return f"{readable}-{digest}"
+
+    source_segment = key_segment(source, "source")
+    version_segment = key_segment(version, "version")
+    selection_segment = key_segment(selection, "selection")
     digest = require_content_hash(digest, "object sha256")
     suffix = ext.lstrip(".")
     if not suffix or "/" in suffix or any(not _SEGMENT_RE.fullmatch(part) for part in suffix.split("/")):
         raise ContractError("object key extension is invalid")
-    return f"datasets/{source}/{version}/{selection}/objects/{digest}.{suffix}"
+    return f"datasets/{source_segment}/{version_segment}/{selection_segment}/objects/{digest}.{suffix}"
 
 
 def _readback(

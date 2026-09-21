@@ -697,8 +697,39 @@ def upload_data(
         "manifest_sha256": acceptance.manifest_sha256,
         "expected_objects": packaged,
     }
+    if output.is_file():
+        previous = read_json(output)
+        if not isinstance(previous, Mapping):
+            raise PreparationError("upload receipt is not an object")
+        if (
+            previous.get("command") != "upload"
+            or previous.get("release") != str(release)
+            or previous.get("acceptance_sha256") != result["acceptance_sha256"]
+            or previous.get("manifest_sha256") != result["manifest_sha256"]
+            or previous.get("expected_objects") != packaged
+        ):
+            raise PreparationError("upload receipt belongs to a different accepted selection")
+        previous_uploaded = previous.get("uploaded")
+        if not isinstance(previous_uploaded, list):
+            raise PreparationError("upload receipt has no resumable object inventory")
+        expected_by_key = {str(item["key"]): item for item in packaged}
+        seen_keys: set[str] = set()
+        for item in previous_uploaded:
+            if not isinstance(item, Mapping) or item.get("state") != ObjectState.UPLOADED.value:
+                raise PreparationError("upload receipt contains an invalid resumable object")
+            key = item.get("key")
+            if not isinstance(key, str) or key in seen_keys or key not in expected_by_key:
+                raise PreparationError("upload receipt contains an unexpected resumable object")
+            expected = expected_by_key[key]
+            if any(item.get(field) != value for field, value in expected.items()):
+                raise PreparationError("upload receipt resumable object differs from the accepted inventory")
+            seen_keys.add(key)
+        result["uploaded"] = [dict(item) for item in previous_uploaded]
     write_json(output, result)
+    completed_keys = {str(item["key"]) for item in result["uploaded"]}
     for item in packaged:
+        if item["key"] in completed_keys:
+            continue
         enforce_cap(directory_bytes(spec.disk.staging_root), spec.disk.max_staging_bytes, "staging")
         path = Path(item["path"])
         spec.disk.cache_root.mkdir(parents=True, exist_ok=True)
@@ -712,6 +743,7 @@ def upload_data(
         # backend operations must retain immutable content across interruption and retry
         store.put_bytes(item["key"], path.read_bytes())
         result["uploaded"].append({**item, "state": ObjectState.UPLOADED.value})
+        completed_keys.add(item["key"])
         write_json(output, result)
     result["ok"] = True
     write_json(output, result)

@@ -78,6 +78,15 @@ def _audio_and_label(root: Path, recording: str = "rec") -> tuple[Path, Path, st
     return audio, label, sha256_bytes(audio.read_bytes()), sha256_bytes(label.read_bytes())
 
 
+def test_object_key_slug_preserves_human_source_identity() -> None:
+    digest = sha256_bytes(b"indic")
+
+    key = object_key("Indic DiarBench", "hf-release", "train", digest, "flac")
+
+    assert key.startswith("datasets/Indic-DiarBench-")
+    assert "/hf-release/train/objects/" in key
+
+
 class _FakeHttpResponse:
     """Small bounded response double for authenticated REST object calls."""
 
