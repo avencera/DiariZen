@@ -54,6 +54,9 @@ DATA_COMMANDS = (
     "handoff",
     "qualification-bundle",
     "training-bundle",
+    "bundle-snapshot-publish",
+    "bundle-snapshot-verify",
+    "bundle-snapshot-restore",
     "dev-bundle",
     "qualification-binding",
 )
@@ -279,6 +282,34 @@ def build_parser() -> argparse.ArgumentParser:
     data_training_bundle.add_argument("--wav-prefix", required=True)
     data_training_bundle.add_argument("--config", required=True, type=Path)
     data_training_bundle.add_argument("--output", required=True, type=Path)
+    data_snapshot_publish = data_sub.add_parser(
+        "bundle-snapshot-publish",
+        help="publish an immutable, restore-ready snapshot of one complete trainer bundle",
+    )
+    data_snapshot_publish.add_argument("--bundle", required=True, type=Path)
+    data_snapshot_publish.add_argument("--launch-descriptor", required=True, type=Path)
+    data_snapshot_publish.add_argument("--bundle-sha256", required=True)
+    data_snapshot_publish.add_argument("--restore-parent", required=True, type=Path)
+    data_snapshot_publish.add_argument("--temporary-root", required=True, type=Path)
+    data_snapshot_publish.add_argument("--config", required=True, type=Path)
+    data_snapshot_publish.add_argument("--output", required=True, type=Path)
+    data_snapshot_verify = data_sub.add_parser(
+        "bundle-snapshot-verify",
+        help="stream and verify every object in a private bundle snapshot",
+    )
+    data_snapshot_verify.add_argument("--manifest-key", required=True)
+    data_snapshot_verify.add_argument("--config", required=True, type=Path)
+    data_snapshot_verify.add_argument("--output", required=True, type=Path)
+    data_snapshot_restore = data_sub.add_parser(
+        "bundle-snapshot-restore",
+        help="download, unpack, and verify a complete trainer bundle snapshot",
+    )
+    snapshot_restore_source = data_snapshot_restore.add_mutually_exclusive_group(required=True)
+    snapshot_restore_source.add_argument("--manifest-key")
+    snapshot_restore_source.add_argument("--bundle-sha256")
+    data_snapshot_restore.add_argument("--restore-parent", required=True, type=Path)
+    data_snapshot_restore.add_argument("--config", required=True, type=Path)
+    data_snapshot_restore.add_argument("--output", required=True, type=Path)
     data_dev_bundle = data_sub.add_parser("dev-bundle", help="build the exact frozen development trainer inputs")
     data_dev_bundle.add_argument("--audio-root", required=True, type=Path)
     data_dev_bundle.add_argument("--established-dev", required=True, type=Path)
@@ -344,6 +375,43 @@ def dispatch(args: argparse.Namespace) -> dict:
 
     command = args.command
     if command == "data":
+        if args.data_command in {
+            "bundle-snapshot-publish",
+            "bundle-snapshot-verify",
+            "bundle-snapshot-restore",
+        }:
+            from .bundle_snapshot import (
+                load_snapshot_destination,
+                publish_bundle_snapshot,
+                resolve_snapshot_manifest_key,
+                restore_bundle_snapshot,
+                verify_bundle_snapshot,
+            )
+
+            destination = load_snapshot_destination(args.config)
+            if args.data_command == "bundle-snapshot-publish":
+                return publish_bundle_snapshot(
+                    destination,
+                    args.bundle,
+                    args.launch_descriptor,
+                    args.bundle_sha256,
+                    args.restore_parent,
+                    args.output,
+                    temporary_root=args.temporary_root,
+                    config_path=args.config,
+                )
+            if args.data_command == "bundle-snapshot-verify":
+                return verify_bundle_snapshot(destination, args.manifest_key, args.output)
+            manifest_key = args.manifest_key or resolve_snapshot_manifest_key(
+                destination,
+                args.bundle_sha256,
+            )
+            return restore_bundle_snapshot(
+                destination,
+                manifest_key,
+                args.restore_parent,
+                args.output,
+            )
         if args.data_command == "dev-bundle":
             from .data import load_data_spec
             from .dev_bundle import build_dev_bundle

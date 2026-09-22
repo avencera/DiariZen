@@ -138,3 +138,53 @@ Data and model licenses must be reviewed before distribution. This recipe uses
 AMI data under CC BY 4.0 and code from DiariZen and torchaudio. The WavLM Base+
 model provenance and all generated file hashes are recorded in the recipe
 artifacts.
+
+## Restore-ready trainer bundle snapshots
+
+The Large data command can publish a complete trainer bundle to private object
+storage as deterministic, uncompressed tar shards. Each snapshot uses the
+`bundle.json` SHA-256 in its versioned prefix. Publication refuses an existing
+key with different bytes. The small manifest binds every shard, the full bundle
+tree, the adjacent launch descriptor, and the only restore parent that keeps
+the absolute `wav.scp` paths valid.
+
+Publish the current Indic DiarBench next-run input from the repository root:
+
+```bash
+python -m recipes.speakrs.large.cli data bundle-snapshot-publish \
+  --bundle /Volumes/CacheDisk/dev-cache/diarization-data-verification/next-run/indic-diarbench-union-v1 \
+  --launch-descriptor /Volumes/CacheDisk/dev-cache/diarization-data-verification/next-run/indic-diarbench-next-run-input-v1.json \
+  --bundle-sha256 18ef53c54340323a0e0f23fb5d5596be4ce34556b418691751a17a0a1dd6bc31 \
+  --restore-parent /opt/diarizen/recipes/speakrs/data \
+  --temporary-root /Users/praveen/code/diarizen-speakrs-data-verification/_scratch/bundle-snapshot \
+  --config DATA_PREPARATION.json \
+  --output SNAPSHOT_MANIFEST.json
+```
+
+The temporary root needs space for one 240 MiB shard, not a second bundle.
+FLAC files are stored without recompression. After publication, verify all
+remote bytes and private access once:
+
+```bash
+python -m recipes.speakrs.large.cli data bundle-snapshot-verify \
+  --manifest-key "$MANIFEST_KEY" \
+  --config DATA_PREPARATION.json \
+  --output SNAPSHOT_VERIFICATION.json
+```
+
+Restore directly from R2. The target parent must be empty of the bundle and
+descriptor and must match the parent stored in the snapshot manifest:
+
+```bash
+python -m recipes.speakrs.large.cli data bundle-snapshot-restore \
+  --bundle-sha256 18ef53c54340323a0e0f23fb5d5596be4ce34556b418691751a17a0a1dd6bc31 \
+  --restore-parent /opt/diarizen/recipes/speakrs/data \
+  --config DATA_PREPARATION.json \
+  --output SNAPSHOT_RESTORE.json
+```
+
+This creates
+`/opt/diarizen/recipes/speakrs/data/indic-diarbench-union-v1` and places the
+launch descriptor beside it. Restore verifies each downloaded shard before
+unpack and then verifies the exact bundle tree, `bundle.json`, and launch
+descriptor identities.
