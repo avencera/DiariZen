@@ -353,22 +353,31 @@ def publish_bundle_snapshot(
 
     with tempfile.TemporaryDirectory(prefix="speakrs-bundle-snapshot-", dir=temporary_root) as temp_directory:
         temp = Path(temp_directory)
-        for index, group in enumerate(groups, 1):
+        pending_groups = list(groups)
+        index = 1
+        while pending_groups:
+            group = pending_groups.pop(0)
             shard_path = temp / f"shard-{index:04d}.tar"
             _write_tar_shard(shard_path, group)
-            packaged_files.extend(_tar_file_identities(shard_path))
-            digest = sha256_file(shard_path)
             size = shard_path.stat().st_size
             if size > max_shard_bytes:
+                shard_path.unlink()
+                if len(group) > 1:
+                    pending_groups.insert(0, group[-1:])
+                    pending_groups.insert(0, group[:-1])
+                    continue
                 raise PreparationError(
                     "packaged tar exceeds the snapshot shard limit",
                     {"size": size, "max_shard_bytes": max_shard_bytes},
                 )
+            packaged_files.extend(_tar_file_identities(shard_path))
+            digest = sha256_file(shard_path)
             key = _object_key(destination, expected_bundle_sha256, digest, "tar")
             payload = shard_path.read_bytes()
             outcomes.append(_publish_absent_bytes(store, key, payload, content_type="application/x-tar"))
             shards.append(SnapshotShard(key, digest, size, len(group)))
             shard_path.unlink()
+            index += 1
 
     bundle_prefix = f"{bundle.name}/"
     bundle_rows = [
@@ -567,6 +576,7 @@ def restore_bundle_snapshot(
     restore_parent: Path,
     output: Path,
     *,
+    filesystem_root: Path | None = None,
     backend: SnapshotStore | None = None,
 ) -> dict[str, object]:
     """Directly download, unpack, and verify one complete snapshot."""
@@ -585,16 +595,21 @@ def restore_bundle_snapshot(
             "restore parent differs from the path required by wav.scp",
             {"expected": restore.get("parent"), "actual": str(restore_parent)},
         )
+    target_parent = restore_parent
+    if filesystem_root is not None:
+        if not restore_parent.is_absolute():
+            raise PreparationError("rooted snapshot restore requires an absolute logical parent")
+        target_parent = filesystem_root / restore_parent.relative_to(restore_parent.anchor)
     bundle_name = _safe_relative_path(str(bundle.get("directory")), "bundle directory")
     descriptor_name = _safe_relative_path(str(descriptor.get("name")), "launch descriptor")
-    final_bundle = restore_parent / bundle_name.as_posix()
-    final_descriptor = restore_parent / descriptor_name.as_posix()
+    final_bundle = target_parent / bundle_name.as_posix()
+    final_descriptor = target_parent / descriptor_name.as_posix()
     if _path_is_within(output, final_bundle) or output.resolve() == final_descriptor.resolve():
         raise PreparationError("restore receipt cannot modify restored snapshot contents")
     if final_bundle.exists() or final_descriptor.exists():
         raise PreparationError("snapshot restore target already exists", {"bundle": str(final_bundle)})
-    restore_parent.mkdir(parents=True, exist_ok=True)
-    partial = restore_parent / f".{bundle_name.name}.snapshot-partial"
+    target_parent.mkdir(parents=True, exist_ok=True)
+    partial = target_parent / f".{bundle_name.name}.snapshot-partial"
     if partial.exists():
         raise PreparationError("snapshot partial restore already exists", {"path": str(partial)})
     partial.mkdir()
@@ -655,6 +670,8 @@ def restore_bundle_snapshot(
         "manifest_key": manifest_key,
         "bundle": str(final_bundle),
         "launch_descriptor": str(final_descriptor),
+        "logical_restore_parent": str(restore_parent),
+        "filesystem_root": str(filesystem_root) if filesystem_root is not None else None,
         "bundle_manifest_sha256": bundle["bundle_manifest_sha256"],
         "tree_sha256": bundle["tree_sha256"],
         "files": bundle["files"],

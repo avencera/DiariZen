@@ -308,6 +308,11 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot_restore_source.add_argument("--manifest-key")
     snapshot_restore_source.add_argument("--bundle-sha256")
     data_snapshot_restore.add_argument("--restore-parent", required=True, type=Path)
+    data_snapshot_restore.add_argument(
+        "--filesystem-root",
+        type=Path,
+        help="map the absolute restore parent under this root for an isolated rehearsal",
+    )
     data_snapshot_restore.add_argument("--config", required=True, type=Path)
     data_snapshot_restore.add_argument("--output", required=True, type=Path)
     data_dev_bundle = data_sub.add_parser("dev-bundle", help="build the exact frozen development trainer inputs")
@@ -411,6 +416,7 @@ def dispatch(args: argparse.Namespace) -> dict:
                 manifest_key,
                 args.restore_parent,
                 args.output,
+                filesystem_root=args.filesystem_root,
             )
         if args.data_command == "dev-bundle":
             from .data import load_data_spec

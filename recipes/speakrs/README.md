@@ -188,3 +188,9 @@ This creates
 launch descriptor beside it. Restore verifies each downloaded shard before
 unpack and then verifies the exact bundle tree, `bundle.json`, and launch
 descriptor identities.
+
+For an isolated rehearsal without root access, add
+`--filesystem-root REHEARSAL_ROOT`. The command maps the recorded absolute
+restore parent below that root, so the example bundle is written below
+`REHEARSAL_ROOT/opt/diarizen/recipes/speakrs/data` without changing its bytes or
+the logical paths recorded in `wav.scp`.

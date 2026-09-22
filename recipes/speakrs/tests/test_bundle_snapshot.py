@@ -185,3 +185,66 @@ def test_restore_requires_the_recorded_wav_parent(tmp_path: Path) -> None:
             tmp_path / "restore.json",
             backend=store,
         )
+
+
+def test_publish_splits_shard_when_pax_headers_exceed_target(tmp_path: Path) -> None:
+    bundle, descriptor, bundle_identity = _bundle(tmp_path)
+    expected_parent = tmp_path / "expected"
+    _set_wav_target(bundle, expected_parent)
+    long_directory = bundle / ("long-path-" + "x" * 100)
+    long_directory.mkdir()
+    (long_directory / "first.bin").write_bytes(b"a" * 1_000)
+    (long_directory / "second.bin").write_bytes(b"b" * 1_000)
+    store = MemoryStore(_destination())
+
+    result = publish_bundle_snapshot(
+        _destination(),
+        bundle,
+        descriptor,
+        bundle_identity,
+        expected_parent,
+        tmp_path / "publication.json",
+        temporary_root=tmp_path / "temporary",
+        config_path=tmp_path / "config.json",
+        max_shard_bytes=10 * 1024,
+        backend=store,
+    )
+
+    manifest = json.loads((tmp_path / "publication.json").read_text(encoding="utf-8"))
+    assert result["shards"] > 1
+    assert all(shard["size"] <= 10 * 1024 for shard in manifest["shards"])
+
+
+def test_restore_maps_logical_parent_under_filesystem_root(tmp_path: Path) -> None:
+    bundle, descriptor, bundle_identity = _bundle(tmp_path)
+    logical_parent = Path("/opt/diarizen/recipes/speakrs/data")
+    _set_wav_target(bundle, logical_parent)
+    store = MemoryStore(_destination())
+    result = publish_bundle_snapshot(
+        _destination(),
+        bundle,
+        descriptor,
+        bundle_identity,
+        logical_parent,
+        tmp_path / "publication.json",
+        temporary_root=tmp_path / "temporary",
+        config_path=tmp_path / "config.json",
+        backend=store,
+    )
+    filesystem_root = tmp_path / "rehearsal-root"
+
+    receipt = restore_bundle_snapshot(
+        _destination(),
+        result["manifest_key"],
+        logical_parent,
+        tmp_path / "restore.json",
+        filesystem_root=filesystem_root,
+        backend=store,
+    )
+
+    physical_parent = filesystem_root / "opt/diarizen/recipes/speakrs/data"
+    assert Path(receipt["bundle"]) == physical_parent / bundle.name
+    assert (physical_parent / bundle.name / "wav.scp").read_bytes() == (bundle / "wav.scp").read_bytes()
+    assert Path(receipt["launch_descriptor"]) == physical_parent / descriptor.name
+    assert receipt["logical_restore_parent"] == str(logical_parent)
+    assert receipt["filesystem_root"] == str(filesystem_root)
