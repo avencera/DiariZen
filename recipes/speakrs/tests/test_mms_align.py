@@ -13,7 +13,7 @@ from recipes.speakrs.large.tight_labels.close_talk import (
 )
 from recipes.speakrs.large.tight_labels.domain import Interval, RecordingLabels, SpeakerSegment, UncertainInterval
 from recipes.speakrs.large.tight_labels.lotus_text import parse_lotus_align_intervals
-from recipes.speakrs.large.tight_labels.markers import cleaning_delta, prepare_transcript
+from recipes.speakrs.large.tight_labels.markers import prepare_transcript, transcript_cleaning_row
 from recipes.speakrs.large.tight_labels.mms import ctc_alignment_fits, leftover_script_rate, mms_words
 from recipes.speakrs.large.tight_labels.produce_mms import (
     TranscriptSegment,
@@ -70,12 +70,70 @@ def test_ascii_gloss_after_native_script_is_removed() -> None:
     assert mms_words("pharst(First)") == ("pharst",)
 
 
-def test_cleaning_delta_counts_generic_tags_the_legacy_list_kept() -> None:
-    delta = cleaning_delta("[vocalization] ஃபர்ஸ்ட்(First)")
+def test_ascii_gloss_starting_with_a_digit_is_removed_when_it_has_a_letter() -> None:
+    prepared = prepare_transcript("নাইনটিজ(90s)এর")
 
-    assert delta["row_changed"] is True
-    assert "vocalization" in delta["tags"]
-    assert delta["glosses"]
+    assert "(90s)" not in prepared.remainder
+    assert "নাইনটিজ" in prepared.remainder
+    assert "এর" in prepared.remainder
+    assert prepared.stripped_glosses
+
+
+def test_pure_digit_parentheses_stay_after_native_script() -> None:
+    prepared = prepare_transcript("বছর(90)এর")
+
+    assert prepared.remainder == "বছর(90)এর"
+    assert prepared.stripped_glosses == ()
+
+
+def test_lotusdis_keeps_square_bracket_loanwords_and_strips_angle_marks() -> None:
+    prepared = prepare_transcript(
+        "<n> [CHICKEN] [TIKKA] [CHICKEN] [MASALA] [ROTI] <n>",
+        keep_square_bracket_words=True,
+    )
+
+    assert prepared.remainder == "chicken tikka chicken masala roti"
+    assert prepared.alignable is True
+    assert "n" in prepared.stripped_tags
+    assert "chicken" not in prepared.stripped_tags
+
+
+def test_lotusdis_keeps_english_loanword_inside_thai() -> None:
+    prepared = prepare_transcript("ไป [MENU] นี้", keep_square_bracket_words=True)
+
+    assert prepared.remainder == "ไป menu นี้"
+    assert prepared.alignable is True
+
+
+def test_indic_still_strips_square_bracket_tags() -> None:
+    prepared = prepare_transcript("[vocalization] ஃபர்ஸ்ட்(First)")
+
+    row = transcript_cleaning_row(prepared)
+    assert "vocalization" in row["tags"]
+    assert row["glosses"]
+    assert "vocalization" not in prepared.remainder
+
+
+def test_old_cache_classes_map_missing_failure_reason_to_aligner_error() -> None:
+    from recipes.speakrs.large.tight_labels.classify import AlignmentFailureReason, SegmentOutcome
+    from recipes.speakrs.large.tight_labels.produce_mms import _classes_from_payload
+
+    classes = _classes_from_payload(
+        [
+            {
+                "recording_id": "rec",
+                "speaker": "A",
+                "start_ns": 0,
+                "end_ns": 1_000_000_000,
+                "outcome": "alignment_failure",
+                "failure_reason": None,
+                "by_design_reason": None,
+            }
+        ]
+    )
+
+    assert classes[0].outcome is SegmentOutcome.ALIGNMENT_FAILURE
+    assert classes[0].failure_reason is AlignmentFailureReason.ALIGNER_ERROR
 
 
 def test_mms_words_keep_only_fa_characters() -> None:

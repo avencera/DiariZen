@@ -457,6 +457,12 @@ def _classes_from_payload(rows: Sequence[Mapping[str, Any]]) -> tuple[SegmentCla
         outcome = SegmentOutcome(str(item["outcome"]))
         failure = item.get("failure_reason")
         by_design = item.get("by_design_reason")
+        if outcome is SegmentOutcome.ALIGNMENT_FAILURE and failure is None:
+            failure_reason = AlignmentFailureReason.ALIGNER_ERROR
+        elif failure is None:
+            failure_reason = None
+        else:
+            failure_reason = AlignmentFailureReason(str(failure))
         classes.append(
             SegmentClass(
                 str(item["recording_id"]),
@@ -464,7 +470,7 @@ def _classes_from_payload(rows: Sequence[Mapping[str, Any]]) -> tuple[SegmentCla
                 int(item["start_ns"]),
                 int(item["end_ns"]),
                 outcome,
-                None if failure is None else AlignmentFailureReason(str(failure)),
+                failure_reason,
                 None if by_design is None else ByDesignReason(str(by_design)),
             )
         )
@@ -770,7 +776,7 @@ def align_lotusdis_recording(
                     by_design_reason=ByDesignReason.MULTI_SPEAKER,
                 )
             continue
-        prepared = prepare_transcript(interval.text)
+        prepared = prepare_transcript(interval.text, keep_square_bracket_words=True)
         if not prepared.alignable:
             kinds["marker"] += 1
             failed_segments.extend(rows)
