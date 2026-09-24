@@ -24,7 +24,6 @@ from ..storage import require_free_gib
 from . import LIBRARY_VERSION
 from .classify import (
     AlignmentFailureReason,
-    ByDesignReason,
     SegmentClass,
     SegmentOutcome,
     unioned_original_segments,
@@ -32,16 +31,22 @@ from .classify import (
 from .domain import Interval, RecordingLabels, SpeakerSegment
 from .gates import GateResult, evaluate_gates
 from .guards import (
+    ACOUSTIC_GUARDS,
+    EMPTY_TEXT_GUARDS,
     GUARD_RULES,
+    RATE_GUARDS,
     SAMPLE_RATE,
     AcousticFeatures,
+    GuardId,
     acoustic_guard,
     classify_transcript,
     dictionary_words,
+    guard_rule_text,
     measure_acoustic,
     measure_transcript,
     normalize_english_words,
     normalize_mms_words,
+    parse_guard_id,
 )
 from .intervals import clip_recording_to_uem
 from .listening import write_listening_pack
@@ -613,7 +618,7 @@ def run_asr_pass(
             backend, selected_language = choose_asr(language, probability)
             row["language"] = selected_language if backend else language
             if backend is None:
-                row["guard"] = "LID_UNSUPPORTED"
+                row["guard"] = GuardId.LID_UNSUPPORTED
             else:
                 row["asr_backend"] = backend
                 language = selected_language
@@ -627,7 +632,7 @@ def run_asr_pass(
                             whisper = WhisperAsr()
                         text = whisper.transcribe(samples, language)
                 except Exception as error:  # noqa: BLE001
-                    row["guard"] = "ASR_FAILED"
+                    row["guard"] = GuardId.ASR_FAILED
                     row["error"] = str(error)
                     text = ""
                 row["text"] = text
@@ -1089,9 +1094,8 @@ def labels_from_alignment(
     return original, produced
 
 
-_BY_DESIGN_GUARDS = frozenset({"SILENCE", "MUSIC_OR_NOISE"})
-_EMPTY_TEXT_GUARDS = frozenset({"EMPTY_ASR", "NO_ALIGNABLE_WORDS"})
-_MARKER_GUARDS = frozenset({"IMPLAUSIBLE_CHAR_RATE", "IMPLAUSIBLE_WORD_RATE", "REPETITION_LOOP"})
+def _guard_rules_json() -> dict[str, str]:
+    return {guard.value: text for guard, text in GUARD_RULES.items()}
 
 
 def _job_outcome(
@@ -1099,7 +1103,7 @@ def _job_outcome(
     asr: Mapping[str, Any],
     aligned: Mapping[str, Any],
 ) -> SegmentClass:
-    error = str(aligned.get("error") or asr.get("guard") or "")
+    error = aligned.get("error") or asr.get("guard") or ""
     if aligned.get("ok"):
         covered = 0
         for word in aligned.get("words") or []:
@@ -1117,30 +1121,20 @@ def _job_outcome(
             SegmentOutcome.ALIGNMENT_FAILURE,
             failure_reason=AlignmentFailureReason.LOW_COVERAGE,
         )
-    guard = error.split(":", 1)[0]
     segment = SpeakerSegment(job.recording_id, job.speaker, job.start_ns, job.end_ns)
-    if guard in _BY_DESIGN_GUARDS:
-        return SegmentClass.from_segment(
-            segment,
-            SegmentOutcome.BY_DESIGN_UNCERTAIN,
-            by_design_reason=ByDesignReason.SOURCE_RULE,
-        )
-    if guard in _EMPTY_TEXT_GUARDS:
-        return SegmentClass.from_segment(
-            segment,
-            SegmentOutcome.ALIGNMENT_FAILURE,
-            failure_reason=AlignmentFailureReason.EMPTY_TEXT,
-        )
-    if guard in _MARKER_GUARDS:
-        return SegmentClass.from_segment(
-            segment,
-            SegmentOutcome.ALIGNMENT_FAILURE,
-            failure_reason=AlignmentFailureReason.MARKER_ONLY,
-        )
+    guard = parse_guard_id(error)
+    if guard in ACOUSTIC_GUARDS:
+        failure_reason = AlignmentFailureReason(guard.name.lower())
+    elif guard in EMPTY_TEXT_GUARDS:
+        failure_reason = AlignmentFailureReason.EMPTY_TEXT
+    elif guard in RATE_GUARDS:
+        failure_reason = AlignmentFailureReason.MARKER_ONLY
+    else:
+        failure_reason = AlignmentFailureReason.ALIGNER_ERROR
     return SegmentClass.from_segment(
         segment,
         SegmentOutcome.ALIGNMENT_FAILURE,
-        failure_reason=AlignmentFailureReason.ALIGNER_ERROR,
+        failure_reason=failure_reason,
     )
 
 
@@ -1153,21 +1147,26 @@ def classify_voxconverse_jobs(
 ) -> tuple[SegmentClass, ...]:
     """Map per-job ASR/align outcomes onto overlapping-only original segments."""
 
-    job_classes: dict[tuple[str, str, int, int], SegmentClass] = {}
+    by_recording: dict[str, list[tuple[tuple[str, str, int, int], SegmentClass]]] = defaultdict(list)
     for job in jobs:
-        job_classes[(job.recording_id, job.speaker, job.start_ns, job.end_ns)] = _job_outcome(
-            job,
-            asr_rows.get(job.segment_id, {}),
-            align_rows.get(job.segment_id, {}),
+        key = (job.recording_id, job.speaker, job.start_ns, job.end_ns)
+        by_recording[job.recording_id].append(
+            (
+                key,
+                _job_outcome(
+                    job,
+                    asr_rows.get(job.segment_id, {}),
+                    align_rows.get(job.segment_id, {}),
+                ),
+            )
         )
     classes: list[SegmentClass] = []
     for segment in unioned_original_segments(original):
         owner = next(
             (
                 item
-                for key, item in job_classes.items()
-                if key[0] == segment.recording_id
-                and key[1] == segment.speaker
+                for key, item in by_recording.get(segment.recording_id, ())
+                if key[1] == segment.speaker
                 and key[2] <= segment.start_ns
                 and key[3] >= segment.end_ns
             ),
@@ -1265,7 +1264,7 @@ def summarize_pass(
         "backend_counts": dict(backend_counts),
         "english_oov_words": oov_words,
         "english_alignable_segments": alignable,
-        "guard_rules": GUARD_RULES,
+        "guard_rules": _guard_rules_json(),
     }
 
 
@@ -1319,7 +1318,7 @@ def write_release(
             "coverage_ratio": float(COVERAGE_RATIO),
             "lid_min_prob": LID_MIN_PROB,
             "mfa_jobs": MFA_JOBS,
-            "guard_rules": GUARD_RULES,
+            "guard_rules": _guard_rules_json(),
         },
         "asr_alignment_summary": dict(summary),
         "gate_results": gate.to_json(),
@@ -1351,7 +1350,7 @@ def render_agent_report(
         f"| {code} | {count} |" for code, count in sorted(languages.items(), key=lambda item: (-item[1], item[0]))
     )
     guard_rows = "\n".join(
-        f"| `{name}` | {count} | {GUARD_RULES.get(name, '')} |"
+        f"| `{name}` | {count} | {guard_rule_text(name)} |"
         for name, count in sorted((summary.get("guard_counts") or {}).items(), key=lambda item: (-item[1], item[0]))
     )
     status = "PASS" if gate.passed and not kept_current else "FAIL"
@@ -1412,14 +1411,21 @@ def render_agent_report(
         f"- Rows inside UEM: {'pass' if gate.uem_ok else 'fail'}",
         f"- Subset of 200 ms-closed original: {'pass' if gate.subset_ok else 'fail'}",
         f"- Smallest same-speaker gap ≥ 0.200 s: {'pass' if gate.smallest_gap_ok else 'fail'}",
-        f"- UNCERTAIN overlapping same-speaker speech: {'pass' if gate.uncertain_overlap_ok else 'fail'}",
-        f"- Failure share ≤ {gate.failure_share_limit:.2f}: {'pass' if gate.failure_share_ok else 'fail'} ({gate.failure_share:.4f})",
+        (
+            f"- Failure share ≤ {gate.failure_share_limit:.2f}: "
+            f"{'pass' if gate.failure_share_ok else 'fail'} ({gate.failure_share:.4f}; "
+            f"excluding by-design {gate.failure_share_excluding_by_design:.4f})"
+        ),
         f"- Tightness band (reported): {'pass' if gate.tightness_ok else 'outside reference'}",
         f"- Speaker retention (reported): {len(gate.flagged_speakers)} speakers below {gate.speaker_retention_floor:.0%}",
         f"- Overlap retention (reported): {gate.overlap_retention}",
         f"- UNCERTAIN share of original speech: {gate.uncertain_share:.4f}",
         f"- UNCERTAIN share excluding by-design: {gate.uncertain_share_excluding_by_design:.4f}",
         f"- By-design UNCERTAIN share of original segments: {gate.by_design_share:.4f}",
+        (
+            "- UNCERTAIN time removed by canonicalization: "
+            f"{ns_to_seconds(gate.uncertain_canonicalization_removed_ns):.3f} s"
+        ),
         f"- Kept current labels: {kept_current}",
         f"- Flagged speakers below {gate.speaker_retention_floor:.0%} retention: {len(gate.flagged_speakers)}",
         "",

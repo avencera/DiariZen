@@ -153,7 +153,7 @@ def test_release_id_with_version_replaces_the_suffix() -> None:
 
 
 def test_classify_voxconverse_jobs_maps_guards_to_typed_outcomes() -> None:
-    from recipes.speakrs.large.tight_labels.classify import AlignmentFailureReason, ByDesignReason, SegmentOutcome
+    from recipes.speakrs.large.tight_labels.classify import AlignmentFailureReason, SegmentOutcome
     from recipes.speakrs.large.tight_labels.voxconverse import SegmentJob, classify_voxconverse_jobs
 
     recording = "voxconverse::abjxc"
@@ -177,8 +177,8 @@ def test_classify_voxconverse_jobs_maps_guards_to_typed_outcomes() -> None:
     classes = classify_voxconverse_jobs(original, produced, jobs, asr_rows, align_rows)
 
     outcomes = {item.start_ns: item for item in classes}
-    assert outcomes[0].outcome is SegmentOutcome.BY_DESIGN_UNCERTAIN
-    assert outcomes[0].by_design_reason is ByDesignReason.SOURCE_RULE
+    assert outcomes[0].outcome is SegmentOutcome.ALIGNMENT_FAILURE
+    assert outcomes[0].failure_reason is AlignmentFailureReason.SILENCE
     assert outcomes[2_000_000_000].outcome is SegmentOutcome.ALIGNMENT_FAILURE
     assert outcomes[2_000_000_000].failure_reason is AlignmentFailureReason.ALIGNER_ERROR
 

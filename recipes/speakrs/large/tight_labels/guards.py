@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from enum import Enum
 from typing import Iterable
 
 import numpy as np
@@ -32,37 +33,85 @@ WORD_RE = re.compile(r"[^\W\d_]+(?:['’][^\W\d_]+)*|\d+", re.UNICODE)
 ENGLISH_KEEP_RE = re.compile(r"[^a-z0-9']+")
 MMS_KEEP_RE = re.compile(r"[^a-z']+")
 
+
+class GuardId(str, Enum):
+    """Typed identifier for one VoxConverse ASR or alignment guard."""
+
+    TOO_SHORT = "TOO_SHORT"
+    SILENCE = "SILENCE"
+    MUSIC_OR_NOISE = "MUSIC_OR_NOISE"
+    EMPTY_ASR = "EMPTY_ASR"
+    IMPLAUSIBLE_CHAR_RATE = "IMPLAUSIBLE_CHAR_RATE"
+    IMPLAUSIBLE_WORD_RATE = "IMPLAUSIBLE_WORD_RATE"
+    REPETITION_LOOP = "REPETITION_LOOP"
+    ASR_FAILED = "ASR_FAILED"
+    LID_UNSUPPORTED = "LID_UNSUPPORTED"
+    G2P_FAILED = "G2P_FAILED"
+    ALIGN_FAILED = "ALIGN_FAILED"
+    NO_ALIGNABLE_WORDS = "NO_ALIGNABLE_WORDS"
+
+
 GUARD_RULES = {
-    "TOO_SHORT": ("Human segment duration is below 80 ms, so ASR and alignment cannot place words with confidence."),
-    "SILENCE": (
+    GuardId.TOO_SHORT: (
+        "Human segment duration is below 80 ms, so ASR and alignment cannot place words with confidence."
+    ),
+    GuardId.SILENCE: (
         "Mean RMS is below -48 dBFS and the share of 30 ms frames at or above "
         "-42 dBFS is below 0.10. The segment is treated as silence."
     ),
-    "MUSIC_OR_NOISE": (
+    GuardId.MUSIC_OR_NOISE: (
         "On a cut of at least 0.60 s, mean RMS is at or above -38 dBFS and "
         "3-8 Hz envelope modulation is below 0.15 of 0.5-20 Hz energy, or "
         "the voiced-frame share is below 0.22 with the same energy floor. "
         "The segment is treated as music or noise."
     ),
-    "EMPTY_ASR": "ASR returned no word tokens after punctuation stripping.",
-    "IMPLAUSIBLE_CHAR_RATE": (
+    GuardId.EMPTY_ASR: "ASR returned no word tokens after punctuation stripping.",
+    GuardId.IMPLAUSIBLE_CHAR_RATE: (
         "Letter and digit count divided by duration exceeds 30 per second on a segment of at least 2.00 s."
     ),
-    "IMPLAUSIBLE_WORD_RATE": (
+    GuardId.IMPLAUSIBLE_WORD_RATE: (
         "Word count divided by duration exceeds 8 per second on a segment of at least 2.00 s with at least 4 words."
     ),
-    "REPETITION_LOOP": (
+    GuardId.REPETITION_LOOP: (
         "The most frequent token is at least 60% of tokens and the token "
         "count is at least 8. This pattern matches ASR hallucination loops."
     ),
-    "ASR_FAILED": "The ASR model raised an error on this segment cut.",
-    "LID_UNSUPPORTED": (
+    GuardId.ASR_FAILED: "The ASR model raised an error on this segment cut.",
+    GuardId.LID_UNSUPPORTED: (
         "Spoken-language identification is outside Parakeet's 25 languages and no fallback ASR covers the language."
     ),
-    "G2P_FAILED": "MFA G2P could not produce a pronunciation for at least one word.",
-    "ALIGN_FAILED": "Forced alignment returned no word intervals or raised an error.",
-    "NO_ALIGNABLE_WORDS": "Normalized ASR text contained no alignable word tokens.",
+    GuardId.G2P_FAILED: "MFA G2P could not produce a pronunciation for at least one word.",
+    GuardId.ALIGN_FAILED: "Forced alignment returned no word intervals or raised an error.",
+    GuardId.NO_ALIGNABLE_WORDS: "Normalized ASR text contained no alignable word tokens.",
 }
+ACOUSTIC_GUARDS = frozenset({GuardId.SILENCE, GuardId.MUSIC_OR_NOISE})
+EMPTY_TEXT_GUARDS = frozenset({GuardId.EMPTY_ASR, GuardId.NO_ALIGNABLE_WORDS})
+RATE_GUARDS = frozenset(
+    {GuardId.IMPLAUSIBLE_CHAR_RATE, GuardId.IMPLAUSIBLE_WORD_RATE, GuardId.REPETITION_LOOP}
+)
+
+
+def parse_guard_id(value: object) -> GuardId | None:
+    """Return a GuardId when value is a known guard identifier."""
+
+    if isinstance(value, GuardId):
+        return value
+    if not isinstance(value, str) or not value:
+        return None
+    name = value.split(":", 1)[0]
+    try:
+        return GuardId(name)
+    except ValueError:
+        return None
+
+
+def guard_rule_text(value: object) -> str:
+    """Return the committed description for a guard identifier."""
+
+    guard = parse_guard_id(value)
+    if guard is None:
+        return ""
+    return GUARD_RULES[guard]
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,18 +208,18 @@ def measure_acoustic(samples: np.ndarray, sample_rate: int = SAMPLE_RATE) -> Aco
     )
 
 
-def acoustic_guard(features: AcousticFeatures) -> str | None:
+def acoustic_guard(features: AcousticFeatures) -> GuardId | None:
     """Return a non-speech guard name, or None when the cut may be speech."""
 
     if features.duration_s < MIN_ALIGN_SECONDS:
-        return "TOO_SHORT"
+        return GuardId.TOO_SHORT
     if features.mean_rms_dbfs < SILENCE_MEAN_DBFS and features.voiced_fraction < SILENCE_VOICED_MAX:
-        return "SILENCE"
+        return GuardId.SILENCE
     if features.duration_s >= MIN_DURATION_FOR_MUSIC_S and features.mean_rms_dbfs >= MUSIC_MEAN_DBFS_MIN:
         low_modulation = features.modulation_ratio < MUSIC_MODULATION_MAX
         low_voicing = features.voiced_fraction < MUSIC_VOICED_MAX
         if low_modulation or low_voicing:
-            return "MUSIC_OR_NOISE"
+            return GuardId.MUSIC_OR_NOISE
     return None
 
 
@@ -210,22 +259,22 @@ def measure_transcript(text: str, duration_s: float) -> TranscriptStats:
     )
 
 
-def classify_transcript(text: str, duration_s: float) -> str | None:
+def classify_transcript(text: str, duration_s: float) -> GuardId | None:
     """Guard ASR text against empty and implausible length or loops."""
 
     stats = measure_transcript(text, duration_s)
     if stats.word_count == 0:
-        return "EMPTY_ASR"
+        return GuardId.EMPTY_ASR
     if duration_s >= MIN_DURATION_FOR_CHAR_RATE_S and stats.char_rate > MAX_CHARS_PER_SEC:
-        return "IMPLAUSIBLE_CHAR_RATE"
+        return GuardId.IMPLAUSIBLE_CHAR_RATE
     if (
         duration_s >= MIN_DURATION_FOR_WORD_RATE_S
         and stats.word_count >= MIN_WORDS_FOR_RATE
         and stats.word_rate > MAX_WORDS_PER_SEC
     ):
-        return "IMPLAUSIBLE_WORD_RATE"
+        return GuardId.IMPLAUSIBLE_WORD_RATE
     if stats.top_token_fraction >= REPETITION_FRACTION and len(stats.tokens) >= REPETITION_MIN_TOKENS:
-        return "REPETITION_LOOP"
+        return GuardId.REPETITION_LOOP
     return None
 
 

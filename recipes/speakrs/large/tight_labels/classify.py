@@ -28,6 +28,8 @@ class AlignmentFailureReason(Enum):
     EMPTY_ROMANIZATION = "empty_romanization"
     LOW_COVERAGE = "low_coverage"
     ALIGNER_ERROR = "aligner_error"
+    SILENCE = "silence"
+    MUSIC_OR_NOISE = "music_or_noise"
 
 
 class ByDesignReason(Enum):
