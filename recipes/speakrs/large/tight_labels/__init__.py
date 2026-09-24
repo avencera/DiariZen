@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .domain import Interval, RecordingLabels, SpeakerSegment, UncertainInterval
-from .gates import GateResult, evaluate_gates
+from .gates import GateResult, UncertainShare, evaluate_gates
 from .intervals import clip_recording_to_uem
 from .mapping import SpeakerMapping, apply_published_replacement, map_speakers_by_overlap
 from .merge import MIN_GAP_NS, MIN_GAP_SECONDS, merge_recording, merge_short_gaps
@@ -36,6 +36,7 @@ __all__ = [
     "TightenSegmentResult",
     "TightnessStats",
     "UncertainInterval",
+    "UncertainShare",
     "apply_published_replacement",
     "clip_recording_to_uem",
     "evaluate_gates",

@@ -5,8 +5,8 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Sequence
 
-from .domain import RecordingLabels, SpeakerSegment
-from .intervals import merge_spans, union_spans
+from .domain import RecordingLabels, SpeakerSegment, UncertainInterval
+from .intervals import merge_spans, subtract_spans, union_spans
 from .time import MIN_GAP_NS, MIN_GAP_SECONDS
 
 
@@ -46,19 +46,44 @@ def merge_short_gaps(
     return tuple(merged)
 
 
+def subtract_uncertain_from_active(
+    uncertain: Sequence[UncertainInterval],
+    active: Sequence[SpeakerSegment],
+) -> tuple[UncertainInterval, ...]:
+    """Drop uncertain time that overlaps the same speaker's active speech."""
+
+    active_by_speaker: dict[tuple[str, str], list[SpeakerSegment]] = defaultdict(list)
+    for segment in active:
+        active_by_speaker[(segment.recording_id, segment.speaker)].append(segment)
+    remaining: list[UncertainInterval] = []
+    for region in uncertain:
+        cut = active_by_speaker.get((region.recording_id, region.speaker), ())
+        for start_ns, end_ns in subtract_spans([region], cut):
+            remaining.append(UncertainInterval(region.recording_id, region.speaker, start_ns, end_ns))
+    remaining.sort(key=lambda item: (item.start_ns, item.end_ns, item.speaker))
+    return tuple(remaining)
+
+
 def merge_recording(
     labels: RecordingLabels,
     *,
     min_gap_ns: int = MIN_GAP_NS,
     within: Sequence[SpeakerSegment] | None = None,
 ) -> RecordingLabels:
-    """Merge short gaps on a recording and keep uncertain regions."""
+    """Merge short gaps on a recording and drop overlapping uncertain time."""
 
+    merged = merge_short_gaps(labels.segments, min_gap_ns=min_gap_ns, within=within)
     return RecordingLabels(
         labels.recording_id,
-        merge_short_gaps(labels.segments, min_gap_ns=min_gap_ns, within=within),
-        labels.uncertain,
+        merged,
+        subtract_uncertain_from_active(labels.uncertain, merged),
     )
 
 
-__all__ = ["MIN_GAP_NS", "MIN_GAP_SECONDS", "merge_recording", "merge_short_gaps"]
+__all__ = [
+    "MIN_GAP_NS",
+    "MIN_GAP_SECONDS",
+    "merge_recording",
+    "merge_short_gaps",
+    "subtract_uncertain_from_active",
+]

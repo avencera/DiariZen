@@ -8,8 +8,8 @@ from fractions import Fraction
 from typing import Mapping, Sequence
 
 from .domain import Interval, RecordingLabels, SpeakerSegment, UncertainInterval
-from .intervals import duration_ns, intersect_spans, subtract_spans, union_spans
-from .merge import MIN_GAP_NS, merge_short_gaps
+from .intervals import duration_ns, intersect_spans, union_spans
+from .merge import MIN_GAP_NS, merge_recording, merge_short_gaps
 from .time import COVERAGE_RATIO, coverage_meets
 
 
@@ -65,24 +65,6 @@ def tighten_segment(
     return TightenSegmentResult(active, (), coverage, False)
 
 
-def _subtract_uncertain_from_active(
-    uncertain: Sequence[UncertainInterval],
-    active: Sequence[SpeakerSegment],
-) -> tuple[UncertainInterval, ...]:
-    """Drop uncertain time that overlaps the same speaker's active speech."""
-
-    active_by_speaker: dict[tuple[str, str], list[SpeakerSegment]] = defaultdict(list)
-    for segment in active:
-        active_by_speaker[(segment.recording_id, segment.speaker)].append(segment)
-    remaining: list[UncertainInterval] = []
-    for region in uncertain:
-        cut = active_by_speaker.get((region.recording_id, region.speaker), ())
-        for start_ns, end_ns in subtract_spans([region], cut):
-            remaining.append(UncertainInterval(region.recording_id, region.speaker, start_ns, end_ns))
-    remaining.sort(key=lambda item: (item.start_ns, item.end_ns, item.speaker))
-    return tuple(remaining)
-
-
 def tighten_recording(
     original: RecordingLabels,
     aligned_by_speaker: Mapping[str, Sequence[Interval | SpeakerSegment | tuple[int, int]]],
@@ -91,7 +73,13 @@ def tighten_recording(
     min_coverage: Fraction | str | float = COVERAGE_RATIO,
     min_gap_ns: int = MIN_GAP_NS,
 ) -> RecordingLabels:
-    """Tighten every original human segment, then merge short gaps inside them."""
+    """Tighten every original human segment, then merge short same-speaker gaps.
+
+    The final merge is speaker-wide. Gaps shorter than min_gap_ns become
+    speech even when they sit between adjacent human segments. A gap of
+    exactly min_gap_ns stays. UNCERTAIN time that the merge overlaps is
+    dropped so it never covers the same speaker's active speech.
+    """
 
     humans = union_human_segments(original.segments)
     active: list[SpeakerSegment] = []
@@ -106,6 +94,7 @@ def tighten_recording(
         )
         active.extend(result.active)
         uncertain.extend(result.uncertain)
-    merged = merge_short_gaps(active, min_gap_ns=min_gap_ns, within=humans)
-    kept_uncertain = _subtract_uncertain_from_active(uncertain, merged)
-    return RecordingLabels(original.recording_id, merged, kept_uncertain)
+    return merge_recording(
+        RecordingLabels(original.recording_id, tuple(active), tuple(uncertain)),
+        min_gap_ns=min_gap_ns,
+    )
