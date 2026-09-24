@@ -414,6 +414,32 @@ def _classes_from_row_outcomes(
     return tuple(classes)
 
 
+def _add_uncertain_for_unresolved_unions(
+    original: RecordingLabels,
+    labels: RecordingLabels,
+    row_classes: Sequence[SegmentClass],
+) -> RecordingLabels:
+    """Mark each unresolved same-speaker union UNCERTAIN without removing speech."""
+
+    unresolved = tuple(
+        item
+        for item in row_classes
+        if item.outcome in (SegmentOutcome.ALIGNMENT_FAILURE, SegmentOutcome.BY_DESIGN_UNCERTAIN)
+    )
+    extra = tuple(
+        UncertainInterval(original.recording_id, segment.speaker, segment.start_ns, segment.end_ns)
+        for segment in unioned_original_segments([original])
+        if any(
+            item.recording_id == segment.recording_id
+            and item.speaker == segment.speaker
+            and item.start_ns < segment.end_ns
+            and item.end_ns > segment.start_ns
+            for item in unresolved
+        )
+    )
+    return apply_extra_uncertain(labels, extra)
+
+
 def _held_out_classes(original: RecordingLabels) -> tuple[SegmentClass, ...]:
     return tuple(
         SegmentClass.from_segment(
@@ -593,7 +619,6 @@ def align_indic_recording(
     matched, report = match_segments(original.segments, transcripts)
     mix, _ = load_audio_mono(ref.audio_path)
     aligned_by_speaker: dict[str, list[AlignedWord]] = defaultdict(list)
-    failed_segments: list[SpeakerSegment] = []
     kinds: dict[str, int] = defaultdict(int)
     lcode = INDIC_UROMAN_LCODES.get(language)
     coverages: list[float] = []
@@ -605,7 +630,6 @@ def align_indic_recording(
         hit = matched.get(key)
         if hit is None:
             kinds["unmatched"] += 1
-            failed_segments.append(segment)
             row_outcomes[key] = SegmentClass.from_segment(
                 segment,
                 SegmentOutcome.ALIGNMENT_FAILURE,
@@ -615,7 +639,6 @@ def align_indic_recording(
         prepared = prepare_transcript(hit.text)
         if not prepared.alignable:
             kinds["marker"] += 1
-            failed_segments.append(segment)
             reason = (
                 AlignmentFailureReason.EMPTY_TEXT
                 if not hit.text.strip()
@@ -632,7 +655,6 @@ def align_indic_recording(
         if romanized.empty:
             empty_roman += 1
             kinds["empty-roman"] += 1
-            failed_segments.append(segment)
             row_outcomes[key] = SegmentClass.from_segment(
                 segment,
                 SegmentOutcome.ALIGNMENT_FAILURE,
@@ -649,7 +671,6 @@ def align_indic_recording(
         )
         if not words:
             kinds["align-failed"] += 1
-            failed_segments.append(segment)
             row_outcomes[key] = SegmentClass.from_segment(
                 segment,
                 SegmentOutcome.ALIGNMENT_FAILURE,
@@ -661,7 +682,13 @@ def align_indic_recording(
         coverages.append(covered / segment.duration_ns if segment.duration_ns else 0.0)
         kinds["aligned"] += 1
         row_outcomes[key] = SegmentClass.from_segment(segment, SegmentOutcome.ALIGNED)
-    tight = _tighten(original, aligned_by_speaker, ref, failed_segments=failed_segments, per_segment=True)
+    tight = _tighten(
+        original,
+        aligned_by_speaker,
+        ref,
+        row_classes=tuple(row_outcomes.values()),
+        per_segment=True,
+    )
     classes = _mark_low_coverage(_classes_from_row_outcomes(original, row_outcomes), tight)
     return {
         "recording_id": ref.recording_id,
@@ -761,7 +788,6 @@ def align_lotusdis_recording(
     for segment in original.segments:
         by_bounds[(segment.start_ns, segment.end_ns)].append(segment)
     aligned_by_speaker: dict[str, list[AlignedWord]] = defaultdict(list)
-    failed_segments: list[SpeakerSegment] = []
     kinds: dict[str, int] = defaultdict(int)
     coverages: list[float] = []
     matched = 0
@@ -778,7 +804,6 @@ def align_lotusdis_recording(
         matched += 1
         if interval.overlap:
             kinds["overlap-uncertain"] += 1
-            failed_segments.extend(rows)
             for row in rows:
                 row_outcomes[(row.speaker, row.start_ns, row.end_ns)] = SegmentClass.from_segment(
                     row,
@@ -789,7 +814,6 @@ def align_lotusdis_recording(
         prepared = prepare_transcript(interval.text, keep_square_bracket_words=True)
         if not prepared.alignable:
             kinds["marker"] += 1
-            failed_segments.extend(rows)
             reason = (
                 AlignmentFailureReason.EMPTY_TEXT
                 if not interval.text.strip()
@@ -805,7 +829,6 @@ def align_lotusdis_recording(
         romanized = aligner.romanize(prepared.remainder, lcode=THAI_UROMAN_LCODE)
         if romanized.empty:
             kinds["empty-roman"] += 1
-            failed_segments.extend(rows)
             for row in rows:
                 row_outcomes[(row.speaker, row.start_ns, row.end_ns)] = SegmentClass.from_segment(
                     row,
@@ -826,7 +849,6 @@ def align_lotusdis_recording(
         )
         if not words:
             kinds["align-failed"] += 1
-            failed_segments.extend(rows)
             for row in rows:
                 row_outcomes[(row.speaker, row.start_ns, row.end_ns)] = SegmentClass.from_segment(
                     row,
@@ -850,7 +872,7 @@ def align_lotusdis_recording(
         original,
         aligned_by_speaker,
         ref,
-        failed_segments=failed_segments,
+        row_classes=tuple(row_outcomes.values()),
         extra_uncertain=extra_uncertain,
         per_segment=True,
     )
@@ -958,7 +980,7 @@ def _tighten(
     aligned_by_speaker: Mapping[str, Sequence[AlignedWord]],
     ref: RecordingRef,
     *,
-    failed_segments: Sequence[SpeakerSegment] = (),
+    row_classes: Sequence[SegmentClass] = (),
     extra_uncertain: Sequence[UncertainInterval] = (),
     per_segment: bool = True,
 ) -> RecordingLabels:
@@ -966,7 +988,11 @@ def _tighten(
         speaker: [Interval(item.start_ns, item.end_ns) for item in words if item.end_ns > item.start_ns]
         for speaker, words in aligned_by_speaker.items()
     }
-    failed_keys = {(item.speaker, item.start_ns, item.end_ns) for item in failed_segments}
+    failed_keys = {
+        (item.speaker, item.start_ns, item.end_ns)
+        for item in row_classes
+        if item.outcome is not SegmentOutcome.ALIGNED
+    }
     active: list[SpeakerSegment] = []
     uncertain: list[UncertainInterval] = []
     for segment in original.segments:
@@ -977,10 +1003,14 @@ def _tighten(
         )
         active.extend(result.active)
         uncertain.extend(result.uncertain)
-    tight = RecordingLabels(
-        original.recording_id,
-        tuple(active),
-        tuple(uncertain) + tuple(extra_uncertain),
+    tight = _add_uncertain_for_unresolved_unions(
+        original,
+        RecordingLabels(
+            original.recording_id,
+            tuple(active),
+            tuple(uncertain) + tuple(extra_uncertain),
+        ),
+        row_classes,
     )
     clipped = clip_recording_to_uem(tight, ref.uem_start_ns, ref.uem_end_ns)
     return merge_recording(clipped, min_gap_ns=MIN_GAP_NS)
@@ -1254,7 +1284,6 @@ def produce_source(
             )
             from_cache = True
         labels = merge_recording(labels)
-        payload["labels"] = labels
         if from_cache:
             if payload.get("segment_classes"):
                 try:
@@ -1274,6 +1303,13 @@ def produce_source(
                     held_out=is_held_out,
                     overlap_keys=overlap_keys,
                 )
+            labels = _add_uncertain_for_unresolved_unions(
+                source_labels,
+                labels,
+                payload["segment_classes"],
+            )
+            labels = merge_recording(labels)
+        payload["labels"] = labels
         payload["held_out"] = is_held_out
         payload.setdefault("held_out_speech_ns", duration_ns(source_labels.segments) if is_held_out else 0)
         results.append(payload)

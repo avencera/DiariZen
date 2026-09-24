@@ -481,3 +481,136 @@ def test_mms_tighten_merges_a_40ms_gap_between_human_segments(tmp_path) -> None:
     assert [(item.start_ns, item.end_ns) for item in tight.segments] == [
         (parse_seconds_to_ns(0), parse_seconds_to_ns(2))
     ]
+
+
+def test_mms_tighten_marks_failed_same_speaker_union_uncertain_without_losing_speech(tmp_path) -> None:
+    from recipes.speakrs.large.tight_labels.classify import (
+        AlignmentFailureReason,
+        SegmentClass,
+        SegmentOutcome,
+    )
+    from recipes.speakrs.large.tight_labels.produce import RecordingRef
+    from recipes.speakrs.large.tight_labels.produce_mms import _tighten
+
+    recording = "rec"
+    aligned_row = SpeakerSegment.from_seconds(recording, "A", 0, 10)
+    failed_row = SpeakerSegment.from_seconds(recording, "A", 4, 5)
+    original = RecordingLabels(recording, (aligned_row, failed_row))
+    row_classes = (
+        SegmentClass.from_segment(aligned_row, SegmentOutcome.ALIGNED),
+        SegmentClass.from_segment(
+            failed_row,
+            SegmentOutcome.ALIGNMENT_FAILURE,
+            failure_reason=AlignmentFailureReason.ALIGNER_ERROR,
+        ),
+    )
+    ref = RecordingRef(
+        recording,
+        tmp_path / "audio.wav",
+        tmp_path / "recording.uem",
+        parse_seconds_to_ns(10),
+        0,
+        parse_seconds_to_ns(10),
+    )
+
+    tight = _tighten(
+        original,
+        {"A": (Interval.from_seconds(0, 8),)},
+        ref,
+        row_classes=row_classes,
+    )
+
+    assert tight.segments == (SpeakerSegment.from_seconds(recording, "A", 0, 8),)
+    assert tight.uncertain == (UncertainInterval.from_seconds(recording, "A", 8, 10),)
+
+
+def test_mms_cached_labels_expand_stored_failed_union_without_changing_speech() -> None:
+    from recipes.speakrs.large.tight_labels.classify import (
+        AlignmentFailureReason,
+        SegmentClass,
+        SegmentOutcome,
+    )
+    from recipes.speakrs.large.tight_labels.produce_mms import (
+        _add_uncertain_for_unresolved_unions,
+        _classes_from_payload,
+        _classes_to_payload,
+    )
+
+    recording = "rec"
+    original = RecordingLabels(
+        recording,
+        (
+            SpeakerSegment.from_seconds(recording, "A", 0, 10),
+            SpeakerSegment.from_seconds(recording, "A", 4, 5),
+        ),
+    )
+    active = (SpeakerSegment.from_seconds(recording, "A", 0, 8),)
+    cached_labels = RecordingLabels(recording, active)
+    stored_classes = _classes_to_payload(
+        (
+            SegmentClass.from_segment(
+                SpeakerSegment.from_seconds(recording, "A", 0, 10),
+                SegmentOutcome.ALIGNMENT_FAILURE,
+                failure_reason=AlignmentFailureReason.ALIGNER_ERROR,
+            ),
+        )
+    )
+
+    rebuilt = _add_uncertain_for_unresolved_unions(
+        original,
+        cached_labels,
+        _classes_from_payload(stored_classes),
+    )
+
+    assert rebuilt.segments == active
+    assert rebuilt.uncertain == (UncertainInterval.from_seconds(recording, "A", 8, 10),)
+
+
+def test_mms_tighten_expands_lotus_by_design_union_uncertainty(tmp_path) -> None:
+    from recipes.speakrs.large.tight_labels.classify import ByDesignReason, SegmentClass, SegmentOutcome
+    from recipes.speakrs.large.tight_labels.produce import RecordingRef
+    from recipes.speakrs.large.tight_labels.produce_mms import _tighten
+
+    recording = "lotusdis::meeting"
+    aligned_row = SpeakerSegment.from_seconds(recording, "F01", 0, 10)
+    overlap_row = SpeakerSegment.from_seconds(recording, "F01", 4, 5)
+    other_speaker_row = SpeakerSegment.from_seconds(recording, "M02", 4, 5)
+    original = RecordingLabels(recording, (aligned_row, overlap_row, other_speaker_row))
+    overlap_classes = (
+        SegmentClass.from_segment(aligned_row, SegmentOutcome.ALIGNED),
+        SegmentClass.from_segment(
+            overlap_row,
+            SegmentOutcome.BY_DESIGN_UNCERTAIN,
+            by_design_reason=ByDesignReason.MULTI_SPEAKER,
+        ),
+        SegmentClass.from_segment(
+            other_speaker_row,
+            SegmentOutcome.BY_DESIGN_UNCERTAIN,
+            by_design_reason=ByDesignReason.MULTI_SPEAKER,
+        ),
+    )
+    ref = RecordingRef(
+        recording,
+        tmp_path / "audio.wav",
+        tmp_path / "recording.uem",
+        parse_seconds_to_ns(10),
+        0,
+        parse_seconds_to_ns(10),
+    )
+
+    tight = _tighten(
+        original,
+        {"F01": (Interval.from_seconds(0, 8),)},
+        ref,
+        row_classes=overlap_classes,
+        extra_uncertain=(
+            UncertainInterval.from_seconds(recording, "F01", 4, 5),
+            UncertainInterval.from_seconds(recording, "M02", 4, 5),
+        ),
+    )
+
+    assert tight.segments == (SpeakerSegment.from_seconds(recording, "F01", 0, 8),)
+    assert tight.uncertain == (
+        UncertainInterval.from_seconds(recording, "M02", 4, 5),
+        UncertainInterval.from_seconds(recording, "F01", 8, 10),
+    )
