@@ -27,12 +27,29 @@ def as_spans(items: Iterable[Interval | SpeakerSegment | UncertainInterval | NsS
 def union_spans(items: Iterable[Interval | SpeakerSegment | UncertainInterval | NsSpan]) -> list[NsSpan]:
     """Merge overlapping and touching spans."""
 
+    return _merge_spans(items, touch=True)
+
+
+def union_overlapping_spans(
+    items: Iterable[Interval | SpeakerSegment | UncertainInterval | NsSpan],
+) -> list[NsSpan]:
+    """Merge strictly overlapping spans and keep touching spans separate."""
+
+    return _merge_spans(items, touch=False)
+
+
+def _merge_spans(
+    items: Iterable[Interval | SpeakerSegment | UncertainInterval | NsSpan],
+    *,
+    touch: bool,
+) -> list[NsSpan]:
     ordered = sorted(as_spans(items), key=lambda span: (span[0], span[1]))
     if not ordered:
         return []
     merged = [[ordered[0][0], ordered[0][1]]]
     for start_ns, end_ns in ordered[1:]:
-        if start_ns <= merged[-1][1]:
+        can_merge = start_ns <= merged[-1][1] if touch else start_ns < merged[-1][1]
+        if can_merge:
             merged[-1][1] = max(merged[-1][1], end_ns)
         else:
             merged.append([start_ns, end_ns])

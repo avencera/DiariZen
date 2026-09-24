@@ -6,8 +6,10 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Sequence
 
+from collections import defaultdict
+
 from .domain import RecordingLabels, SpeakerSegment, require_identity, require_ns_bounds
-from .tighten import union_human_segments
+from .intervals import union_overlapping_spans
 
 
 class SegmentOutcome(Enum):
@@ -111,11 +113,21 @@ class SegmentClass:
 
 
 def unioned_original_segments(original: Sequence[RecordingLabels]) -> tuple[SpeakerSegment, ...]:
-    """Return per-speaker unions of original human segments, in recording order."""
+    """Return original human segments with overlapping same-speaker rows collapsed.
+
+    Touching same-speaker rows stay separate so adjacent single-speaker and
+    by-design overlap intervals keep their own outcomes.
+    """
 
     rows: list[SpeakerSegment] = []
     for labels in original:
-        rows.extend(union_human_segments(labels.segments))
+        grouped: dict[str, list[SpeakerSegment]] = defaultdict(list)
+        for segment in labels.segments:
+            grouped[segment.speaker].append(segment)
+        for speaker, group in grouped.items():
+            for start_ns, end_ns in union_overlapping_spans(group):
+                rows.append(SpeakerSegment(labels.recording_id, speaker, start_ns, end_ns))
+    rows.sort(key=lambda item: (item.recording_id, item.start_ns, item.end_ns, item.speaker))
     return tuple(rows)
 
 

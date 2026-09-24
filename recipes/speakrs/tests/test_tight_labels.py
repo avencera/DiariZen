@@ -739,6 +739,25 @@ def test_gates_exclude_by_design_segments_from_failure_share() -> None:
     assert 0.0 <= gate.by_design_share <= 1.0
 
 
+def test_gates_keep_touching_original_rows_as_separate_segments() -> None:
+    originals = (_seg("A", 0, 1), _seg("A", 1, 2))
+    original = [RecordingLabels("rec", originals)]
+    new = [RecordingLabels("rec", (_seg("A", 0, 1),), (_unc("A", 1, 2),))]
+    classes = (
+        _cls(originals[0], SegmentOutcome.ALIGNED),
+        _cls(
+            originals[1],
+            SegmentOutcome.BY_DESIGN_UNCERTAIN,
+            by_design_reason=ByDesignReason.MULTI_SPEAKER,
+        ),
+    )
+
+    gate = evaluate_gates(original, new, segment_classes=classes)
+
+    assert gate.failure_share == pytest.approx(0.0)
+    assert gate.by_design_share == pytest.approx(0.5)
+
+
 def test_gates_union_overlapping_original_rows_before_counting() -> None:
     original = [RecordingLabels("rec", (_seg("A", 0, 2), _seg("A", 1, 3)))]
     new = [RecordingLabels("rec", (), (_unc("A", 0, 3),))]
