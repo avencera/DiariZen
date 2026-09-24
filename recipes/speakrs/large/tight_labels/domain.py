@@ -216,9 +216,16 @@ class RecordingLabels:
     recording_id: str
     segments: tuple[SpeakerSegment, ...]
     uncertain: tuple[UncertainInterval, ...] = ()
+    uncertain_removed_ns: int = 0
 
     def __post_init__(self) -> None:
         require_identity(self.recording_id, "recording_id")
+        if (
+            isinstance(self.uncertain_removed_ns, bool)
+            or not isinstance(self.uncertain_removed_ns, int)
+            or self.uncertain_removed_ns < 0
+        ):
+            raise ValueError("uncertain_removed_ns must be a non-negative integer")
         segments = tuple(self.segments)
         uncertain = tuple(self.uncertain)
         object.__setattr__(self, "segments", segments)
@@ -232,10 +239,11 @@ class RecordingLabels:
                 raise ValueError("uncertain must contain UncertainInterval values")
             if region.recording_id != self.recording_id:
                 raise ValueError("uncertain recording_id must match the recording")
-        from .merge import subtract_uncertain_from_active
+        from .merge import canonicalize_uncertain
 
-        canonical = subtract_uncertain_from_active(uncertain, segments)
+        canonical, removed_ns = canonicalize_uncertain(uncertain, segments)
         object.__setattr__(self, "uncertain", canonical)
+        object.__setattr__(self, "uncertain_removed_ns", self.uncertain_removed_ns + removed_ns)
         self._reject_same_speaker_overlap(segments, canonical)
 
     @staticmethod
@@ -279,6 +287,7 @@ class RecordingLabels:
             tuple(
                 UncertainInterval(recording_id, item.speaker, item.start_ns, item.end_ns) for item in self.uncertain
             ),
+            uncertain_removed_ns=self.uncertain_removed_ns,
         )
 
     def map_speakers(self, speaker_map: Mapping[str, str]) -> RecordingLabels:
@@ -297,7 +306,12 @@ class RecordingLabels:
             for item in self.uncertain
             if item.speaker in speaker_map
         )
-        return RecordingLabels(self.recording_id, segments, uncertain)
+        return RecordingLabels(
+            self.recording_id,
+            segments,
+            uncertain,
+            uncertain_removed_ns=self.uncertain_removed_ns,
+        )
 
 
 def segments_from_pairs(

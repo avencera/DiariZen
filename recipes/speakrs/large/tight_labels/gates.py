@@ -83,6 +83,7 @@ class UncertainShare:
     original_ns: int
     uncertain_ns: int
     uncertain_excluding_by_design_ns: int
+    canonicalization_removed_ns: int = 0
 
     @property
     def original_seconds(self) -> float:
@@ -117,6 +118,12 @@ class UncertainShare:
         if self.original_ns <= 0:
             return 0.0
         return self.uncertain_excluding_by_design_ns / self.original_ns
+
+    @property
+    def canonicalization_removed_seconds(self) -> float:
+        """Return UNCERTAIN time dropped because it overlapped same-speaker speech."""
+
+        return ns_to_seconds(self.canonicalization_removed_ns)
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,15 +169,16 @@ class GateResult:
     subset_ok: bool | None
     uem_ok: bool
     unmapped_speakers_ok: bool
-    uncertain_overlap_ok: bool
     tightness: TightnessStats
     original_tightness: TightnessStats
     speaker_retention: tuple[SpeakerRetention, ...]
     overlap_retention: float | None
     failure_share: float
+    failure_share_excluding_by_design: float
     by_design_share: float
     uncertain_share: float
     uncertain_share_excluding_by_design: float
+    uncertain_canonicalization_removed_ns: int
     failure_share_limit: float
     speaker_retention_floor: float
     uncertain_by_recording: tuple[UncertainShare, ...]
@@ -198,7 +206,6 @@ class GateResult:
             "subset_ok": self.subset_ok,
             "uem_ok": self.uem_ok,
             "unmapped_speakers_ok": self.unmapped_speakers_ok,
-            "uncertain_overlap_ok": self.uncertain_overlap_ok,
             "tightness": self.tightness.to_json(),
             "original_tightness": self.original_tightness.to_json(),
             "reference_forced_ami": {
@@ -217,9 +224,13 @@ class GateResult:
             },
             "overlap_retention": self.overlap_retention,
             "failure_share": self.failure_share,
+            "failure_share_excluding_by_design": self.failure_share_excluding_by_design,
             "by_design_share": self.by_design_share,
             "uncertain_share": self.uncertain_share,
             "uncertain_share_excluding_by_design": self.uncertain_share_excluding_by_design,
+            "uncertain_canonicalization_removed_seconds": ns_to_seconds(
+                self.uncertain_canonicalization_removed_ns
+            ),
             "failure_share_limit": self.failure_share_limit,
             "speaker_retention_floor": self.speaker_retention_floor,
             "uncertain_by_recording": [
@@ -228,6 +239,7 @@ class GateResult:
                     "original_seconds": item.original_seconds,
                     "uncertain_seconds": item.uncertain_seconds,
                     "uncertain_excluding_by_design_seconds": item.uncertain_excluding_by_design_seconds,
+                    "canonicalization_removed_seconds": item.canonicalization_removed_seconds,
                     "ratio": item.ratio,
                     "ratio_excluding_by_design": item.ratio_excluding_by_design,
                 }
@@ -310,13 +322,15 @@ def _overlap_ns(labels: RecordingLabels) -> int:
     return overlap_timeline_ns(grouped)
 
 
-def _segment_shares(classes: Sequence[SegmentClass]) -> tuple[float, float]:
+def _segment_shares(classes: Sequence[SegmentClass]) -> tuple[float, float, float]:
     total = len(classes)
     if total <= 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
     failures = sum(1 for item in classes if item.outcome is SegmentOutcome.ALIGNMENT_FAILURE)
     by_design = sum(1 for item in classes if item.outcome is SegmentOutcome.BY_DESIGN_UNCERTAIN)
-    return failures / total, by_design / total
+    eligible = total - by_design
+    excluding = 0.0 if eligible <= 0 else failures / eligible
+    return failures / total, by_design / total, excluding
 
 
 def _speaker_time_ns(items: Sequence[SpeakerSegment | UncertainInterval]) -> int:
@@ -364,17 +378,13 @@ def _uncertain_share_row(
         new.uncertain,
         _by_design_spans(classes, original.recording_id),
     )
-    return UncertainShare(original.recording_id, original_ns, uncertain_ns, excluding_ns)
-
-
-def _uncertain_overlaps_speech(labels: RecordingLabels) -> bool:
-    active_by_speaker: dict[str, list[SpeakerSegment]] = defaultdict(list)
-    for segment in labels.segments:
-        active_by_speaker[segment.speaker].append(segment)
-    for region in labels.uncertain:
-        if overlap_duration_ns([region], active_by_speaker.get(region.speaker, ())) > 0:
-            return True
-    return False
+    return UncertainShare(
+        original.recording_id,
+        original_ns,
+        uncertain_ns,
+        excluding_ns,
+        new.uncertain_removed_ns,
+    )
 
 
 def _rows_outside_uem(
@@ -429,9 +439,9 @@ def evaluate_gates(
     original_speech_ns = 0
     uncertain_ns = 0
     uncertain_excluding_ns = 0
+    uncertain_removed_ns = 0
     subset_ok: bool | None = True if require_subset else None
     outside_rows: list[str] = []
-    uncertain_overlap_ok = True
     for recording_id in sorted(original_by_id):
         source = original_by_id[recording_id]
         produced = new_by_id[recording_id]
@@ -442,12 +452,11 @@ def evaluate_gates(
         original_speech_ns += share.original_ns
         uncertain_ns += share.uncertain_ns
         uncertain_excluding_ns += share.uncertain_excluding_by_design_ns
+        uncertain_removed_ns += share.canonicalization_removed_ns
         original_overlap += _overlap_ns(source)
         new_overlap += _overlap_ns(produced)
         if require_subset and not recording_is_subset(produced, source, min_gap_ns=min_gap_ns):
             subset_ok = False
-        if _uncertain_overlaps_speech(produced):
-            uncertain_overlap_ok = False
         if uem_by_recording is not None:
             uem_start_ns, uem_end_ns = uem_by_recording[recording_id]
             outside_rows.extend(_rows_outside_uem(produced, uem_start_ns, uem_end_ns))
@@ -461,7 +470,7 @@ def evaluate_gates(
         item.recording_id for item in time_bases if item.new_outside_share > published_outside_flag
     )
     overlap_retention = None if original_overlap <= 0 else new_overlap / original_overlap
-    failure_share, by_design_share = _segment_shares(classes)
+    failure_share, by_design_share, failure_share_excluding_by_design = _segment_shares(classes)
     uncertain_share = 0.0 if original_speech_ns <= 0 else uncertain_ns / original_speech_ns
     uncertain_share_excluding_by_design = (
         0.0 if original_speech_ns <= 0 else uncertain_excluding_ns / original_speech_ns
@@ -511,20 +520,12 @@ def evaluate_gates(
             f"{len(unmapped_published)} published speakers are unmapped; "
             f"dropped {ns_to_seconds(dropped_unmapped_ns):.3f} s of published speech"
         )
-    if not uncertain_overlap_ok:
-        notes.append("UNCERTAIN regions overlap active speech of the same speaker")
     if not failure_share_ok:
         notes.append(
             f"failure share {failure_share:.4f} is above the {failure_share_limit:.2f} limit"
         )
 
-    hard_gates_ok = (
-        smallest_gap_ok
-        and uem_ok
-        and unmapped_speakers_ok
-        and uncertain_overlap_ok
-        and subset_ok is not False
-    )
+    hard_gates_ok = smallest_gap_ok and uem_ok and unmapped_speakers_ok and subset_ok is not False
     passed = hard_gates_ok and failure_share_ok
     return GateResult(
         passed=passed,
@@ -537,15 +538,16 @@ def evaluate_gates(
         subset_ok=subset_ok,
         uem_ok=uem_ok,
         unmapped_speakers_ok=unmapped_speakers_ok,
-        uncertain_overlap_ok=uncertain_overlap_ok,
         tightness=tightness,
         original_tightness=original_tightness,
         speaker_retention=tuple(retentions),
         overlap_retention=overlap_retention,
         failure_share=failure_share,
+        failure_share_excluding_by_design=failure_share_excluding_by_design,
         by_design_share=by_design_share,
         uncertain_share=uncertain_share,
         uncertain_share_excluding_by_design=uncertain_share_excluding_by_design,
+        uncertain_canonicalization_removed_ns=uncertain_removed_ns,
         failure_share_limit=failure_share_limit,
         speaker_retention_floor=speaker_retention_floor,
         uncertain_by_recording=tuple(uncertain_rows),

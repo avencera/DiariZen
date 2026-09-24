@@ -253,7 +253,12 @@ def clip_recording_to_uem(
         clipped = clip_span(item.start_ns, item.end_ns, uem_start_ns, uem_end_ns)
         if clipped is not None:
             uncertain.append(UncertainInterval(labels.recording_id, item.speaker, clipped[0], clipped[1]))
-    return RecordingLabels(labels.recording_id, tuple(segments), tuple(uncertain))
+    return RecordingLabels(
+        labels.recording_id,
+        tuple(segments),
+        tuple(uncertain),
+        uncertain_removed_ns=labels.uncertain_removed_ns,
+    )
 
 
 def span_outside_uem(start_ns: int, end_ns: int, uem_start_ns: int, uem_end_ns: int) -> bool:

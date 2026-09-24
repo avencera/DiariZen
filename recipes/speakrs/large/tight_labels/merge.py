@@ -46,11 +46,11 @@ def merge_short_gaps(
     return tuple(merged)
 
 
-def subtract_uncertain_from_active(
+def canonicalize_uncertain(
     uncertain: Sequence[UncertainInterval],
     active: Sequence[SpeakerSegment],
-) -> tuple[UncertainInterval, ...]:
-    """Union overlapping and touching UNCERTAIN per speaker, then drop active speech."""
+) -> tuple[tuple[UncertainInterval, ...], int]:
+    """Union UNCERTAIN per speaker, drop same-speaker speech, and return removed time."""
 
     grouped: dict[tuple[str, str], list[UncertainInterval]] = defaultdict(list)
     for region in uncertain:
@@ -59,12 +59,28 @@ def subtract_uncertain_from_active(
     for segment in active:
         active_by_speaker[(segment.recording_id, segment.speaker)].append(segment)
     remaining: list[UncertainInterval] = []
+    removed_ns = 0
     for (recording_id, speaker), regions in grouped.items():
-        cut = active_by_speaker.get((recording_id, speaker), ())
-        for start_ns, end_ns in subtract_spans(union_spans(regions), cut):
-            remaining.append(UncertainInterval(recording_id, speaker, start_ns, end_ns))
+        unioned = union_spans(regions)
+        leftover = subtract_spans(unioned, active_by_speaker.get((recording_id, speaker), ()))
+        removed_ns += sum(end_ns - start_ns for start_ns, end_ns in unioned) - sum(
+            end_ns - start_ns for start_ns, end_ns in leftover
+        )
+        remaining.extend(
+            UncertainInterval(recording_id, speaker, start_ns, end_ns) for start_ns, end_ns in leftover
+        )
     remaining.sort(key=lambda item: (item.start_ns, item.end_ns, item.speaker))
-    return tuple(remaining)
+    return tuple(remaining), removed_ns
+
+
+def subtract_uncertain_from_active(
+    uncertain: Sequence[UncertainInterval],
+    active: Sequence[SpeakerSegment],
+) -> tuple[UncertainInterval, ...]:
+    """Union overlapping and touching UNCERTAIN per speaker, then drop active speech."""
+
+    remaining, _removed_ns = canonicalize_uncertain(uncertain, active)
+    return remaining
 
 
 def merge_recording(
@@ -76,7 +92,12 @@ def merge_recording(
     """Merge short gaps on a recording and drop overlapping uncertain time."""
 
     merged = merge_short_gaps(labels.segments, min_gap_ns=min_gap_ns, within=within)
-    return RecordingLabels(labels.recording_id, merged, labels.uncertain)
+    return RecordingLabels(
+        labels.recording_id,
+        merged,
+        labels.uncertain,
+        uncertain_removed_ns=labels.uncertain_removed_ns,
+    )
 
 
 __all__ = [
