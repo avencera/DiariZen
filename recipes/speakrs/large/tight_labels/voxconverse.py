@@ -22,6 +22,13 @@ import soundfile as sf
 from ..jsonio import read_json, write_json
 from ..storage import require_free_gib
 from . import LIBRARY_VERSION
+from .classify import (
+    AlignmentFailureReason,
+    ByDesignReason,
+    SegmentClass,
+    SegmentOutcome,
+    unioned_original_segments,
+)
 from .domain import Interval, RecordingLabels, SpeakerSegment
 from .gates import GateResult, evaluate_gates
 from .guards import (
@@ -50,8 +57,8 @@ from .produce import (
     release_id_with_version,
     render_gate_markdown,
 )
-from .tighten import tighten_recording, union_human_segments
-from .time import NANOSECONDS_PER_SECOND, ns_to_seconds
+from .tighten import COVERAGE_RATIO, tighten_recording, union_human_segments
+from .time import NANOSECONDS_PER_SECOND, coverage_meets, ns_to_seconds
 from .writers import (
     render_speaker_rttm,
     rewrite_uem_file_id,
@@ -1082,6 +1089,110 @@ def labels_from_alignment(
     return original, produced
 
 
+_BY_DESIGN_GUARDS = frozenset({"SILENCE", "MUSIC_OR_NOISE"})
+_EMPTY_TEXT_GUARDS = frozenset({"EMPTY_ASR", "NO_ALIGNABLE_WORDS"})
+_MARKER_GUARDS = frozenset({"IMPLAUSIBLE_CHAR_RATE", "IMPLAUSIBLE_WORD_RATE", "REPETITION_LOOP"})
+
+
+def _job_outcome(
+    job: SegmentJob,
+    asr: Mapping[str, Any],
+    aligned: Mapping[str, Any],
+) -> SegmentClass:
+    error = str(aligned.get("error") or asr.get("guard") or "")
+    if aligned.get("ok"):
+        covered = 0
+        for word in aligned.get("words") or []:
+            start_ns = int(word["start_ns"])
+            end_ns = int(word["end_ns"])
+            if end_ns > start_ns:
+                covered += max(0, min(end_ns, job.end_ns) - max(start_ns, job.start_ns))
+        if coverage_meets(covered, job.duration_ns, COVERAGE_RATIO):
+            return SegmentClass.from_segment(
+                SpeakerSegment(job.recording_id, job.speaker, job.start_ns, job.end_ns),
+                SegmentOutcome.ALIGNED,
+            )
+        return SegmentClass.from_segment(
+            SpeakerSegment(job.recording_id, job.speaker, job.start_ns, job.end_ns),
+            SegmentOutcome.ALIGNMENT_FAILURE,
+            failure_reason=AlignmentFailureReason.LOW_COVERAGE,
+        )
+    guard = error.split(":", 1)[0]
+    segment = SpeakerSegment(job.recording_id, job.speaker, job.start_ns, job.end_ns)
+    if guard in _BY_DESIGN_GUARDS:
+        return SegmentClass.from_segment(
+            segment,
+            SegmentOutcome.BY_DESIGN_UNCERTAIN,
+            by_design_reason=ByDesignReason.SOURCE_RULE,
+        )
+    if guard in _EMPTY_TEXT_GUARDS:
+        return SegmentClass.from_segment(
+            segment,
+            SegmentOutcome.ALIGNMENT_FAILURE,
+            failure_reason=AlignmentFailureReason.EMPTY_TEXT,
+        )
+    if guard in _MARKER_GUARDS:
+        return SegmentClass.from_segment(
+            segment,
+            SegmentOutcome.ALIGNMENT_FAILURE,
+            failure_reason=AlignmentFailureReason.MARKER_ONLY,
+        )
+    return SegmentClass.from_segment(
+        segment,
+        SegmentOutcome.ALIGNMENT_FAILURE,
+        failure_reason=AlignmentFailureReason.ALIGNER_ERROR,
+    )
+
+
+def classify_voxconverse_jobs(
+    original: Sequence[RecordingLabels],
+    _produced: Sequence[RecordingLabels],
+    jobs: Sequence[SegmentJob],
+    asr_rows: Mapping[str, Mapping[str, Any]],
+    align_rows: Mapping[str, Mapping[str, Any]],
+) -> tuple[SegmentClass, ...]:
+    """Map per-job ASR/align outcomes onto overlapping-only original segments."""
+
+    job_classes: dict[tuple[str, str, int, int], SegmentClass] = {}
+    for job in jobs:
+        job_classes[(job.recording_id, job.speaker, job.start_ns, job.end_ns)] = _job_outcome(
+            job,
+            asr_rows.get(job.segment_id, {}),
+            align_rows.get(job.segment_id, {}),
+        )
+    classes: list[SegmentClass] = []
+    for segment in unioned_original_segments(original):
+        owner = next(
+            (
+                item
+                for key, item in job_classes.items()
+                if key[0] == segment.recording_id
+                and key[1] == segment.speaker
+                and key[2] <= segment.start_ns
+                and key[3] >= segment.end_ns
+            ),
+            None,
+        )
+        if owner is None:
+            classes.append(
+                SegmentClass.from_segment(
+                    segment,
+                    SegmentOutcome.ALIGNMENT_FAILURE,
+                    failure_reason=AlignmentFailureReason.ALIGNER_ERROR,
+                )
+            )
+            continue
+        classes.append(
+            SegmentClass.from_segment(
+                segment,
+                owner.outcome,
+                failure_reason=owner.failure_reason,
+                by_design_reason=owner.by_design_reason,
+            )
+        )
+    return tuple(classes)
+
+
 def model_hashes() -> dict[str, Any]:
     """Record aligner and ASR identities from the acquisition receipt plus local files."""
 
@@ -1205,7 +1316,7 @@ def write_release(
         "licenses": [LICENSE],
         "models": model_hashes(),
         "thresholds": {
-            "coverage_ratio": 0.3,
+            "coverage_ratio": float(COVERAGE_RATIO),
             "lid_min_prob": LID_MIN_PROB,
             "mfa_jobs": MFA_JOBS,
             "guard_rules": GUARD_RULES,
@@ -1260,7 +1371,7 @@ def render_agent_report(
         "0.6B v3 on MLX. Other Whisper languages use Whisper small. English "
         "text is aligned with MFA English v3.1.0. Other languages are aligned "
         "with MMS FA after uroman. Word intervals go to `tighten`. Coverage "
-        "below 30% or an alignment failure marks the human-segment interior "
+        f"below {float(COVERAGE_RATIO):.0%} or an alignment failure marks the human-segment interior "
         "UNCERTAIN.",
         "",
         "## Inventory",
@@ -1302,13 +1413,15 @@ def render_agent_report(
         f"- Subset of 200 ms-closed original: {'pass' if gate.subset_ok else 'fail'}",
         f"- Smallest same-speaker gap ≥ 0.200 s: {'pass' if gate.smallest_gap_ok else 'fail'}",
         f"- UNCERTAIN overlapping same-speaker speech: {'pass' if gate.uncertain_overlap_ok else 'fail'}",
-        f"- Failure share ≤ 0.25: {'pass' if gate.failure_share_ok else 'fail'} ({gate.failure_share:.4f})",
+        f"- Failure share ≤ {gate.failure_share_limit:.2f}: {'pass' if gate.failure_share_ok else 'fail'} ({gate.failure_share:.4f})",
         f"- Tightness band (reported): {'pass' if gate.tightness_ok else 'outside reference'}",
-        f"- Speaker retention (reported): {len(gate.flagged_speakers)} speakers below 30%",
+        f"- Speaker retention (reported): {len(gate.flagged_speakers)} speakers below {gate.speaker_retention_floor:.0%}",
         f"- Overlap retention (reported): {gate.overlap_retention}",
         f"- UNCERTAIN share of original speech: {gate.uncertain_share:.4f}",
+        f"- UNCERTAIN share excluding by-design: {gate.uncertain_share_excluding_by_design:.4f}",
+        f"- By-design UNCERTAIN share of original segments: {gate.by_design_share:.4f}",
         f"- Kept current labels: {kept_current}",
-        f"- Flagged speakers below 30% retention: {len(gate.flagged_speakers)}",
+        f"- Flagged speakers below {gate.speaker_retention_floor:.0%} retention: {len(gate.flagged_speakers)}",
         "",
     ]
     if kept_current:
@@ -1371,17 +1484,19 @@ def produce(*, limit: int | None = None, phase: str = "all", release_version: st
 
     original, produced = labels_from_alignment(refs, current_by_id, align_rows)
     uem_by_recording = {ref.recording_id: (ref.uem_start_ns, ref.uem_end_ns) for ref in refs}
+    segment_classes = classify_voxconverse_jobs(original, produced, jobs, asr_rows, align_rows)
     gate = evaluate_gates(
         original,
         produced,
         require_subset=True,
         uem_by_recording=uem_by_recording,
+        segment_classes=segment_classes,
     )
     kept_current = not gate.passed
     summary = summarize_pass(jobs, asr_rows, align_rows)
-    uncertain_ns = sum(region.duration_ns for labels in produced for region in labels.uncertain)
-    original_ns = sum(segment.duration_ns for labels in original for segment in labels.segments)
-    summary["uncertain_share_of_original_speech"] = (uncertain_ns / original_ns) if original_ns else 0.0
+    summary["uncertain_share_of_original_speech"] = gate.uncertain_share
+    summary["uncertain_share_excluding_by_design"] = gate.uncertain_share_excluding_by_design
+    summary["by_design_share"] = gate.by_design_share
     summary["failure_share_gate"] = gate.failure_share
     write_json(WORK_ROOT / "summary.json", {**summary, "gate": gate.to_json(), "kept_current": kept_current})
     release_id = release_id_with_version(RELEASE_ID, release_version)

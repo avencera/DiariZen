@@ -152,6 +152,37 @@ def test_release_id_with_version_replaces_the_suffix() -> None:
     assert release_id_with_version("voxconverse-tight-v1", "2") == "voxconverse-tight-v2"
 
 
+def test_classify_voxconverse_jobs_maps_guards_to_typed_outcomes() -> None:
+    from recipes.speakrs.large.tight_labels.classify import AlignmentFailureReason, ByDesignReason, SegmentOutcome
+    from recipes.speakrs.large.tight_labels.voxconverse import SegmentJob, classify_voxconverse_jobs
+
+    recording = "voxconverse::abjxc"
+    original = [
+        RecordingLabels(
+            recording,
+            (
+                SpeakerSegment.from_seconds(recording, "spk00", 0.0, 1.0),
+                SpeakerSegment.from_seconds(recording, "spk00", 2.0, 3.0),
+            ),
+        )
+    ]
+    produced = original
+    jobs = (
+        SegmentJob("a", recording, "spk00", 0, 1_000_000_000, "a.wav"),
+        SegmentJob("b", recording, "spk00", 2_000_000_000, 3_000_000_000, "a.wav"),
+    )
+    asr_rows = {"a": {"guard": "SILENCE"}, "b": {}}
+    align_rows = {"a": {"ok": False, "error": "SILENCE"}, "b": {"ok": False, "error": "ALIGN_FAILED"}}
+
+    classes = classify_voxconverse_jobs(original, produced, jobs, asr_rows, align_rows)
+
+    outcomes = {item.start_ns: item for item in classes}
+    assert outcomes[0].outcome is SegmentOutcome.BY_DESIGN_UNCERTAIN
+    assert outcomes[0].by_design_reason is ByDesignReason.SOURCE_RULE
+    assert outcomes[2_000_000_000].outcome is SegmentOutcome.ALIGNMENT_FAILURE
+    assert outcomes[2_000_000_000].failure_reason is AlignmentFailureReason.ALIGNER_ERROR
+
+
 def test_agent_report_renders_speaker_hours() -> None:
     from pathlib import Path
 
