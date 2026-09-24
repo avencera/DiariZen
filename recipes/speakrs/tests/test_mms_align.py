@@ -13,7 +13,7 @@ from recipes.speakrs.large.tight_labels.close_talk import (
 )
 from recipes.speakrs.large.tight_labels.domain import Interval, RecordingLabels, SpeakerSegment, UncertainInterval
 from recipes.speakrs.large.tight_labels.lotus_text import parse_lotus_align_intervals
-from recipes.speakrs.large.tight_labels.markers import prepare_transcript
+from recipes.speakrs.large.tight_labels.markers import cleaning_delta, prepare_transcript
 from recipes.speakrs.large.tight_labels.mms import ctc_alignment_fits, leftover_script_rate, mms_words
 from recipes.speakrs.large.tight_labels.produce_mms import (
     TranscriptSegment,
@@ -48,6 +48,34 @@ def test_mixed_markers_leave_spoken_text() -> None:
     assert prepared.alignable is True
     assert "สวัสดี" in prepared.remainder
     assert "<n>" not in prepared.remainder
+
+
+def test_generic_bracket_tags_are_stripped() -> None:
+    prepared = prepare_transcript("hello [vocalization] [stutters] <vocalization> [gasps] <background speech> [coughing] world")
+
+    assert prepared.alignable is True
+    assert prepared.remainder == "hello world"
+    assert "vocalization" in prepared.stripped_tags
+    assert "stutters" in prepared.stripped_tags
+    assert "background speech" in prepared.stripped_tags
+    assert "coughing" in prepared.stripped_tags
+    assert "gasps" in prepared.stripped_tags
+
+
+def test_ascii_gloss_after_native_script_is_removed() -> None:
+    prepared = prepare_transcript("ஃபர்ஸ்ட்(First)")
+
+    assert prepared.remainder == "ஃபர்ஸ்ட்"
+    assert prepared.stripped_glosses
+    assert mms_words("pharst(First)") == ("pharst",)
+
+
+def test_cleaning_delta_counts_generic_tags_the_legacy_list_kept() -> None:
+    delta = cleaning_delta("[vocalization] ஃபர்ஸ்ட்(First)")
+
+    assert delta["row_changed"] is True
+    assert "vocalization" in delta["tags"]
+    assert delta["glosses"]
 
 
 def test_mms_words_keep_only_fa_characters() -> None:
@@ -206,6 +234,23 @@ def test_held_out_language_uses_uncertain_interiors() -> None:
     assert labels.segments == ()
     assert {item.speaker for item in labels.uncertain} == {"A", "B"}
     assert sum(item.duration_ns for item in labels.uncertain) == sum(item.duration_ns for item in original.segments)
+
+
+def test_apply_extra_uncertain_unions_overlapping_and_touching_regions() -> None:
+    labels = apply_extra_uncertain(
+        RecordingLabels("rec", (SpeakerSegment.from_seconds("rec", "A", 0.2, 0.8),)),
+        (
+            UncertainInterval.from_seconds("rec", "A", 0, 2),
+            UncertainInterval.from_seconds("rec", "A", 1, 3),
+            UncertainInterval.from_seconds("rec", "A", 3, 4),
+            UncertainInterval.from_seconds("rec", "A", 0.3, 0.6),
+        ),
+    )
+
+    assert [(item.start_ns, item.end_ns) for item in labels.uncertain] == [
+        (parse_seconds_to_ns(0), parse_seconds_to_ns("0.2")),
+        (parse_seconds_to_ns("0.8"), parse_seconds_to_ns(4)),
+    ]
 
 
 def test_lotus_overlap_is_uncertain_beside_aligned_speech() -> None:

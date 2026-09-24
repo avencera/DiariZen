@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import re
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -158,11 +159,15 @@ def leftover_script_rate(text: str) -> float:
     return leftover / len(letters)
 
 
-def mms_words(romanized: str) -> tuple[str, ...]:
-    """Keep only MMS-FA characters and drop empty tokens."""
+_ASCII_GLOSS_TOKEN_RE = re.compile(r"\([A-Za-z][A-Za-z0-9' .,-]*\)")
 
+
+def mms_words(romanized: str) -> tuple[str, ...]:
+    """Keep only MMS-FA characters and drop leftover ASCII gloss tokens."""
+
+    cleaned = _ASCII_GLOSS_TOKEN_RE.sub(" ", romanized)
     words: list[str] = []
-    for raw in romanized.lower().split():
+    for raw in cleaned.lower().split():
         chars = [char for char in raw if char in MMS_CHARSET]
         if chars:
             words.append("".join(chars))

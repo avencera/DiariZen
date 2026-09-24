@@ -21,6 +21,13 @@ from ..indic_diarbench import canonical_speaker_id
 from ..jsonio import read_json, write_json
 from ..storage import require_free_gib
 from . import LIBRARY_VERSION
+from .classify import (
+    AlignmentFailureReason,
+    ByDesignReason,
+    SegmentClass,
+    SegmentOutcome,
+    unioned_original_segments,
+)
 from .close_talk import (
     ClockOffset,
     LavalierMapping,
@@ -35,10 +42,10 @@ from .close_talk import (
 )
 from .domain import Interval, RecordingLabels, SpeakerSegment, UncertainInterval
 from .gates import GateResult, evaluate_gates
-from .intervals import clip_recording_to_uem, duration_ns, subtract_spans, union_spans
+from .intervals import clip_recording_to_uem, duration_ns, overlap_duration_ns
 from .listening import write_listening_pack
 from .lotus_text import LotusAlignInterval, parse_lotus_align_intervals
-from .markers import prepare_transcript
+from .markers import cleaning_stats_by_language, prepare_transcript
 from .merge import MIN_GAP_NS, MIN_GAP_SECONDS, merge_recording
 from .mms import (
     INDIC_UROMAN_LCODES,
@@ -49,7 +56,7 @@ from .mms import (
     measure_language_coverage,
 )
 from .produce import RecordingRef, library_commit, release_id_with_version, render_gate_markdown
-from .tighten import tighten_recording, tighten_segment, union_human_segments
+from .tighten import tighten_recording, tighten_segment
 from .time import NANOSECONDS_PER_SECOND, float_bounds_to_rttm_ns, format_ns, ns_to_seconds
 from .writers import parse_speaker_rttm, render_speaker_rttm, rewrite_uem_file_id, uem_bounds, write_recording_labels
 
@@ -346,28 +353,161 @@ def apply_extra_uncertain(
     labels: RecordingLabels,
     extra: Sequence[UncertainInterval],
 ) -> RecordingLabels:
-    """Add UNCERTAIN regions and drop any that overlap the same speaker's speech."""
+    """Add UNCERTAIN regions; RecordingLabels unions them and cuts active speech."""
 
     if not extra:
         return labels
-    remaining = _subtract_uncertain(tuple(labels.uncertain) + tuple(extra), labels.segments)
-    return RecordingLabels(labels.recording_id, labels.segments, remaining)
+    return RecordingLabels(
+        labels.recording_id,
+        labels.segments,
+        tuple(labels.uncertain) + tuple(extra),
+    )
 
 
-def _subtract_uncertain(
-    uncertain: Sequence[UncertainInterval],
-    active: Sequence[SpeakerSegment],
-) -> tuple[UncertainInterval, ...]:
-    active_by_speaker: dict[tuple[str, str], list[SpeakerSegment]] = defaultdict(list)
-    for segment in active:
-        active_by_speaker[(segment.recording_id, segment.speaker)].append(segment)
-    remaining: list[UncertainInterval] = []
-    for region in uncertain:
-        cut = active_by_speaker.get((region.recording_id, region.speaker), ())
-        for start_ns, end_ns in subtract_spans([region], cut):
-            remaining.append(UncertainInterval(region.recording_id, region.speaker, start_ns, end_ns))
-    remaining.sort(key=lambda item: (item.start_ns, item.end_ns, item.speaker))
-    return tuple(remaining)
+def _classes_from_row_outcomes(
+    original: RecordingLabels,
+    row_outcomes: Mapping[tuple[str, int, int], SegmentClass],
+) -> tuple[SegmentClass, ...]:
+    classes: list[SegmentClass] = []
+    for segment in unioned_original_segments([original]):
+        hits = [
+            item
+            for key, item in row_outcomes.items()
+            if key[0] == segment.speaker and key[1] < segment.end_ns and key[2] > segment.start_ns
+        ]
+        if not hits:
+            classes.append(
+                SegmentClass.from_segment(
+                    segment,
+                    SegmentOutcome.ALIGNMENT_FAILURE,
+                    failure_reason=AlignmentFailureReason.ALIGNER_ERROR,
+                )
+            )
+            continue
+        by_design = next((item for item in hits if item.outcome is SegmentOutcome.BY_DESIGN_UNCERTAIN), None)
+        if by_design is not None:
+            classes.append(
+                SegmentClass.from_segment(
+                    segment,
+                    SegmentOutcome.BY_DESIGN_UNCERTAIN,
+                    by_design_reason=by_design.by_design_reason,
+                )
+            )
+            continue
+        failed = next((item for item in hits if item.outcome is SegmentOutcome.ALIGNMENT_FAILURE), None)
+        if failed is not None:
+            classes.append(
+                SegmentClass.from_segment(
+                    segment,
+                    SegmentOutcome.ALIGNMENT_FAILURE,
+                    failure_reason=failed.failure_reason,
+                )
+            )
+            continue
+        classes.append(SegmentClass.from_segment(segment, SegmentOutcome.ALIGNED))
+    return tuple(classes)
+
+
+def _held_out_classes(original: RecordingLabels) -> tuple[SegmentClass, ...]:
+    return tuple(
+        SegmentClass.from_segment(
+            segment,
+            SegmentOutcome.BY_DESIGN_UNCERTAIN,
+            by_design_reason=ByDesignReason.HELD_OUT_LANGUAGE,
+        )
+        for segment in unioned_original_segments([original])
+    )
+
+
+def _mark_low_coverage(
+    classes: Sequence[SegmentClass],
+    produced: RecordingLabels,
+) -> tuple[SegmentClass, ...]:
+    adjusted: list[SegmentClass] = []
+    for item in classes:
+        if item.outcome is SegmentOutcome.ALIGNED:
+            covered = overlap_duration_ns(
+                [(item.start_ns, item.end_ns)],
+                produced.segments_for(item.speaker),
+            )
+            if covered <= 0:
+                adjusted.append(
+                    SegmentClass(
+                        item.recording_id,
+                        item.speaker,
+                        item.start_ns,
+                        item.end_ns,
+                        SegmentOutcome.ALIGNMENT_FAILURE,
+                        AlignmentFailureReason.LOW_COVERAGE,
+                        None,
+                    )
+                )
+                continue
+        adjusted.append(item)
+    return tuple(adjusted)
+
+
+def _classes_to_payload(classes: Sequence[SegmentClass]) -> list[dict[str, str | int | None]]:
+    return [item.to_json() for item in classes]
+
+
+def _classes_from_payload(rows: Sequence[Mapping[str, Any]]) -> tuple[SegmentClass, ...]:
+    classes: list[SegmentClass] = []
+    for item in rows:
+        outcome = SegmentOutcome(str(item["outcome"]))
+        failure = item.get("failure_reason")
+        by_design = item.get("by_design_reason")
+        classes.append(
+            SegmentClass(
+                str(item["recording_id"]),
+                str(item["speaker"]),
+                int(item["start_ns"]),
+                int(item["end_ns"]),
+                outcome,
+                None if failure is None else AlignmentFailureReason(str(failure)),
+                None if by_design is None else ByDesignReason(str(by_design)),
+            )
+        )
+    return tuple(classes)
+
+
+def _reconstruct_classes(
+    original: RecordingLabels,
+    produced: RecordingLabels,
+    *,
+    held_out: bool,
+    overlap_keys: set[tuple[str, int, int]] | None = None,
+) -> tuple[SegmentClass, ...]:
+    if held_out:
+        return _held_out_classes(original)
+    overlap_keys = overlap_keys or set()
+    classes: list[SegmentClass] = []
+    for segment in unioned_original_segments([original]):
+        key = (segment.speaker, segment.start_ns, segment.end_ns)
+        if key in overlap_keys or any(
+            speaker == segment.speaker and start_ns < segment.end_ns and end_ns > segment.start_ns
+            for speaker, start_ns, end_ns in overlap_keys
+        ):
+            classes.append(
+                SegmentClass.from_segment(
+                    segment,
+                    SegmentOutcome.BY_DESIGN_UNCERTAIN,
+                    by_design_reason=ByDesignReason.MULTI_SPEAKER,
+                )
+            )
+            continue
+        covered = overlap_duration_ns([(segment.start_ns, segment.end_ns)], produced.segments_for(segment.speaker))
+        if covered > 0:
+            classes.append(SegmentClass.from_segment(segment, SegmentOutcome.ALIGNED))
+        else:
+            classes.append(
+                SegmentClass.from_segment(
+                    segment,
+                    SegmentOutcome.ALIGNMENT_FAILURE,
+                    failure_reason=AlignmentFailureReason.ALIGNER_ERROR,
+                )
+            )
+    return tuple(classes)
 
 
 def load_audio_mono(path: Path, start_ns: int | None = None, end_ns: int | None = None) -> tuple[np.ndarray, int]:
@@ -435,6 +575,7 @@ def align_indic_recording(
             "empty_roman": 0,
             "letter_segments": 0,
             "labels": tight,
+            "segment_classes": _held_out_classes(original),
             "close_talk": {"used": False, "reason": "indic-mix-only"},
         }
     matched, report = match_segments(original.segments, transcripts)
@@ -446,17 +587,33 @@ def align_indic_recording(
     coverages: list[float] = []
     empty_roman = 0
     letter_segments = 0
+    row_outcomes: dict[tuple[str, int, int], SegmentClass] = {}
     for segment in original.segments:
         key = (segment.speaker, segment.start_ns, segment.end_ns)
         hit = matched.get(key)
         if hit is None:
             kinds["unmatched"] += 1
             failed_segments.append(segment)
+            row_outcomes[key] = SegmentClass.from_segment(
+                segment,
+                SegmentOutcome.ALIGNMENT_FAILURE,
+                failure_reason=AlignmentFailureReason.ALIGNER_ERROR,
+            )
             continue
         prepared = prepare_transcript(hit.text)
         if not prepared.alignable:
             kinds["marker"] += 1
             failed_segments.append(segment)
+            reason = (
+                AlignmentFailureReason.EMPTY_TEXT
+                if not hit.text.strip()
+                else AlignmentFailureReason.MARKER_ONLY
+            )
+            row_outcomes[key] = SegmentClass.from_segment(
+                segment,
+                SegmentOutcome.ALIGNMENT_FAILURE,
+                failure_reason=reason,
+            )
             continue
         letter_segments += 1
         romanized = aligner.romanize(prepared.remainder, lcode=lcode)
@@ -464,6 +621,11 @@ def align_indic_recording(
             empty_roman += 1
             kinds["empty-roman"] += 1
             failed_segments.append(segment)
+            row_outcomes[key] = SegmentClass.from_segment(
+                segment,
+                SegmentOutcome.ALIGNMENT_FAILURE,
+                failure_reason=AlignmentFailureReason.EMPTY_ROMANIZATION,
+            )
             continue
         start = (segment.start_ns * SAMPLE_RATE) // NANOSECONDS_PER_SECOND
         stop = (segment.end_ns * SAMPLE_RATE) // NANOSECONDS_PER_SECOND
@@ -476,12 +638,19 @@ def align_indic_recording(
         if not words:
             kinds["align-failed"] += 1
             failed_segments.append(segment)
+            row_outcomes[key] = SegmentClass.from_segment(
+                segment,
+                SegmentOutcome.ALIGNMENT_FAILURE,
+                failure_reason=AlignmentFailureReason.ALIGNER_ERROR,
+            )
             continue
         aligned_by_speaker[segment.speaker].extend(words)
         covered = sum(item.end_ns - item.start_ns for item in words)
         coverages.append(covered / segment.duration_ns if segment.duration_ns else 0.0)
         kinds["aligned"] += 1
+        row_outcomes[key] = SegmentClass.from_segment(segment, SegmentOutcome.ALIGNED)
     tight = _tighten(original, aligned_by_speaker, ref, failed_segments=failed_segments, per_segment=True)
+    classes = _mark_low_coverage(_classes_from_row_outcomes(original, row_outcomes), tight)
     return {
         "recording_id": ref.recording_id,
         "language": language,
@@ -499,6 +668,7 @@ def align_indic_recording(
         "empty_roman": empty_roman,
         "letter_segments": letter_segments,
         "labels": tight,
+        "segment_classes": classes,
         "close_talk": {"used": False, "reason": "indic-mix-only"},
     }
 
@@ -580,6 +750,8 @@ def align_lotusdis_recording(
     coverages: list[float] = []
     matched = 0
     unmatched = 0
+    row_outcomes: dict[tuple[str, int, int], SegmentClass] = {}
+    aligned_keys: set[tuple[str, int, int]] = set()
     for interval in intervals:
         if interval.non_speech:
             continue
@@ -591,16 +763,39 @@ def align_lotusdis_recording(
         if interval.overlap:
             kinds["overlap-uncertain"] += 1
             failed_segments.extend(rows)
+            for row in rows:
+                row_outcomes[(row.speaker, row.start_ns, row.end_ns)] = SegmentClass.from_segment(
+                    row,
+                    SegmentOutcome.BY_DESIGN_UNCERTAIN,
+                    by_design_reason=ByDesignReason.MULTI_SPEAKER,
+                )
             continue
         prepared = prepare_transcript(interval.text)
         if not prepared.alignable:
             kinds["marker"] += 1
             failed_segments.extend(rows)
+            reason = (
+                AlignmentFailureReason.EMPTY_TEXT
+                if not interval.text.strip()
+                else AlignmentFailureReason.MARKER_ONLY
+            )
+            for row in rows:
+                row_outcomes[(row.speaker, row.start_ns, row.end_ns)] = SegmentClass.from_segment(
+                    row,
+                    SegmentOutcome.ALIGNMENT_FAILURE,
+                    failure_reason=reason,
+                )
             continue
         romanized = aligner.romanize(prepared.remainder, lcode=THAI_UROMAN_LCODE)
         if romanized.empty:
             kinds["empty-roman"] += 1
             failed_segments.extend(rows)
+            for row in rows:
+                row_outcomes[(row.speaker, row.start_ns, row.end_ns)] = SegmentClass.from_segment(
+                    row,
+                    SegmentOutcome.ALIGNMENT_FAILURE,
+                    failure_reason=AlignmentFailureReason.EMPTY_ROMANIZATION,
+                )
             continue
         speaker = interval.speakers[0]
         channel_name = mapping.channel_for(speaker) if mapping.use_close_talk else None
@@ -616,12 +811,24 @@ def align_lotusdis_recording(
         if not words:
             kinds["align-failed"] += 1
             failed_segments.extend(rows)
+            for row in rows:
+                row_outcomes[(row.speaker, row.start_ns, row.end_ns)] = SegmentClass.from_segment(
+                    row,
+                    SegmentOutcome.ALIGNMENT_FAILURE,
+                    failure_reason=AlignmentFailureReason.ALIGNER_ERROR,
+                )
             continue
         aligned_by_speaker[speaker].extend(words)
+        aligned_keys.add((speaker, interval.start_ns, interval.end_ns))
         duration = interval.end_ns - interval.start_ns
         covered = sum(item.end_ns - item.start_ns for item in words)
         coverages.append(covered / duration if duration else 0.0)
         kinds["aligned"] += 1
+        for row in rows:
+            row_outcomes[(row.speaker, row.start_ns, row.end_ns)] = SegmentClass.from_segment(
+                row,
+                SegmentOutcome.ALIGNED,
+            )
     extra_uncertain = list(overlap_uncertain_regions(ref.recording_id, intervals))
     tight = _tighten(
         original,
@@ -633,24 +840,28 @@ def align_lotusdis_recording(
     )
     extra_uncertain = []
     if mapping.use_close_talk:
-        humans = union_human_segments(original.segments)
-        for human in humans:
-            channel_name = mapping.channel_for(human.speaker)
+        for interval in intervals:
+            if interval.non_speech or interval.overlap or len(interval.speakers) != 1:
+                continue
+            speaker = interval.speakers[0]
+            if (speaker, interval.start_ns, interval.end_ns) not in aligned_keys:
+                continue
+            channel_name = mapping.channel_for(speaker)
             if channel_name is None or channel_name not in channels:
                 continue
             channel = channels[channel_name]
             speech_rms = rms_in_spans(
                 channel,
                 SAMPLE_RATE,
-                [(item.start_ns, item.end_ns) for item in tight.segments_for(human.speaker)],
+                [(item.start_ns, item.end_ns) for item in tight.segments_for(speaker)],
             )
             voiced = voiced_spans(channel, SAMPLE_RATE, speech_rms=speech_rms)
             extra_uncertain.extend(
                 voicing_uncertain(
                     ref.recording_id,
-                    human.speaker,
-                    human.bounds,
-                    [(item.start_ns, item.end_ns) for item in tight.segments_for(human.speaker)],
+                    speaker,
+                    Interval(interval.start_ns, interval.end_ns),
+                    [(item.start_ns, item.end_ns) for item in tight.segments_for(speaker)],
                     voiced,
                 )
             )
@@ -658,6 +869,7 @@ def align_lotusdis_recording(
             tight = apply_extra_uncertain(tight, extra_uncertain)
             tight = clip_recording_to_uem(tight, ref.uem_start_ns, ref.uem_end_ns)
     kinds["voicing-uncertain"] = len(extra_uncertain)
+    classes = _mark_low_coverage(_classes_from_row_outcomes(original, row_outcomes), tight)
     return {
         "recording_id": ref.recording_id,
         "language": "Thai",
@@ -673,6 +885,7 @@ def align_lotusdis_recording(
         "kinds": dict(kinds),
         "coverage": coverages,
         "labels": tight,
+        "segment_classes": classes,
         "close_talk": {
             "used": mapping.use_close_talk,
             "reason": mapping.reason,
@@ -734,8 +947,11 @@ def _tighten(
         )
         active.extend(result.active)
         uncertain.extend(result.uncertain)
-    kept = _subtract_uncertain(tuple(uncertain) + tuple(extra_uncertain), active)
-    tight = RecordingLabels(original.recording_id, tuple(active), kept)
+    tight = RecordingLabels(
+        original.recording_id,
+        tuple(active),
+        tuple(uncertain) + tuple(extra_uncertain),
+    )
     clipped = clip_recording_to_uem(tight, ref.uem_start_ns, ref.uem_end_ns)
     return merge_recording(clipped, min_gap_ns=MIN_GAP_NS)
 
@@ -832,14 +1048,6 @@ def _coverage_stats(rows: Sequence[Mapping[str, Any]]) -> dict[str, float | None
     }
 
 
-def _uncertain_share(original: Sequence[RecordingLabels], produced: Sequence[RecordingLabels]) -> float:
-    original_ns = sum(duration_ns(item.segments) for item in original)
-    uncertain_ns = sum(duration_ns(item.uncertain) for item in produced)
-    if original_ns <= 0:
-        return 0.0
-    return uncertain_ns / original_ns
-
-
 def produce_source(
     source: str,
     aligner: MmsAligner,
@@ -924,6 +1132,7 @@ def produce_source(
         match_summary = {"by_language": dict(language_match), "poor_languages": list(poor_languages)}
         extra["romanizer_coverage"] = coverage_by_language
         extra["transcript_match"] = match_summary
+        extra["transcript_cleaning"] = cleaning_stats_by_language(transcripts)
         write_json(match_path, {"match": match_summary, "coverage": coverage_by_language})
     produced_labels: list[RecordingLabels] = []
     close_talk_rows: list[dict[str, Any]] = []
@@ -950,6 +1159,7 @@ def produce_source(
             else:
                 payload = align_lotusdis_recording(ref, source_labels, aligner)
             labels = payload["labels"]
+            classes = tuple(payload.get("segment_classes") or ())
             serialisable = {
                 "recording_id": ref.recording_id,
                 "language": payload.get("language"),
@@ -959,6 +1169,7 @@ def produce_source(
                 "kinds": payload.get("kinds"),
                 "coverage": payload.get("coverage"),
                 "close_talk": payload.get("close_talk"),
+                "segment_classes": _classes_to_payload(classes),
                 "segments": [
                     {"speaker": item.speaker, "start_ns": item.start_ns, "end_ns": item.end_ns}
                     for item in labels.segments
@@ -986,6 +1197,25 @@ def produce_source(
             from_cache = True
         labels = merge_recording(labels)
         payload["labels"] = labels
+        if from_cache:
+            if payload.get("segment_classes"):
+                try:
+                    payload["segment_classes"] = _classes_from_payload(payload["segment_classes"])
+                except (KeyError, TypeError, ValueError):
+                    payload["segment_classes"] = ()
+            if not payload.get("segment_classes"):
+                overlap_keys: set[tuple[str, int, int]] = set()
+                if source == "lotusdis":
+                    for interval in parse_lotus_align_intervals(_lotus_textgrid(ref.recording_id)):
+                        if interval.overlap:
+                            for speaker in interval.speakers:
+                                overlap_keys.add((speaker, interval.start_ns, interval.end_ns))
+                payload["segment_classes"] = _reconstruct_classes(
+                    source_labels,
+                    labels,
+                    held_out=is_held_out,
+                    overlap_keys=overlap_keys,
+                )
         payload["held_out"] = is_held_out
         payload.setdefault("held_out_speech_ns", duration_ns(source_labels.segments) if is_held_out else 0)
         results.append(payload)
@@ -1011,23 +1241,18 @@ def produce_source(
         for item in results
         if item.get("held_out")
     }
-    gate_original = [item for item in original if item.recording_id not in held_ids]
-    gate_attempted = [item for item in attempted if item.recording_id not in held_ids]
-    gate_uem = {key: value for key, value in uem_by_recording.items() if key not in held_ids}
-    if gate_original:
-        gate = evaluate_gates(
-            gate_original,
-            gate_attempted,
-            require_subset=spec["require_subset"],
-            uem_by_recording=gate_uem,
-        )
-    else:
-        gate = evaluate_gates(
-            original,
-            attempted,
-            require_subset=spec["require_subset"],
-            uem_by_recording=uem_by_recording,
-        )
+    segment_classes = tuple(
+        item
+        for row in results
+        for item in row.get("segment_classes") or ()
+    )
+    gate = evaluate_gates(
+        original,
+        attempted,
+        require_subset=spec["require_subset"],
+        uem_by_recording=uem_by_recording,
+        segment_classes=segment_classes,
+    )
     kept_current = not gate.passed
     written = []
     for source_labels, attempted_labels in zip(original, attempted, strict=True):
@@ -1040,14 +1265,16 @@ def produce_source(
     held_out_speech_ns = sum(int(item.get("held_out_speech_ns") or 0) for item in results if item.get("held_out"))
     extra["segment_kinds"] = _summarise_kinds(results)
     extra["coverage_distribution"] = _coverage_stats(results)
-    extra["uncertain_share_of_original_speech"] = _uncertain_share(original, attempted)
+    extra["uncertain_share_of_original_speech"] = gate.uncertain_share
+    extra["uncertain_share_excluding_by_design"] = gate.uncertain_share_excluding_by_design
+    extra["by_design_share"] = gate.by_design_share
     extra["close_talk"] = close_talk_rows
     extra["failure_share"] = gate.failure_share
     extra["held_out_languages"] = sorted(poor_languages)
     extra["held_out_recordings"] = len(held_ids)
     extra["held_out_speech_seconds"] = ns_to_seconds(held_out_speech_ns)
-    extra["held_out_excluded_from_gates"] = True
-    extra["gates_scored_on_recordings"] = len(gate_original)
+    extra["held_out_excluded_from_gates"] = False
+    extra["gates_scored_on_recordings"] = len(original)
     release_dir = write_aligned_release(
         source=source,
         refs=refs,
@@ -1115,7 +1342,7 @@ def render_align_report(results: Sequence[Mapping[str, Any]], aligner: MmsAligne
                 n_mid=gate.tightness.gaps_0_3_to_1_per_min,
                 gap="—" if gate.tightness.smallest_gap_s is None else f"{gate.tightness.smallest_gap_s:.4f}",
                 fail=gate.failure_share,
-                unc=extra["uncertain_share_of_original_speech"],
+                unc=gate.uncertain_share,
                 status=status,
                 kept=result["kept_current_labels"],
             )
@@ -1136,7 +1363,9 @@ def render_align_report(results: Sequence[Mapping[str, Any]], aligner: MmsAligne
                 f"- Coverage: {extra['coverage_distribution']}",
                 f"- Segment kinds: {extra['segment_kinds']}",
                 f"- Failure share: {gate.failure_share:.4f}",
-                f"- Uncertain share of original speech: {extra['uncertain_share_of_original_speech']:.4f}",
+                f"- By-design UNCERTAIN share: {gate.by_design_share:.4f}",
+                f"- Uncertain share of original speech: {gate.uncertain_share:.4f}",
+                f"- Uncertain share excluding by-design: {gate.uncertain_share_excluding_by_design:.4f}",
                 f"- Overlap retention: {gate.overlap_retention}",
                 f"- Subset: {gate.subset_ok}",
                 f"- UEM: {gate.uem_ok}",
@@ -1144,7 +1373,7 @@ def render_align_report(results: Sequence[Mapping[str, Any]], aligner: MmsAligne
                 f"- Held-out languages: {extra.get('held_out_languages') or 'none'}",
                 f"- Held-out recordings: {extra.get('held_out_recordings', 0)}",
                 f"- Held-out original speech (s): {extra.get('held_out_speech_seconds', 0):.3f}",
-                "- Held-out recordings keep UNCERTAIN interiors and are excluded from gates",
+                "- Held-out recordings keep UNCERTAIN interiors and count as by-design, not failures",
             ]
         )
         if result["source"] == "indic-diarbench":
@@ -1162,6 +1391,18 @@ def render_align_report(results: Sequence[Mapping[str, Any]], aligner: MmsAligne
                     f"{cov.get('leftover_script_rate', 0):.4f} | {cov.get('expansion_ratio', 0):.2f} | "
                     f"{cov.get('nap_junk_rate', 0):.4f} | {cov.get('poor', False)} |"
                 )
+            cleaning = extra.get("transcript_cleaning") or {}
+            if cleaning:
+                lines.extend(["", "### Indic transcript cleaning", ""])
+                lines.append("| Language | Rows | Changed rows | Changed tokens | Gloss rows | Top tags |")
+                lines.append("|---|---:|---:|---:|---:|---|")
+                for language, stats in cleaning.items():
+                    tags = stats.get("tags") or {}
+                    top = ", ".join(f"{name} {count}" for name, count in list(tags.items())[:6]) or "—"
+                    lines.append(
+                        f"| {language} | {stats.get('rows', 0)} | {stats.get('changed_rows', 0)} | "
+                        f"{stats.get('changed_tokens', 0)} | {stats.get('gloss_rows', 0)} | {top} |"
+                    )
         if extra.get("close_talk"):
             lines.extend(["", "### LOTUSDIS lavalier mapping", ""])
             used = sum(1 for item in extra["close_talk"] if item.get("used"))
