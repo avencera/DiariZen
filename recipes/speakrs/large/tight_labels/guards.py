@@ -20,10 +20,10 @@ MUSIC_MEAN_DBFS_MIN = -38.0
 MUSIC_MODULATION_MAX = 0.15
 MIN_ALIGN_SECONDS = 0.080
 MIN_DURATION_FOR_MUSIC_S = 0.60
-MAX_CHARS_PER_SEC = 25.0
+MAX_CHARS_PER_SEC = 30.0
 MAX_WORDS_PER_SEC = 8.0
-MIN_DURATION_FOR_CHAR_RATE_S = 0.40
-MIN_DURATION_FOR_WORD_RATE_S = 0.50
+MIN_DURATION_FOR_CHAR_RATE_S = 2.00
+MIN_DURATION_FOR_WORD_RATE_S = 2.00
 MIN_WORDS_FOR_RATE = 4
 REPETITION_FRACTION = 0.60
 REPETITION_MIN_TOKENS = 8
@@ -46,10 +46,10 @@ GUARD_RULES = {
     ),
     "EMPTY_ASR": "ASR returned no word tokens after punctuation stripping.",
     "IMPLAUSIBLE_CHAR_RATE": (
-        "Letter and digit count divided by duration exceeds 25 per second on a segment of at least 0.40 s."
+        "Letter and digit count divided by duration exceeds 30 per second on a segment of at least 2.00 s."
     ),
     "IMPLAUSIBLE_WORD_RATE": (
-        "Word count divided by duration exceeds 8 per second on a segment of at least 0.50 s with at least 4 words."
+        "Word count divided by duration exceeds 8 per second on a segment of at least 2.00 s with at least 4 words."
     ),
     "REPETITION_LOOP": (
         "The most frequent token is at least 60% of tokens and the token "

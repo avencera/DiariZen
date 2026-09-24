@@ -55,8 +55,13 @@ def test_empty_asr_is_guarded() -> None:
 
 
 def test_implausible_character_rate_is_guarded() -> None:
-    text = "abcdefghij" * 20
-    assert classify_transcript(text, 1.0) == "IMPLAUSIBLE_CHAR_RATE"
+    text = "abcdefghij" * 40
+    assert classify_transcript(text, 3.0) == "IMPLAUSIBLE_CHAR_RATE"
+
+
+def test_short_fast_speech_is_not_rate_guarded() -> None:
+    text = "I mean I always look at the"
+    assert classify_transcript(text, 0.8) is None
 
 
 def test_repetition_loop_is_guarded() -> None:
