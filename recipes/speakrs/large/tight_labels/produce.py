@@ -250,7 +250,7 @@ def render_gate_markdown(source_name: str, release_id: str, gate: GateResult, *,
         f"- Smallest same-speaker gap ≥ 0.200 s: {_ok(gate.smallest_gap_ok)}",
         f"- Published speakers mapped: {_ok(gate.unmapped_speakers_ok)}",
         f"- UNCERTAIN overlapping same-speaker speech: {_ok(gate.uncertain_overlap_ok)}",
-        f"- Failure share ≤ 0.25: {_ok(gate.failure_share_ok)} ({gate.failure_share:.4f})",
+        f"- Failure share ≤ {gate.failure_share_limit:.2f}: {_ok(gate.failure_share_ok)} ({gate.failure_share:.4f})",
         "",
         "## Reported (do not fail)",
         "",
@@ -261,8 +261,10 @@ def render_gate_markdown(source_name: str, release_id: str, gate: GateResult, *,
         f"- Speaker retention: {_ok(gate.speaker_retention_ok)}",
         f"- Overlap retention: {_ok(gate.overlap_retention_ok)} ({_fmt(gate.overlap_retention)})",
         f"- UNCERTAIN share of original speech: {_fmt(gate.uncertain_share)}",
+        f"- UNCERTAIN share excluding by-design: {_fmt(gate.uncertain_share_excluding_by_design)}",
+        f"- By-design UNCERTAIN share of original segments: {_fmt(gate.by_design_share)}",
         "",
-        f"Flagged speakers below 30% retention: {len(gate.flagged_speakers)}",
+        f"Flagged speakers below {gate.speaker_retention_floor:.0%} retention: {len(gate.flagged_speakers)}",
         f"Flagged recordings with >5% new speech outside original: {len(gate.flagged_recordings)}",
         f"Rows outside UEM: {len(gate.rows_outside_uem)}",
         f"Unmapped published speakers: {len(gate.unmapped_published)}",
@@ -536,7 +538,9 @@ def render_core_report(results: Sequence[Mapping[str, Any]]) -> str:
         lines.append(f"- Listening seconds: {result['listening']['total_seconds']:.1f}")
         lines.append(f"- Kept current labels: {result['kept_current_labels']}")
         lines.append(f"- Flagged recordings: {len(gate.flagged_recordings)}")
-        lines.append(f"- Flagged speakers below 30% retention: {len(gate.flagged_speakers)}")
+        lines.append(
+            f"- Flagged speakers below {gate.speaker_retention_floor:.0%} retention: {len(gate.flagged_speakers)}"
+        )
         lines.append(f"- Rows outside UEM: {len(gate.rows_outside_uem)}")
         lines.append(f"- Unmapped published speakers: {len(gate.unmapped_published)}")
         lines.append(f"- Dropped unmapped published speech: {gate.dropped_unmapped_seconds:.3f} s")

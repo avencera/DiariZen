@@ -8,8 +8,21 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
+from .classify import (
+    SegmentClass,
+    SegmentOutcome,
+    aligned_classes,
+    require_segment_classes,
+)
 from .domain import RecordingLabels, SpeakerSegment, UncertainInterval
-from .intervals import duration_ns, overlap_duration_ns, overlap_timeline_ns, span_outside_uem, union_spans
+from .intervals import (
+    duration_ns,
+    overlap_duration_ns,
+    overlap_timeline_ns,
+    span_outside_uem,
+    subtract_spans,
+    union_spans,
+)
 from .mapping import SpeakerMapping
 from .merge import MIN_GAP_NS
 from .subset import recording_is_subset
@@ -64,31 +77,46 @@ class SpeakerRetention:
 
 @dataclass(frozen=True, slots=True)
 class UncertainShare:
-    """Share of one recording's original speech marked UNCERTAIN."""
+    """Share of one recording's original per-speaker speech marked UNCERTAIN."""
 
     recording_id: str
     original_ns: int
     uncertain_ns: int
+    uncertain_excluding_by_design_ns: int
 
     @property
     def original_seconds(self) -> float:
-        """Return original speech time in seconds."""
+        """Return original per-speaker speech time in seconds."""
 
         return ns_to_seconds(self.original_ns)
 
     @property
     def uncertain_seconds(self) -> float:
-        """Return UNCERTAIN time in seconds."""
+        """Return UNCERTAIN per-speaker time in seconds."""
 
         return ns_to_seconds(self.uncertain_ns)
 
     @property
+    def uncertain_excluding_by_design_seconds(self) -> float:
+        """Return UNCERTAIN time outside by-design original segments."""
+
+        return ns_to_seconds(self.uncertain_excluding_by_design_ns)
+
+    @property
     def ratio(self) -> float:
-        """Return UNCERTAIN time divided by original speech."""
+        """Return UNCERTAIN time divided by original per-speaker speech."""
 
         if self.original_ns <= 0:
             return 0.0
         return self.uncertain_ns / self.original_ns
+
+    @property
+    def ratio_excluding_by_design(self) -> float:
+        """Return UNCERTAIN time outside by-design regions divided by original speech."""
+
+        if self.original_ns <= 0:
+            return 0.0
+        return self.uncertain_excluding_by_design_ns / self.original_ns
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,8 +168,13 @@ class GateResult:
     speaker_retention: tuple[SpeakerRetention, ...]
     overlap_retention: float | None
     failure_share: float
+    by_design_share: float
     uncertain_share: float
+    uncertain_share_excluding_by_design: float
+    failure_share_limit: float
+    speaker_retention_floor: float
     uncertain_by_recording: tuple[UncertainShare, ...]
+    segment_classes: tuple[SegmentClass, ...]
     time_bases: tuple[RecordingTimeBase, ...]
     flagged_speakers: tuple[SpeakerRetention, ...]
     flagged_recordings: tuple[str, ...]
@@ -184,13 +217,19 @@ class GateResult:
             },
             "overlap_retention": self.overlap_retention,
             "failure_share": self.failure_share,
+            "by_design_share": self.by_design_share,
             "uncertain_share": self.uncertain_share,
+            "uncertain_share_excluding_by_design": self.uncertain_share_excluding_by_design,
+            "failure_share_limit": self.failure_share_limit,
+            "speaker_retention_floor": self.speaker_retention_floor,
             "uncertain_by_recording": [
                 {
                     "recording_id": item.recording_id,
                     "original_seconds": item.original_seconds,
                     "uncertain_seconds": item.uncertain_seconds,
+                    "uncertain_excluding_by_design_seconds": item.uncertain_excluding_by_design_seconds,
                     "ratio": item.ratio,
+                    "ratio_excluding_by_design": item.ratio_excluding_by_design,
                 }
                 for item in self.uncertain_by_recording
             ],
@@ -271,12 +310,13 @@ def _overlap_ns(labels: RecordingLabels) -> int:
     return overlap_timeline_ns(grouped)
 
 
-def _failure_share(original: Sequence[RecordingLabels], new: Sequence[RecordingLabels]) -> float:
-    original_segments = sum(len(item.segments) for item in original)
-    if original_segments <= 0:
-        return 0.0
-    failed = sum(len(item.uncertain) for item in new)
-    return failed / original_segments
+def _segment_shares(classes: Sequence[SegmentClass]) -> tuple[float, float]:
+    total = len(classes)
+    if total <= 0:
+        return 0.0, 0.0
+    failures = sum(1 for item in classes if item.outcome is SegmentOutcome.ALIGNMENT_FAILURE)
+    by_design = sum(1 for item in classes if item.outcome is SegmentOutcome.BY_DESIGN_UNCERTAIN)
+    return failures / total, by_design / total
 
 
 def _speaker_time_ns(items: Sequence[SpeakerSegment | UncertainInterval]) -> int:
@@ -286,12 +326,45 @@ def _speaker_time_ns(items: Sequence[SpeakerSegment | UncertainInterval]) -> int
     return sum(duration_ns(spans) for spans in grouped.values())
 
 
-def _uncertain_share_row(original: RecordingLabels, new: RecordingLabels) -> UncertainShare:
-    return UncertainShare(
-        original.recording_id,
-        _speaker_time_ns(original.segments),
-        _speaker_time_ns(new.uncertain),
+def _by_design_spans(
+    classes: Sequence[SegmentClass],
+    recording_id: str,
+) -> dict[str, list[tuple[int, int]]]:
+    spans: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    for item in classes:
+        if item.recording_id != recording_id:
+            continue
+        if item.outcome is SegmentOutcome.BY_DESIGN_UNCERTAIN:
+            spans[item.speaker].append((item.start_ns, item.end_ns))
+    return spans
+
+
+def _uncertain_excluding_by_design_ns(
+    uncertain: Sequence[UncertainInterval],
+    by_design: Mapping[str, Sequence[tuple[int, int]]],
+) -> int:
+    grouped: dict[str, list[UncertainInterval]] = defaultdict(list)
+    for region in uncertain:
+        grouped[region.speaker].append(region)
+    total = 0
+    speakers = set(grouped) | set(by_design)
+    for speaker in speakers:
+        total += duration_ns(subtract_spans(grouped.get(speaker, ()), by_design.get(speaker, ())))
+    return total
+
+
+def _uncertain_share_row(
+    original: RecordingLabels,
+    new: RecordingLabels,
+    classes: Sequence[SegmentClass],
+) -> UncertainShare:
+    original_ns = _speaker_time_ns(original.segments)
+    uncertain_ns = _speaker_time_ns(new.uncertain)
+    excluding_ns = _uncertain_excluding_by_design_ns(
+        new.uncertain,
+        _by_design_spans(classes, original.recording_id),
     )
+    return UncertainShare(original.recording_id, original_ns, uncertain_ns, excluding_ns)
 
 
 def _uncertain_overlaps_speech(labels: RecordingLabels) -> bool:
@@ -332,6 +405,7 @@ def evaluate_gates(
     tightness_short_gap_max: float = TIGHTNESS_SHORT_GAP_MAX,
     uem_by_recording: Mapping[str, tuple[int, int]] | None = None,
     mappings: Mapping[str, SpeakerMapping] | None = None,
+    segment_classes: Sequence[SegmentClass] | None = None,
 ) -> GateResult:
     """Score hard gates, failure share, and report-only tightness and retention."""
 
@@ -339,6 +413,11 @@ def evaluate_gates(
     new_by_id = _by_recording(new)
     if set(original_by_id) != set(new_by_id):
         raise ValueError("gate evaluation requires the same recording set")
+    classes = (
+        aligned_classes(original)
+        if segment_classes is None
+        else require_segment_classes(original, segment_classes)
+    )
 
     tightness = measure_tightness(new)
     original_tightness = measure_tightness(original)
@@ -349,6 +428,7 @@ def evaluate_gates(
     new_overlap = 0
     original_speech_ns = 0
     uncertain_ns = 0
+    uncertain_excluding_ns = 0
     subset_ok: bool | None = True if require_subset else None
     outside_rows: list[str] = []
     uncertain_overlap_ok = True
@@ -357,10 +437,11 @@ def evaluate_gates(
         produced = new_by_id[recording_id]
         retentions.extend(_speaker_retention(source, produced))
         time_bases.append(_time_base(source, produced))
-        share = _uncertain_share_row(source, produced)
+        share = _uncertain_share_row(source, produced, classes)
         uncertain_rows.append(share)
         original_speech_ns += share.original_ns
         uncertain_ns += share.uncertain_ns
+        uncertain_excluding_ns += share.uncertain_excluding_by_design_ns
         original_overlap += _overlap_ns(source)
         new_overlap += _overlap_ns(produced)
         if require_subset and not recording_is_subset(produced, source, min_gap_ns=min_gap_ns):
@@ -380,8 +461,11 @@ def evaluate_gates(
         item.recording_id for item in time_bases if item.new_outside_share > published_outside_flag
     )
     overlap_retention = None if original_overlap <= 0 else new_overlap / original_overlap
-    failure_share = _failure_share(original, new)
+    failure_share, by_design_share = _segment_shares(classes)
     uncertain_share = 0.0 if original_speech_ns <= 0 else uncertain_ns / original_speech_ns
+    uncertain_share_excluding_by_design = (
+        0.0 if original_speech_ns <= 0 else uncertain_excluding_ns / original_speech_ns
+    )
 
     smallest_ns = tightness.smallest_gap_ns
     smallest_gap_ok = smallest_ns is None or smallest_ns >= min_gap_ns
@@ -410,7 +494,8 @@ def evaluate_gates(
         )
     if flagged_speakers:
         notes.append(
-            f"{len(flagged_speakers)} speakers keep less than 30% of original speech; reported only"
+            f"{len(flagged_speakers)} speakers keep less than "
+            f"{speaker_retention_floor:.0%} of original speech; reported only"
         )
     if flagged_recordings:
         notes.append(
@@ -458,8 +543,13 @@ def evaluate_gates(
         speaker_retention=tuple(retentions),
         overlap_retention=overlap_retention,
         failure_share=failure_share,
+        by_design_share=by_design_share,
         uncertain_share=uncertain_share,
+        uncertain_share_excluding_by_design=uncertain_share_excluding_by_design,
+        failure_share_limit=failure_share_limit,
+        speaker_retention_floor=speaker_retention_floor,
         uncertain_by_recording=tuple(uncertain_rows),
+        segment_classes=classes,
         time_bases=tuple(time_bases),
         flagged_speakers=flagged_speakers,
         flagged_recordings=flagged_recordings,

@@ -9,8 +9,12 @@ import soundfile as sf
 from recipes.speakrs.large.tight_labels import (
     COVERAGE_RATIO,
     MIN_GAP_NS,
+    AlignmentFailureReason,
+    ByDesignReason,
     Interval,
     RecordingLabels,
+    SegmentClass,
+    SegmentOutcome,
     SpeakerSegment,
     UncertainInterval,
     apply_published_replacement,
@@ -22,6 +26,7 @@ from recipes.speakrs.large.tight_labels import (
     merge_short_gaps,
     parse_seconds_to_ns,
     parse_speaker_rttm,
+    subtract_uncertain_from_active,
     tighten_recording,
     tighten_segment,
     write_recording_labels,
@@ -41,6 +46,25 @@ def _iv(start: object, end: object) -> Interval:
 
 def _span(start: object, end: object) -> tuple[int, int]:
     return (parse_seconds_to_ns(start), parse_seconds_to_ns(end))  # type: ignore[arg-type]
+
+
+def _unc(speaker: str, start: object, end: object, recording: str = "rec") -> UncertainInterval:
+    return UncertainInterval.from_seconds(recording, speaker, start, end)  # type: ignore[arg-type]
+
+
+def _cls(
+    segment: SpeakerSegment,
+    outcome: SegmentOutcome,
+    *,
+    failure_reason: AlignmentFailureReason | None = None,
+    by_design_reason: ByDesignReason | None = None,
+) -> SegmentClass:
+    return SegmentClass.from_segment(
+        segment,
+        outcome,
+        failure_reason=failure_reason,
+        by_design_reason=by_design_reason,
+    )
 
 
 def _spans(items: tuple[SpeakerSegment, ...] | list[SpeakerSegment]) -> list[tuple[int, int]]:
@@ -552,41 +576,64 @@ def test_gates_fail_subset_outside_the_200ms_closed_original() -> None:
     assert gate.passed is False
 
 
+def test_segment_class_rejects_string_outcomes() -> None:
+    with pytest.raises(TypeError, match="SegmentOutcome"):
+        SegmentClass("rec", "A", 0, parse_seconds_to_ns(1), "alignment_failure")  # type: ignore[arg-type]
+
+
 def test_gates_pass_failure_share_at_the_025_limit() -> None:
-    original = [
-        RecordingLabels(
-            "rec",
-            (_seg("A", 0, 1), _seg("A", 2, 3), _seg("B", 0, 1), _seg("B", 2, 3)),
-        )
-    ]
+    originals = (_seg("A", 0, 1), _seg("A", 2, 3), _seg("B", 0, 1), _seg("B", 2, 3))
+    original = [RecordingLabels("rec", originals)]
     new = [
         RecordingLabels(
             "rec",
             (_seg("A", 0, 1), _seg("A", 2, 3), _seg("B", 0, 1)),
-            (UncertainInterval.from_seconds("rec", "B", 2, 3),),
+            (_unc("B", 2, 3),),
         )
     ]
+    classes = (
+        _cls(originals[0], SegmentOutcome.ALIGNED),
+        _cls(originals[1], SegmentOutcome.ALIGNED),
+        _cls(originals[2], SegmentOutcome.ALIGNED),
+        _cls(
+            originals[3],
+            SegmentOutcome.ALIGNMENT_FAILURE,
+            failure_reason=AlignmentFailureReason.LOW_COVERAGE,
+        ),
+    )
 
-    gate = evaluate_gates(original, new)
+    gate = evaluate_gates(original, new, segment_classes=classes)
 
     assert gate.failure_share == pytest.approx(0.25)
+    assert gate.by_design_share == pytest.approx(0.0)
     assert gate.failure_share_ok is True
     assert gate.passed is True
 
 
 def test_gates_fail_failure_share_above_025() -> None:
-    original = [RecordingLabels("rec", (_seg("A", 0, 1), _seg("A", 2, 3), _seg("B", 0, 1)))]
+    originals = (_seg("A", 0, 1), _seg("A", 2, 3), _seg("B", 0, 1))
+    original = [RecordingLabels("rec", originals)]
     new = [
         RecordingLabels(
             "rec",
             (_seg("A", 0, 1), _seg("A", 2, 3)),
-            (UncertainInterval.from_seconds("rec", "B", 0, 1),),
+            (_unc("B", 0, 1),),
         )
     ]
+    classes = (
+        _cls(originals[0], SegmentOutcome.ALIGNED),
+        _cls(originals[1], SegmentOutcome.ALIGNED),
+        _cls(
+            originals[2],
+            SegmentOutcome.ALIGNMENT_FAILURE,
+            failure_reason=AlignmentFailureReason.ALIGNER_ERROR,
+        ),
+    )
 
-    gate = evaluate_gates(original, new)
+    gate = evaluate_gates(original, new, segment_classes=classes)
 
     assert gate.failure_share == pytest.approx(1 / 3)
+    assert 0.0 <= gate.failure_share <= 1.0
     assert gate.failure_share_ok is False
     assert gate.hard_gates_ok is True
     assert gate.passed is False
@@ -622,5 +669,193 @@ def test_gates_report_uncertain_share_per_recording() -> None:
     assert gate.uncertain_overlap_ok is True
     payload = gate.to_json()
     assert payload["uncertain_share"] == pytest.approx(0.08)
+    assert payload["uncertain_share_excluding_by_design"] == pytest.approx(0.08)
+    assert payload["by_design_share"] == pytest.approx(0.0)
     assert payload["keeps_current_labels"] is False
     assert gate.passed is True
+
+
+def test_gates_count_three_uncertain_rows_as_one_original_segment() -> None:
+    human = _seg("A", 0, 4)
+    original = [RecordingLabels("rec", (human, _seg("B", 0, 1), _seg("C", 0, 1), _seg("D", 0, 1)))]
+    new = [
+        RecordingLabels(
+            "rec",
+            (_seg("B", 0, 1), _seg("C", 0, 1), _seg("D", 0, 1)),
+            (_unc("A", 0, 1), _unc("A", 1, 2), _unc("A", 2, 4)),
+        )
+    ]
+    classes = (
+        _cls(human, SegmentOutcome.ALIGNMENT_FAILURE, failure_reason=AlignmentFailureReason.MARKER_ONLY),
+        _cls(_seg("B", 0, 1), SegmentOutcome.ALIGNED),
+        _cls(_seg("C", 0, 1), SegmentOutcome.ALIGNED),
+        _cls(_seg("D", 0, 1), SegmentOutcome.ALIGNED),
+    )
+
+    gate = evaluate_gates(original, new, segment_classes=classes)
+
+    assert len(new[0].uncertain) == 1
+    assert gate.failure_share == pytest.approx(0.25)
+    assert 0.0 <= gate.failure_share <= 1.0
+
+
+def test_gates_exclude_by_design_segments_from_failure_share() -> None:
+    originals = (_seg("A", 0, 1), _seg("B", 0, 1), _seg("C", 0, 1), _seg("D", 0, 1))
+    original = [RecordingLabels("rec", originals)]
+    new = [
+        RecordingLabels(
+            "rec",
+            (_seg("A", 0, 1),),
+            (_unc("B", 0, 1), _unc("C", 0, 1), _unc("D", 0, 1)),
+        )
+    ]
+    classes = (
+        _cls(originals[0], SegmentOutcome.ALIGNED),
+        _cls(
+            originals[1],
+            SegmentOutcome.BY_DESIGN_UNCERTAIN,
+            by_design_reason=ByDesignReason.MULTI_SPEAKER,
+        ),
+        _cls(
+            originals[2],
+            SegmentOutcome.BY_DESIGN_UNCERTAIN,
+            by_design_reason=ByDesignReason.HELD_OUT_LANGUAGE,
+        ),
+        _cls(
+            originals[3],
+            SegmentOutcome.ALIGNMENT_FAILURE,
+            failure_reason=AlignmentFailureReason.EMPTY_ROMANIZATION,
+        ),
+    )
+
+    gate = evaluate_gates(original, new, segment_classes=classes)
+
+    assert gate.failure_share == pytest.approx(0.25)
+    assert gate.by_design_share == pytest.approx(0.5)
+    assert gate.failure_share_ok is True
+    assert gate.uncertain_share == pytest.approx(0.75)
+    assert gate.uncertain_share_excluding_by_design == pytest.approx(0.25)
+    assert 0.0 <= gate.failure_share <= 1.0
+    assert 0.0 <= gate.by_design_share <= 1.0
+
+
+def test_gates_keep_touching_original_rows_as_separate_segments() -> None:
+    originals = (_seg("A", 0, 1), _seg("A", 1, 2))
+    original = [RecordingLabels("rec", originals)]
+    new = [RecordingLabels("rec", (_seg("A", 0, 1),), (_unc("A", 1, 2),))]
+    classes = (
+        _cls(originals[0], SegmentOutcome.ALIGNED),
+        _cls(
+            originals[1],
+            SegmentOutcome.BY_DESIGN_UNCERTAIN,
+            by_design_reason=ByDesignReason.MULTI_SPEAKER,
+        ),
+    )
+
+    gate = evaluate_gates(original, new, segment_classes=classes)
+
+    assert gate.failure_share == pytest.approx(0.0)
+    assert gate.by_design_share == pytest.approx(0.5)
+
+
+def test_gates_union_overlapping_original_rows_before_counting() -> None:
+    original = [RecordingLabels("rec", (_seg("A", 0, 2), _seg("A", 1, 3)))]
+    new = [RecordingLabels("rec", (), (_unc("A", 0, 3),))]
+    unioned = _seg("A", 0, 3)
+    classes = (
+        _cls(unioned, SegmentOutcome.ALIGNMENT_FAILURE, failure_reason=AlignmentFailureReason.LOW_COVERAGE),
+    )
+
+    gate = evaluate_gates(original, new, segment_classes=classes)
+
+    assert gate.failure_share == pytest.approx(1.0)
+    with pytest.raises(ValueError, match="cover each unioned original segment once"):
+        evaluate_gates(
+            original,
+            new,
+            segment_classes=(
+                _cls(_seg("A", 0, 2), SegmentOutcome.ALIGNED),
+                _cls(
+                    _seg("A", 1, 3),
+                    SegmentOutcome.ALIGNMENT_FAILURE,
+                    failure_reason=AlignmentFailureReason.LOW_COVERAGE,
+                ),
+            ),
+        )
+
+
+def test_gates_failure_share_stays_in_unit_interval_with_many_uncertain_rows() -> None:
+    human = _seg("A", 0, 1)
+    original = [RecordingLabels("rec", (human,))]
+    new = [RecordingLabels("rec", (), (_unc("A", 0, "0.2"), _unc("A", "0.4", "0.6"), _unc("A", "0.8", 1)))]
+    classes = (
+        _cls(human, SegmentOutcome.ALIGNMENT_FAILURE, failure_reason=AlignmentFailureReason.ALIGNER_ERROR),
+    )
+
+    gate = evaluate_gates(original, new, segment_classes=classes)
+
+    assert gate.failure_share == pytest.approx(1.0)
+    assert 0.0 <= gate.failure_share <= 1.0
+
+
+def test_recording_labels_unions_overlapping_uncertain_per_speaker() -> None:
+    labels = RecordingLabels(
+        "rec",
+        (),
+        (_unc("A", 0, 2), _unc("A", 1, 3), _unc("B", 0, 1)),
+    )
+
+    assert _spans(labels.uncertain_for("A")) == [_span(0, 3)]
+    assert _spans(labels.uncertain_for("B")) == [_span(0, 1)]
+
+
+def test_recording_labels_unions_nested_uncertain_regions() -> None:
+    labels = RecordingLabels("rec", (), (_unc("A", 0, 5), _unc("A", 1, 2), _unc("A", 3, 4)))
+
+    assert _spans(labels.uncertain) == [_span(0, 5)]
+
+
+def test_recording_labels_unions_touching_uncertain_regions() -> None:
+    labels = RecordingLabels("rec", (), (_unc("A", 0, 1), _unc("A", 1, 2)))
+
+    assert _spans(labels.uncertain) == [_span(0, 2)]
+
+
+def test_recording_labels_subtracts_active_speech_from_uncertain() -> None:
+    labels = RecordingLabels(
+        "rec",
+        (_seg("A", 1, 2),),
+        (_unc("A", 0, 3), _unc("A", "0.5", "2.5")),
+    )
+
+    assert _spans(labels.segments) == [_span(1, 2)]
+    assert _spans(labels.uncertain) == [_span(0, 1), _span(2, 3)]
+
+
+def test_subtract_uncertain_from_active_unions_then_cuts() -> None:
+    remaining = subtract_uncertain_from_active(
+        (_unc("A", 0, 2), _unc("A", 1, 4), _unc("A", 4, 5)),
+        (_seg("A", 2, 3),),
+    )
+
+    assert _spans(remaining) == [_span(0, 2), _span(3, 5)]
+
+
+def test_gate_report_uses_failure_share_and_retention_parameters() -> None:
+    from recipes.speakrs.large.tight_labels.produce import render_gate_markdown
+
+    originals = (_seg("A", 0, 1),)
+    original = [RecordingLabels("rec", originals)]
+    new = [RecordingLabels("rec", originals)]
+    gate = evaluate_gates(
+        original,
+        new,
+        failure_share_limit=0.4,
+        speaker_retention_floor=0.15,
+    )
+    text = render_gate_markdown("AMI", "ami-tight-v3", gate, kept_current=False)
+
+    assert "Failure share ≤ 0.40:" in text
+    assert "Flagged speakers below 15% retention:" in text
+    assert gate.failure_share_limit == pytest.approx(0.4)
+    assert gate.speaker_retention_floor == pytest.approx(0.15)
