@@ -706,17 +706,17 @@ def map_lotusdis_close_talk(
 ) -> tuple[dict[str, np.ndarray], dict[str, ClockOffset], LavalierMapping]:
     """Infer lavalier-to-speaker maps from exclusive single-speaker energy."""
 
-    exclusive: dict[str, list[tuple[int, int]]] = defaultdict(list)
-    exclusive_seconds: dict[str, float] = defaultdict(float)
+    exclusive: dict[str, list[LotusAlignInterval]] = defaultdict(list)
+    interval_seconds: dict[str, list[float]] = defaultdict(list)
     for interval in intervals:
         if interval.non_speech or interval.overlap or len(interval.speakers) != 1:
             continue
         speaker = interval.speakers[0]
-        exclusive[speaker].append((interval.start_ns, interval.end_ns))
-        exclusive_seconds[speaker] += ns_to_seconds(interval.end_ns - interval.start_ns)
+        exclusive[speaker].append(interval)
+        interval_seconds[speaker].append(ns_to_seconds(interval.end_ns - interval.start_ns))
     channels: dict[str, np.ndarray] = {}
     offsets: dict[str, ClockOffset] = {}
-    energy: dict[str, dict[str, float]] = {}
+    interval_rms: dict[str, dict[str, tuple[float, ...]]] = {}
     for name, path in _lotus_lav_paths(ref.recording_id).items():
         if not path.is_file():
             continue
@@ -725,11 +725,14 @@ def map_lotusdis_close_talk(
         offsets[name] = offset
         aligned = shift_close_talk(samples, offset.offset_samples if offset.consistent else 0, mix.size)
         channels[name] = aligned
-        energy[name] = {
-            speaker: rms_in_spans(aligned, SAMPLE_RATE, exclusive.get(speaker, ()))
-            for speaker in exclusive
+        interval_rms[name] = {
+            speaker: tuple(
+                rms_in_spans(aligned, SAMPLE_RATE, [(interval.start_ns, interval.end_ns)])
+                for interval in speaker_intervals
+            )
+            for speaker, speaker_intervals in exclusive.items()
         }
-    mapping = map_lavaliers(energy, exclusive_seconds)
+    mapping = map_lavaliers(interval_rms, interval_seconds)
     if mapping.use_close_talk:
         for assignment in mapping.assignments:
             offset = offsets.get(assignment.channel)
@@ -740,6 +743,7 @@ def map_lotusdis_close_talk(
                     False,
                     mapping.confidence,
                     f"offset-inconsistent:{assignment.channel}",
+                    mapping.speaker_decisions,
                 )
                 break
     return channels, offsets, mapping
@@ -908,11 +912,25 @@ def align_lotusdis_recording(
                 {
                     "speaker": item.speaker,
                     "channel": item.channel,
+                    "method": item.method,
+                    "winner_fraction": item.winner_fraction,
                     "ratio": item.ratio,
                     "exclusive_seconds": item.exclusive_seconds,
                     "rms_by_speaker": item.rms_by_speaker,
                 }
                 for item in mapping.assignments
+            ],
+            "speaker_mappings": [
+                {
+                    "speaker": item.speaker,
+                    "channel": item.channel,
+                    "candidate_channel": item.candidate_channel,
+                    "method": item.method,
+                    "winner_fraction": item.winner_fraction,
+                    "ratio": item.ratio,
+                    "ambiguous": item.ambiguous,
+                }
+                for item in mapping.speaker_decisions
             ],
             "offsets": {
                 name: {

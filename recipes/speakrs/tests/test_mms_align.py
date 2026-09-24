@@ -195,31 +195,61 @@ item [1]:
     assert intervals[2].overlap is True
 
 
-def test_lavalier_map_requires_a_clear_unique_ratio() -> None:
-    energy = {
-        "Lav1": {"F01": 0.9, "M01": 0.1, "F02": 0.05},
-        "Lav2": {"F01": 0.1, "M01": 0.8, "F02": 0.1},
-        "Lav3": {"F01": 0.05, "M01": 0.1, "F02": 0.7},
+def test_lavalier_mapping_normalizes_channel_gain_before_selecting_speakers() -> None:
+    interval_rms = {
+        "Lav1": {"F01": [100.0] * 4, "M01": [99.0] * 4},
+        "Lav2": {"F01": [2.0] * 4, "M01": [1.0] * 4},
     }
-    exclusive = {"F01": 20.0, "M01": 20.0, "F02": 20.0}
+    interval_seconds = {"F01": [1.0] * 4, "M01": [1.0] * 4}
 
-    mapping = map_lavaliers(energy, exclusive)
+    mapping = map_lavaliers(interval_rms, interval_seconds)
 
     assert mapping.use_close_talk is True
+    assert mapping.channel_for("F01") == "Lav2"
+    assert mapping.channel_for("M01") == "Lav1"
+    assert {item.method for item in mapping.assignments} == {"energy"}
+    assert all(item.winner_fraction == 1.0 for item in mapping.assignments)
+    assert all(item.ratio > 1.0 for item in mapping.assignments)
+
+
+def test_lavalier_mapping_completes_one_remaining_speaker_by_elimination() -> None:
+    interval_rms = {
+        "Lav1": {"F01": [10.0] * 4, "M01": [1.0] * 4},
+        "Lav2": {"F01": [1.0] * 4, "M01": [10.0, 10.0, 0.1, 0.1]},
+    }
+    interval_seconds = {"F01": [1.0] * 4, "M01": [1.0] * 4}
+
+    mapping = map_lavaliers(interval_rms, interval_seconds)
+
     assert mapping.channel_for("F01") == "Lav1"
     assert mapping.channel_for("M01") == "Lav2"
-    assert mapping.channel_for("F02") == "Lav3"
-
-
-def test_lavalier_map_falls_back_when_energy_is_tied() -> None:
-    energy = {
-        "Lav1": {"F01": 0.5, "M01": 0.5},
-        "Lav2": {"F01": 0.4, "M01": 0.4},
+    assert {item.speaker: item.method for item in mapping.assignments} == {
+        "F01": "energy",
+        "M01": "elimination",
     }
+    assert mapping.channel_for("M01") is not None
+    decision = next(item for item in mapping.speaker_decisions if item.speaker == "M01")
+    assert decision.winner_fraction == 0.5
+    assert decision.ambiguous is False
 
-    mapping = map_lavaliers(energy, {"F01": 20.0, "M01": 20.0})
 
-    assert mapping.use_close_talk is False
+def test_lavalier_mapping_leaves_shared_leakage_ambiguous() -> None:
+    interval_rms = {
+        "Lav1": {"M34": [10.0] * 4, "F37": [2.0] * 4, "F38": [2.0] * 4},
+        "Lav2": {"M34": [1.0] * 4, "F37": [1.0] * 4, "F38": [1.0] * 4},
+        "Lav3": {"M34": [1.0] * 4, "F37": [1.0] * 4, "F38": [1.0] * 4},
+    }
+    interval_seconds = {speaker: [1.0] * 4 for speaker in ("M34", "F37", "F38")}
+
+    mapping = map_lavaliers(interval_rms, interval_seconds)
+
+    assert mapping.use_close_talk is True
+    assert mapping.channel_for("M34") == "Lav1"
+    assert mapping.channel_for("F37") is None
+    assert mapping.channel_for("F38") is None
+    decisions = {item.speaker: item for item in mapping.speaker_decisions}
+    assert {speaker for speaker, item in decisions.items() if item.ambiguous} == {"F37", "F38"}
+    assert decisions["F37"].ratio == pytest.approx(1.0)
 
 
 def test_clock_offset_recovers_a_known_delay() -> None:
@@ -234,12 +264,35 @@ def test_clock_offset_recovers_a_known_delay() -> None:
     assert abs(measured.offset_samples - delay) <= 2
 
 
-def test_shift_close_talk_places_the_channel_on_the_mix_clock() -> None:
+def test_shift_close_talk_applies_offsets_to_the_mix_clock() -> None:
     samples = np.arange(10, dtype=np.float32)
-    shifted = shift_close_talk(samples, 2, 10)
+    shifted = shift_close_talk(samples, -2, 10)
 
     np.testing.assert_array_equal(shifted[:2], np.zeros(2, dtype=np.float32))
     np.testing.assert_array_equal(shifted[2:], samples[:8])
+
+
+@pytest.mark.parametrize("delay", (50, -50))
+def test_clock_offset_sign_aligns_close_talk_content_with_mix(delay: int) -> None:
+    mix = np.random.default_rng(10).normal(0, 0.1, 16_000 * 4).astype(np.float32)
+    close = np.zeros_like(mix)
+    if delay > 0:
+        close[delay:] = mix[:-delay]
+    else:
+        close[:delay] = mix[-delay:]
+
+    measured = measure_clock_offset(mix, close, windows=4, window_seconds=1.0)
+    aligned = shift_close_talk(close, measured.offset_samples, mix.size)
+    if delay > 0:
+        actual = aligned[:-delay]
+        expected = mix[:-delay]
+    else:
+        actual = aligned[-delay:]
+        expected = mix[-delay:]
+
+    assert measured.consistent is True
+    assert abs(measured.offset_samples - delay) <= 1
+    assert np.corrcoef(actual, expected)[0, 1] > 0.999
 
 
 def test_voicing_marks_close_talk_speech_the_aligner_left_silent() -> None:

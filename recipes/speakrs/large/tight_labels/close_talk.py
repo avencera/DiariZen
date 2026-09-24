@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Literal, Mapping, Sequence
 
 import numpy as np
 from scipy.signal import correlate, resample_poly
@@ -19,8 +19,8 @@ OFFSET_WINDOWS = 6
 OFFSET_WINDOW_SECONDS = 8.0
 OFFSET_MAX_ABS_SECONDS = 0.25
 OFFSET_AGREE_SECONDS = 0.02
-LAV_RATIO_MIN = 1.5
-LAV_MIN_EXCLUSIVE_SECONDS = 5.0
+LAV_WINNER_FRACTION_MIN = 0.80
+LAV_ELIMINATION_FRACTION_MIN = 0.50
 VOICED_FRAME_MS = 30
 VOICED_HOP_MS = 10
 VOICED_ABS_FLOOR = 1e-3
@@ -44,9 +44,24 @@ class LavalierAssignment:
 
     speaker: str
     channel: str
+    method: Literal["energy", "elimination"]
+    winner_fraction: float
     ratio: float
     exclusive_seconds: float
     rms_by_speaker: dict[str, float]
+
+
+@dataclass(frozen=True, slots=True)
+class LavalierSpeakerDecision:
+    """Record the mapping evidence for one speaker, including ambiguity."""
+
+    speaker: str
+    channel: str | None
+    candidate_channel: str | None
+    method: Literal["energy", "elimination"] | None
+    winner_fraction: float
+    ratio: float
+    ambiguous: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +73,7 @@ class LavalierMapping:
     use_close_talk: bool
     confidence: float
     reason: str
+    speaker_decisions: tuple[LavalierSpeakerDecision, ...] = ()
 
     def channel_for(self, speaker: str) -> str | None:
         """Return the mapped lavalier name for a speaker."""
@@ -66,6 +82,17 @@ class LavalierMapping:
             if item.speaker == speaker:
                 return item.channel
         return None
+
+
+@dataclass(frozen=True, slots=True)
+class _SpeakerEnergyEvidence:
+    """Normalized energy evidence used while selecting one speaker map."""
+
+    candidate_channel: str | None
+    pooled: Mapping[str, float]
+    ratio: float
+    winner_fraction: float
+    winner_fractions: Mapping[str, float]
 
 
 def downmix_mono(samples: np.ndarray) -> np.ndarray:
@@ -154,12 +181,9 @@ def shift_close_talk(samples: np.ndarray, offset_samples: int, length: int) -> n
 
     mono = downmix_mono(samples)
     out = np.zeros(length, dtype=np.float32)
-    if offset_samples >= 0:
-        src_start = 0
-        dst_start = offset_samples
-    else:
-        src_start = -offset_samples
-        dst_start = 0
+    # positive offsets mean the source lags the mix, so trim its delayed prefix
+    src_start = max(0, offset_samples)
+    dst_start = max(0, -offset_samples)
     copy = min(mono.size - src_start, length - dst_start)
     if copy > 0 and src_start < mono.size and dst_start < length:
         out[dst_start : dst_start + copy] = mono[src_start : src_start + copy]
@@ -184,63 +208,196 @@ def rms_in_spans(samples: np.ndarray, sample_rate: int, spans: Sequence[tuple[in
 
 
 def map_lavaliers(
-    energy: Mapping[str, Mapping[str, float]],
-    exclusive_seconds: Mapping[str, float],
-    *,
-    ratio_min: float = LAV_RATIO_MIN,
-    min_exclusive_seconds: float = LAV_MIN_EXCLUSIVE_SECONDS,
+    interval_rms: Mapping[str, Mapping[str, Sequence[float]]],
+    interval_seconds: Mapping[str, Sequence[float]],
 ) -> LavalierMapping:
-    """Assign each lavalier to the speaker with the strongest exclusive energy."""
+    """Assign lavaliers from gain-normalized, per-interval speaker energy."""
 
-    channels = sorted(energy)
-    speakers = sorted({speaker for row in energy.values() for speaker in row})
+    channels = sorted(interval_rms)
+    speakers = sorted(set(interval_seconds) | {speaker for row in interval_rms.values() for speaker in row})
     if not channels or not speakers:
-        return LavalierMapping((), tuple(speakers), False, 0.0, "no-channels")
-    used_speakers: set[str] = set()
-    used_channels: set[str] = set()
-    assignments: list[LavalierAssignment] = []
-    ratios: list[float] = []
-    for channel in channels:
-        ranked = sorted(
-            ((speaker, energy[channel].get(speaker, 0.0)) for speaker in speakers),
-            key=lambda item: item[1],
-            reverse=True,
+        decisions = tuple(
+            LavalierSpeakerDecision(speaker, None, None, None, 0.0, 0.0, True)
+            for speaker in speakers
         )
-        if not ranked or ranked[0][1] <= 0:
-            continue
-        best_speaker, best_rms = ranked[0]
-        second_rms = ranked[1][1] if len(ranked) > 1 else 0.0
-        ratio = best_rms / second_rms if second_rms > 0 else float("inf")
-        exclusive = float(exclusive_seconds.get(best_speaker, 0.0))
-        if (
-            best_speaker in used_speakers
-            or channel in used_channels
-            or ratio < ratio_min
-            or exclusive < min_exclusive_seconds
-        ):
-            continue
-        used_speakers.add(best_speaker)
-        used_channels.add(channel)
-        assignments.append(
-            LavalierAssignment(
-                speaker=best_speaker,
-                channel=channel,
-                ratio=float(ratio) if np.isfinite(ratio) else 99.0,
-                exclusive_seconds=exclusive,
-                rms_by_speaker={name: float(energy[channel].get(name, 0.0)) for name in speakers},
-            )
+        return LavalierMapping((), tuple(speakers), False, 0.0, "no-channels", decisions)
+
+    normalized = _normalize_interval_rms(interval_rms, channels, speakers)
+    evidence: dict[str, _SpeakerEnergyEvidence] = {}
+    for speaker in speakers:
+        evidence[speaker] = _speaker_energy_evidence(
+            speaker,
+            channels,
+            normalized,
+            interval_seconds.get(speaker, ()),
         )
-        ratios.append(assignments[-1].ratio)
-    unmapped = tuple(item for item in speakers if item not in used_speakers)
-    confidence = min(ratios) if ratios else 0.0
-    use = bool(assignments) and not unmapped
-    if use:
-        reason = "unique-energy-map"
-    elif assignments:
+    eligible: dict[str, str] = {}
+    channel_claims: dict[str, list[str]] = {}
+    for speaker, item in evidence.items():
+        candidate = item.candidate_channel
+        if candidate is None or item.winner_fraction < LAV_WINNER_FRACTION_MIN:
+            continue
+        eligible[speaker] = candidate
+        channel_claims.setdefault(candidate, []).append(speaker)
+
+    selected: dict[str, tuple[str, Literal["energy", "elimination"], float]] = {}
+    for speaker, channel in eligible.items():
+        if len(channel_claims[channel]) == 1:
+            selected[speaker] = (channel, "energy", evidence[speaker].winner_fraction)
+
+    unmapped_speakers = [speaker for speaker in speakers if speaker not in selected]
+    used_channels = {channel for channel, _, _ in selected.values()}
+    remaining_channels = [channel for channel in channels if channel not in used_channels]
+    if len(unmapped_speakers) == 1 and len(remaining_channels) == 1:
+        speaker = unmapped_speakers[0]
+        channel = remaining_channels[0]
+        # compare against every channel so the sole remaining one cannot win by default
+        fraction = evidence[speaker].winner_fractions.get(channel, 0.0)
+        if fraction >= LAV_ELIMINATION_FRACTION_MIN:
+            selected[speaker] = (channel, "elimination", fraction)
+
+    assignments = tuple(
+        LavalierAssignment(
+            speaker=speaker,
+            channel=channel,
+            method=method,
+            winner_fraction=winner_fraction,
+            ratio=evidence[speaker].ratio,
+            exclusive_seconds=float(sum(interval_seconds.get(speaker, ()))),
+            rms_by_speaker={name: evidence[name].pooled.get(channel, 0.0) for name in speakers},
+        )
+        for speaker, (channel, method, winner_fraction) in sorted(selected.items())
+    )
+    assigned_by_speaker = {item.speaker: item for item in assignments}
+    decisions = tuple(
+        LavalierSpeakerDecision(
+            speaker=speaker,
+            channel=assigned_by_speaker[speaker].channel if speaker in assigned_by_speaker else None,
+            candidate_channel=evidence[speaker].candidate_channel,
+            method=assigned_by_speaker[speaker].method if speaker in assigned_by_speaker else None,
+            winner_fraction=(
+                assigned_by_speaker[speaker].winner_fraction
+                if speaker in assigned_by_speaker
+                else evidence[speaker].winner_fraction
+            ),
+            ratio=evidence[speaker].ratio,
+            ambiguous=speaker not in assigned_by_speaker,
+        )
+        for speaker in speakers
+    )
+    unmapped = tuple(item for item in speakers if item not in assigned_by_speaker)
+    confidence = min((item.ratio for item in assignments), default=0.0)
+    use = bool(assignments)
+    if use and not unmapped:
+        reason = (
+            "unique-energy-map"
+            if all(item.method == "energy" for item in assignments)
+            else "complete-map"
+        )
+    elif use:
         reason = "partial-map"
     else:
         reason = "no-clear-channel"
-    return LavalierMapping(tuple(assignments), unmapped, use, float(confidence), reason)
+    return LavalierMapping(assignments, unmapped, use, float(confidence), reason, decisions)
+
+
+def _normalize_interval_rms(
+    interval_rms: Mapping[str, Mapping[str, Sequence[float]]],
+    channels: Sequence[str],
+    speakers: Sequence[str],
+) -> dict[str, dict[str, np.ndarray]]:
+    """Normalize each channel by its median interval RMS."""
+
+    normalized: dict[str, dict[str, np.ndarray]] = {}
+    for channel in channels:
+        rows = {
+            speaker: np.asarray(interval_rms[channel].get(speaker, ()), dtype=np.float64)
+            for speaker in speakers
+        }
+        finite_rows = [row[np.isfinite(row) & (row >= 0)] for row in rows.values()]
+        observed_rows = [row for row in finite_rows if row.size]
+        observed = np.concatenate(observed_rows) if observed_rows else np.array([])
+        median = float(np.median(observed)) if observed.size else 0.0
+        if median <= 1e-12:
+            normalized[channel] = {speaker: np.zeros_like(row) for speaker, row in rows.items()}
+            continue
+        normalized[channel] = {
+            speaker: np.where(np.isfinite(row) & (row >= 0), row / median, 0.0)
+            for speaker, row in rows.items()
+        }
+    return normalized
+
+
+def _speaker_energy_evidence(
+    speaker: str,
+    channels: Sequence[str],
+    normalized: Mapping[str, Mapping[str, np.ndarray]],
+    interval_seconds: Sequence[float],
+) -> _SpeakerEnergyEvidence:
+    """Return pooled energy, the unique top channel, and interval win fractions."""
+
+    durations = np.asarray(interval_seconds, dtype=np.float64)
+    lengths = [durations.size]
+    lengths.extend(normalized[channel].get(speaker, np.array([])).size for channel in channels)
+    available = min(lengths)
+    durations = durations[:available]
+    valid = np.isfinite(durations) & (durations > 0)
+    durations = durations[valid]
+    values = {
+        channel: normalized[channel].get(speaker, np.array([]))[:available][valid]
+        for channel in channels
+    }
+    total_duration = float(durations.sum())
+    pooled = {
+        channel: (
+            float(np.sqrt(np.sum(np.square(values[channel], dtype=np.float64) * durations) / total_duration))
+            if total_duration > 0
+            else 0.0
+        )
+        for channel in channels
+    }
+    win_counts = dict.fromkeys(channels, 0)
+    if durations.size:
+        for index in range(durations.size):
+            winner = _unique_maximum({channel: float(values[channel][index]) for channel in channels})
+            if winner is not None:
+                win_counts[winner] += 1
+    winner_fractions = {
+        channel: count / durations.size if durations.size else 0.0
+        for channel, count in win_counts.items()
+    }
+    ranked = sorted(pooled.values(), reverse=True)
+    ratio = _energy_ratio(ranked[0], ranked[1] if len(ranked) > 1 else 0.0)
+    candidate = _unique_maximum(pooled)
+    if candidate is None:
+        winner_fraction = 0.0
+        candidate_channel = None
+    else:
+        winner_fraction = winner_fractions[candidate]
+        candidate_channel = candidate
+    return _SpeakerEnergyEvidence(candidate_channel, pooled, ratio, winner_fraction, winner_fractions)
+
+
+def _unique_maximum(values: Mapping[str, float]) -> str | None:
+    """Return the sole positive maximum, or None for a tie or empty evidence."""
+
+    if not values:
+        return None
+    best = max(values.values())
+    if best <= 0:
+        return None
+    winners = [name for name, value in values.items() if np.isclose(value, best, rtol=1e-9, atol=1e-12)]
+    return winners[0] if len(winners) == 1 else None
+
+
+def _energy_ratio(best: float, second: float) -> float:
+    """Return a bounded top-to-runner-up ratio for JSON-safe evidence."""
+
+    if best <= 0:
+        return 0.0
+    if second <= 0:
+        return 99.0
+    return float(best / second)
 
 
 def voiced_spans(
@@ -303,8 +460,8 @@ def voicing_thresholds() -> dict[str, float | int]:
         "hop_ms": VOICED_HOP_MS,
         "abs_floor_rms": VOICED_ABS_FLOOR,
         "relative_to_speech_rms": VOICED_RELATIVE,
-        "lavalier_ratio_min": LAV_RATIO_MIN,
-        "lavalier_min_exclusive_seconds": LAV_MIN_EXCLUSIVE_SECONDS,
+        "lavalier_winner_fraction_min": LAV_WINNER_FRACTION_MIN,
+        "lavalier_elimination_fraction_min": LAV_ELIMINATION_FRACTION_MIN,
         "offset_windows": OFFSET_WINDOWS,
         "offset_window_seconds": OFFSET_WINDOW_SECONDS,
         "offset_max_abs_seconds": OFFSET_MAX_ABS_SECONDS,
