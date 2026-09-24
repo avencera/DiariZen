@@ -128,18 +128,29 @@ def parse_recording_rttm(
     *,
     recording_id: str,
     uncertain_text: str = "",
+    uncertain_removed_ns: int = 0,
 ) -> RecordingLabels:
-    """Parse speaker and optional uncertain text for one recording."""
+    """Parse speaker and optional uncertain text for one recording
+
+    `uncertain_removed_ns` carries canonicalization time accumulated before
+    these rows were written
+    """
 
     return RecordingLabels(
         recording_id,
         parse_speaker_rttm(text, recording_id=recording_id),
         parse_uncertain_rttm(uncertain_text, recording_id=recording_id),
+        uncertain_removed_ns=uncertain_removed_ns,
     )
 
 
-def load_written_recording_labels(labels_dir: Path, recording_id: str) -> RecordingLabels:
-    """Parse SPEAKER and UNCERTAIN files written for one recording."""
+def load_written_recording_labels(
+    labels_dir: Path,
+    recording_id: str,
+    *,
+    uncertain_removed_ns: int = 0,
+) -> RecordingLabels:
+    """Parse one written recording and preserve its earlier canonicalization count"""
 
     rttm_path = labels_dir / f"{recording_id}.rttm"
     uncertain_path = labels_dir / f"{recording_id}.uncertain.rttm"
@@ -148,6 +159,7 @@ def load_written_recording_labels(labels_dir: Path, recording_id: str) -> Record
         rttm_path.read_text(encoding="utf-8"),
         recording_id=recording_id,
         uncertain_text=uncertain_text,
+        uncertain_removed_ns=uncertain_removed_ns,
     )
 
 

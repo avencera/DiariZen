@@ -16,7 +16,7 @@ from ..jsonio import read_json, write_json
 from ..storage import require_free_gib
 from . import GATE_POLICY_VERSION, LIBRARY_VERSION
 from .domain import RecordingLabels, SpeakerSegment
-from .gates import GateResult, evaluate_gates
+from .gates import OVERLAP_TURN_PADDING_WINDOW_NS, GateResult, evaluate_gates
 from .intervals import clip_recording_to_uem
 from .listening import write_listening_pack
 from .mapping import (
@@ -63,7 +63,6 @@ SOURCE_SPECS = {
         "method": "replace-published-forced-alignment",
         "license": "CC BY 4.0",
         "published_split": "AMI/train",
-        "require_subset": True,
         "listening_name": "ami",
     },
     "alimeeting": {
@@ -74,7 +73,6 @@ SOURCE_SPECS = {
         "method": "replace-published-forced-alignment",
         "license": "CC BY-SA 4.0",
         "published_split": "AliMeeting/Train_Ali_far",
-        "require_subset": True,
         "listening_name": "alimeeting",
     },
     "ava-avd": {
@@ -85,7 +83,6 @@ SOURCE_SPECS = {
         "method": "merge-short-gaps",
         "license": "CC BY 4.0",
         "published_split": None,
-        "require_subset": True,
         "listening_name": "ava-avd",
     },
 }
@@ -258,6 +255,7 @@ def render_gate_markdown(source_name: str, release_id: str, gate: GateResult) ->
         f"- Rows inside UEM: {_ok(gate.uem_ok)}",
         f"- Subset of 200 ms-closed original: {_ok(gate.subset_ok)}",
         f"- UNCERTAIN inside original same-speaker support: {_ok(gate.uncertain_subset_ok)}",
+        f"- Same-speaker SPEAKER and UNCERTAIN do not overlap: {_ok(gate.same_speaker_uncertain_overlap_ok)}",
         f"- Smallest same-speaker gap ≥ 0.200 s: {_ok(gate.smallest_gap_ok)}",
         f"- Published speakers mapped: {_ok(gate.unmapped_speakers_ok)}",
         f"- Original speakers kept in SPEAKER or UNCERTAIN: {_ok(gate.dropped_speakers_ok)}",
@@ -287,6 +285,10 @@ def render_gate_markdown(source_name: str, release_id: str, gate: GateResult) ->
             f"{loss.removed_padding_seconds:.3f} s, masked {loss.masked_seconds:.3f} s, "
             f"unexplained {loss.unexplained_seconds:.3f} s "
             f"(original {loss.original_seconds:.3f} s, retained {loss.retained_seconds:.3f} s)"
+        ),
+        (
+            "- Turn-padding window: "
+            f"{ns_to_seconds(OVERLAP_TURN_PADDING_WINDOW_NS):.3f} s from an original same-speaker segment edge"
         ),
         "",
         "## Reported",
@@ -374,9 +376,7 @@ def _fmt(value: float | None) -> str:
     return f"{value:.4f}"
 
 
-def _ok(value: bool | None) -> str:
-    if value is None:
-        return "not required"
+def _ok(value: bool) -> str:
     return "pass" if value else "fail"
 
 
@@ -417,12 +417,16 @@ def write_release(
     (release_dir / "all.rttm").write_text("".join(all_rttm), encoding="utf-8")
     (release_dir / "all.uem").write_text("".join(all_uem), encoding="utf-8")
     written = tuple(
-        load_written_recording_labels(labels_dir, labels.recording_id) for labels in produced
+        load_written_recording_labels(
+            labels_dir,
+            labels.recording_id,
+            uncertain_removed_ns=labels.uncertain_removed_ns,
+        )
+        for labels in produced
     )
     gate = evaluate_gates(
         original,
         written,
-        require_subset=spec["require_subset"],
         uem_by_recording=uem_by_recording,
         mappings=mappings or None,
         segment_classes=segment_classes,

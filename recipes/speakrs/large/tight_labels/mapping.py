@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Mapping, Sequence
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from .classify import ByDesignReason, SegmentClass, SegmentOutcome, unioned_original_segments
+from .classify import (
+    AlignmentFailureReason,
+    ByDesignReason,
+    SegmentClass,
+    SegmentOutcome,
+    unioned_original_segments,
+)
 from .domain import RecordingLabels, SpeakerSegment, UncertainInterval
 from .intervals import clip_recording_to_uem, clip_span, duration_ns, overlap_duration_ns, union_spans
 from .merge import MIN_GAP_NS, merge_recording
@@ -17,13 +23,18 @@ from .time import ns_to_seconds
 
 @dataclass(frozen=True, slots=True)
 class SpeakerMatch:
-    """One published speaker assigned to one original speaker."""
+    """One published speaker assigned to one original speaker.
+
+    `published_spans` records the published support used to classify original
+    segments after the speaker assignment
+    """
 
     published_speaker: str
     original_speaker: str
     overlap_ns: int
     published_ns: int
     original_ns: int
+    published_spans: tuple[tuple[int, int], ...] = ()
 
     @property
     def overlap_seconds(self) -> float:
@@ -54,12 +65,16 @@ class SpeakerMatch:
 
 @dataclass(frozen=True, slots=True)
 class SpeakerMapping:
-    """Assignment of published speakers onto original identities."""
+    """Assignment of published speakers onto original identities.
+
+    `uem` is the time window applied before published support was assigned
+    """
 
     matches: tuple[SpeakerMatch, ...]
     unmapped_published: tuple[str, ...]
     unmapped_original: tuple[str, ...]
     unmapped_published_ns: int = 0
+    uem: tuple[int, int] | None = None
 
     def as_dict(self) -> dict[str, str]:
         """Return published speaker to original speaker."""
@@ -143,6 +158,7 @@ def map_speakers_by_overlap(
                 overlap_ns=seconds_ns,
                 published_ns=duration_ns(published_spans[published_name]),
                 original_ns=duration_ns(original_spans[original_name]),
+                published_spans=tuple(published_spans[published_name]),
             )
         )
     matches.sort(key=lambda item: item.original_speaker)
@@ -173,10 +189,22 @@ def apply_published_replacement(
     source = published
     if uem is not None:
         source = clip_recording_to_uem(published, uem[0], uem[1])
-    mapping = map_speakers_by_overlap(source, original)
+    mapping = replace(map_speakers_by_overlap(source, original), uem=uem)
     relabeled = source.with_recording_id(original.recording_id).map_speakers(mapping.as_dict())
     mapped_original = {item.original_speaker for item in mapping.matches}
+    matches_by_original = {item.original_speaker: item for item in mapping.matches}
     extra_uncertain: list[UncertainInterval] = []
+    for segment in unioned_original_segments((original,)):
+        match = matches_by_original.get(segment.speaker)
+        if match is None:
+            continue
+        span = _original_span_for_mapping(segment, mapping)
+        if span is None or _published_covers(match, span):
+            continue
+        extra_uncertain.append(
+            UncertainInterval(original.recording_id, segment.speaker, span[0], span[1])
+        )
+
     for segment in original.segments:
         if segment.speaker in mapped_original:
             continue
@@ -200,14 +228,27 @@ def classify_published_replacement(
     original: Sequence[RecordingLabels],
     mappings: Mapping[str, SpeakerMapping],
 ) -> tuple[SegmentClass, ...]:
-    """Mark original speakers missing from published labels as by-design UNCERTAIN."""
+    """Classify published coverage failures and speakers missing by design."""
 
     rows: list[SegmentClass] = []
     for segment in unioned_original_segments(original):
         mapping = mappings.get(segment.recording_id)
-        mapped = set() if mapping is None else {item.original_speaker for item in mapping.matches}
-        if segment.speaker in mapped:
+        match = None if mapping is None else next(
+            (item for item in mapping.matches if item.original_speaker == segment.speaker),
+            None,
+        )
+        span = None if mapping is None else _original_span_for_mapping(segment, mapping)
+        if match is not None and (span is None or _published_covers(match, span)):
             rows.append(SegmentClass.from_segment(segment, SegmentOutcome.ALIGNED))
+            continue
+        if match is not None:
+            rows.append(
+                SegmentClass.from_segment(
+                    segment,
+                    SegmentOutcome.ALIGNMENT_FAILURE,
+                    failure_reason=AlignmentFailureReason.NO_PUBLISHED_COVERAGE,
+                )
+            )
             continue
         rows.append(
             SegmentClass.from_segment(
@@ -217,3 +258,18 @@ def classify_published_replacement(
             )
         )
     return tuple(rows)
+
+
+def _original_span_for_mapping(
+    segment: SpeakerSegment,
+    mapping: SpeakerMapping,
+) -> tuple[int, int] | None:
+    if mapping.uem is None:
+        return segment.start_ns, segment.end_ns
+    return clip_span(segment.start_ns, segment.end_ns, mapping.uem[0], mapping.uem[1])
+
+
+def _published_covers(match: SpeakerMatch, span: tuple[int, int]) -> bool:
+    if not match.published_spans:
+        return True
+    return overlap_duration_ns(match.published_spans, (span,)) > 0

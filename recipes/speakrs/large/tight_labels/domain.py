@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable, Mapping
 
 from .time import SecondsLike, ns_to_seconds, parse_seconds_to_ns
@@ -211,12 +211,13 @@ def _overlap_ns(left: Interval, right: Interval) -> int:
 
 @dataclass(frozen=True, slots=True)
 class RecordingLabels:
-    """Active speech and uncertain regions for one recording."""
+    """Active speech, uncertain regions, and parse-time overlap state for one recording."""
 
     recording_id: str
     segments: tuple[SpeakerSegment, ...]
     uncertain: tuple[UncertainInterval, ...] = ()
     uncertain_removed_ns: int = 0
+    same_speaker_uncertain_overlap: bool = field(default=False, init=False, compare=False)
 
     def __post_init__(self) -> None:
         require_identity(self.recording_id, "recording_id")
@@ -239,6 +240,17 @@ class RecordingLabels:
                 raise ValueError("uncertain must contain UncertainInterval values")
             if region.recording_id != self.recording_id:
                 raise ValueError("uncertain recording_id must match the recording")
+
+        active_by_speaker: dict[str, list[Interval]] = {}
+        for segment in segments:
+            active_by_speaker.setdefault(segment.speaker, []).append(segment.bounds)
+        has_same_speaker_overlap = any(
+            _overlap_ns(region.bounds, active) > 0
+            for region in uncertain
+            for active in active_by_speaker.get(region.speaker, ())
+        )
+        object.__setattr__(self, "same_speaker_uncertain_overlap", has_same_speaker_overlap)
+
         from .merge import canonicalize_uncertain
 
         canonical, removed_ns = canonicalize_uncertain(uncertain, segments)
