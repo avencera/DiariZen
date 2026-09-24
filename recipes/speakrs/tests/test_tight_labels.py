@@ -605,6 +605,7 @@ def test_gates_pass_failure_share_at_the_025_limit() -> None:
     gate = evaluate_gates(original, new, segment_classes=classes)
 
     assert gate.failure_share == pytest.approx(0.25)
+    assert gate.failure_share_excluding_by_design == pytest.approx(0.25)
     assert gate.by_design_share == pytest.approx(0.0)
     assert gate.failure_share_ok is True
     assert gate.passed is True
@@ -666,12 +667,15 @@ def test_gates_report_uncertain_share_per_recording() -> None:
     assert len(gate.uncertain_by_recording) == 1
     assert gate.uncertain_by_recording[0].recording_id == "rec"
     assert gate.uncertain_by_recording[0].ratio == pytest.approx(0.08)
-    assert gate.uncertain_overlap_ok is True
+    assert gate.uncertain_canonicalization_removed_ns == 0
     payload = gate.to_json()
     assert payload["uncertain_share"] == pytest.approx(0.08)
     assert payload["uncertain_share_excluding_by_design"] == pytest.approx(0.08)
+    assert payload["failure_share_excluding_by_design"] == pytest.approx(0.0)
     assert payload["by_design_share"] == pytest.approx(0.0)
+    assert payload["uncertain_canonicalization_removed_seconds"] == pytest.approx(0.0)
     assert payload["keeps_current_labels"] is False
+    assert "uncertain_overlap_ok" not in payload
     assert gate.passed is True
 
 
@@ -731,6 +735,7 @@ def test_gates_exclude_by_design_segments_from_failure_share() -> None:
     gate = evaluate_gates(original, new, segment_classes=classes)
 
     assert gate.failure_share == pytest.approx(0.25)
+    assert gate.failure_share_excluding_by_design == pytest.approx(0.5)
     assert gate.by_design_share == pytest.approx(0.5)
     assert gate.failure_share_ok is True
     assert gate.uncertain_share == pytest.approx(0.75)
@@ -830,6 +835,44 @@ def test_recording_labels_subtracts_active_speech_from_uncertain() -> None:
 
     assert _spans(labels.segments) == [_span(1, 2)]
     assert _spans(labels.uncertain) == [_span(0, 1), _span(2, 3)]
+    assert labels.uncertain_removed_ns == parse_seconds_to_ns(1)
+
+
+def test_gates_report_uncertain_removed_by_canonicalization() -> None:
+    original = [RecordingLabels("rec", (_seg("A", 0, 2),))]
+    new = [
+        RecordingLabels(
+            "rec",
+            (_seg("A", 0, 1),),
+            (_unc("A", 0, 2),),
+        )
+    ]
+
+    gate = evaluate_gates(original, new)
+
+    assert new[0].uncertain_removed_ns == parse_seconds_to_ns(1)
+    assert _spans(new[0].uncertain) == [_span(1, 2)]
+    assert gate.uncertain_canonicalization_removed_ns == parse_seconds_to_ns(1)
+    assert gate.uncertain_by_recording[0].canonicalization_removed_ns == parse_seconds_to_ns(1)
+    assert gate.hard_gates_ok is True
+    assert gate.to_json()["uncertain_canonicalization_removed_seconds"] == pytest.approx(1.0)
+
+
+def test_gates_report_zero_failure_share_excluding_by_design_when_all_are_by_design() -> None:
+    originals = (_seg("A", 0, 1), _seg("B", 0, 1))
+    original = [RecordingLabels("rec", originals)]
+    new = [RecordingLabels("rec", (), (_unc("A", 0, 1), _unc("B", 0, 1)))]
+    classes = (
+        _cls(originals[0], SegmentOutcome.BY_DESIGN_UNCERTAIN, by_design_reason=ByDesignReason.MULTI_SPEAKER),
+        _cls(originals[1], SegmentOutcome.BY_DESIGN_UNCERTAIN, by_design_reason=ByDesignReason.SOURCE_RULE),
+    )
+
+    gate = evaluate_gates(original, new, segment_classes=classes)
+
+    assert gate.failure_share == pytest.approx(0.0)
+    assert gate.failure_share_excluding_by_design == pytest.approx(0.0)
+    assert gate.by_design_share == pytest.approx(1.0)
+    assert gate.failure_share_ok is True
 
 
 def test_subtract_uncertain_from_active_unions_then_cuts() -> None:
@@ -856,6 +899,9 @@ def test_gate_report_uses_failure_share_and_retention_parameters() -> None:
     text = render_gate_markdown("AMI", "ami-tight-v3", gate, kept_current=False)
 
     assert "Failure share ≤ 0.40:" in text
+    assert "excluding by-design" in text
+    assert "UNCERTAIN time removed by canonicalization:" in text
+    assert "UNCERTAIN overlapping same-speaker speech" not in text
     assert "Flagged speakers below 15% retention:" in text
     assert gate.failure_share_limit == pytest.approx(0.4)
     assert gate.speaker_retention_floor == pytest.approx(0.15)
