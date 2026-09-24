@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from .domain import RecordingLabels, SpeakerSegment
-from .intervals import clip_recording_to_uem, duration_ns, overlap_duration_ns, union_spans
+from .classify import ByDesignReason, SegmentClass, SegmentOutcome, unioned_original_segments
+from .domain import RecordingLabels, SpeakerSegment, UncertainInterval
+from .intervals import clip_recording_to_uem, clip_span, duration_ns, overlap_duration_ns, union_spans
 from .merge import MIN_GAP_NS, merge_recording
 from .time import ns_to_seconds
 
@@ -165,6 +166,8 @@ def apply_published_replacement(
     """Map published speakers onto original identities and merge short gaps.
 
     When uem is set, published rows are clipped to it before mapping and merge.
+    Original speakers with no published match keep their UEM-clipped speech as
+    UNCERTAIN so they are not dropped from the source record.
     """
 
     source = published
@@ -172,4 +175,45 @@ def apply_published_replacement(
         source = clip_recording_to_uem(published, uem[0], uem[1])
     mapping = map_speakers_by_overlap(source, original)
     relabeled = source.with_recording_id(original.recording_id).map_speakers(mapping.as_dict())
-    return merge_recording(relabeled, min_gap_ns=min_gap_ns), mapping
+    mapped_original = {item.original_speaker for item in mapping.matches}
+    extra_uncertain: list[UncertainInterval] = []
+    for segment in original.segments:
+        if segment.speaker in mapped_original:
+            continue
+        start_ns, end_ns = segment.start_ns, segment.end_ns
+        if uem is not None:
+            clipped = clip_span(start_ns, end_ns, uem[0], uem[1])
+            if clipped is None:
+                continue
+            start_ns, end_ns = clipped
+        extra_uncertain.append(UncertainInterval(original.recording_id, segment.speaker, start_ns, end_ns))
+    combined = RecordingLabels(
+        original.recording_id,
+        relabeled.segments,
+        tuple(relabeled.uncertain) + tuple(extra_uncertain),
+        uncertain_removed_ns=relabeled.uncertain_removed_ns,
+    )
+    return merge_recording(combined, min_gap_ns=min_gap_ns), mapping
+
+
+def classify_published_replacement(
+    original: Sequence[RecordingLabels],
+    mappings: Mapping[str, SpeakerMapping],
+) -> tuple[SegmentClass, ...]:
+    """Mark original speakers missing from published labels as by-design UNCERTAIN."""
+
+    rows: list[SegmentClass] = []
+    for segment in unioned_original_segments(original):
+        mapping = mappings.get(segment.recording_id)
+        mapped = set() if mapping is None else {item.original_speaker for item in mapping.matches}
+        if segment.speaker in mapped:
+            rows.append(SegmentClass.from_segment(segment, SegmentOutcome.ALIGNED))
+            continue
+        rows.append(
+            SegmentClass.from_segment(
+                segment,
+                SegmentOutcome.BY_DESIGN_UNCERTAIN,
+                by_design_reason=ByDesignReason.SOURCE_RULE,
+            )
+        )
+    return tuple(rows)
