@@ -267,14 +267,20 @@ class MmsAligner:
             with torch.inference_mode():
                 emission, _ = self._model(waveform.to(self.device))
                 emission = emission.to(align_device)
+                # text longer than the audio can hold cannot be aligned; the caller
+                # treats an empty result as an alignment failure (UNCERTAIN interior)
+                if not ctc_alignment_fits(tokens, int(emission.size(1))):
+                    return ()
                 token_spans = self._aligner(emission[0], tokens)
         except RuntimeError:
             if self.device != "cpu":
                 with torch.inference_mode():
                     cpu_model = self._model.to("cpu")
                     emission, _ = cpu_model(waveform)
-                    token_spans = self._aligner(emission[0], tokens)
                     self._model.to(self.device)
+                    if not ctc_alignment_fits(tokens, int(emission.size(1))):
+                        return ()
+                    token_spans = self._aligner(emission[0], tokens)
             else:
                 raise
         if len(token_spans) != len(words):
@@ -300,6 +306,18 @@ class MmsAligner:
             score = float(weight / length) if length else 0.0
             aligned.append(AlignedWord(int(start_ns), int(end_ns), word, score))
         return tuple(aligned)
+
+
+def ctc_alignment_fits(tokens: Sequence[Sequence[int]], num_frames: int) -> bool:
+    """Return whether CTC forced alignment can place these tokens in num_frames
+
+    CTC needs one frame per token plus one blank frame between each pair of
+    equal adjacent tokens, so longer targets make torchaudio raise
+    """
+
+    flat = [token for word in tokens for token in word]
+    repeats = sum(1 for left, right in zip(flat, flat[1:]) if left == right)
+    return len(flat) + repeats <= num_frames
 
 
 def _as_mono_waveform(samples: np.ndarray, sample_rate: int) -> torch.Tensor:

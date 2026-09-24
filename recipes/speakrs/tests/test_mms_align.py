@@ -14,7 +14,7 @@ from recipes.speakrs.large.tight_labels.close_talk import (
 from recipes.speakrs.large.tight_labels.domain import Interval, RecordingLabels, SpeakerSegment, UncertainInterval
 from recipes.speakrs.large.tight_labels.lotus_text import parse_lotus_align_intervals
 from recipes.speakrs.large.tight_labels.markers import prepare_transcript
-from recipes.speakrs.large.tight_labels.mms import leftover_script_rate, mms_words
+from recipes.speakrs.large.tight_labels.mms import ctc_alignment_fits, leftover_script_rate, mms_words
 from recipes.speakrs.large.tight_labels.produce_mms import (
     TranscriptSegment,
     apply_extra_uncertain,
@@ -270,3 +270,16 @@ def test_produce_mms_progress_log_records_failed_and_nonzero_exit(tmp_path, monk
     log_text = (tmp_path / "work" / "progress.log").read_text(encoding="utf-8")
     assert code == 1
     assert log_text.strip().endswith("FAILED alignment crashed") or "FAILED alignment crashed" in log_text
+
+
+def test_ctc_alignment_fits_counts_blank_between_repeated_tokens() -> None:
+    # 70 tokens with 7 adjacent repeats need 77 frames; the failing Indic segment had 76
+    tokens = [[1, 1, 2, 3, 4, 5, 6, 7, 8, 9]] * 7
+    assert sum(len(word) for word in tokens) == 70
+    assert not ctc_alignment_fits(tokens, 76)
+    assert ctc_alignment_fits(tokens, 77)
+
+
+def test_ctc_alignment_fits_counts_repeats_across_word_boundaries() -> None:
+    assert not ctc_alignment_fits([[1, 2], [2, 3]], 4)
+    assert ctc_alignment_fits([[1, 2], [2, 3]], 5)
