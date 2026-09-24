@@ -11,9 +11,21 @@ from .classify import (
     aligned_classes,
     require_segment_classes,
 )
-from .gates import GateResult, UncertainShare, evaluate_gates
+from .gates import (
+    GATE_POLICY_VERSION,
+    AdmissionStatus,
+    GateResult,
+    OverlapLoss,
+    UncertainShare,
+    evaluate_gates,
+)
 from .intervals import clip_recording_to_uem
-from .mapping import SpeakerMapping, apply_published_replacement, map_speakers_by_overlap
+from .mapping import (
+    SpeakerMapping,
+    apply_published_replacement,
+    classify_published_replacement,
+    map_speakers_by_overlap,
+)
 from .merge import (
     MIN_GAP_NS,
     MIN_GAP_SECONDS,
@@ -22,11 +34,12 @@ from .merge import (
     merge_short_gaps,
     subtract_uncertain_from_active,
 )
-from .subset import is_subset_of_original, recording_is_subset
+from .subset import ClipReport, clip_to_original_support, is_subset_of_original, recording_is_subset
 from .tighten import COVERAGE_RATIO, TightenSegmentResult, tighten_recording, tighten_segment
 from .tightness import FORCED_AMI_REFERENCE, TightnessStats, measure_tightness
 from .time import parse_seconds_to_ns
 from .writers import (
+    load_written_recording_labels,
     parse_recording_rttm,
     parse_speaker_rttm,
     write_recording_labels,
@@ -35,18 +48,22 @@ from .writers import (
 )
 
 
-LIBRARY_VERSION = "3"
+LIBRARY_VERSION = "4"
 
 __all__ = [
     "COVERAGE_RATIO",
     "FORCED_AMI_REFERENCE",
+    "GATE_POLICY_VERSION",
     "LIBRARY_VERSION",
     "MIN_GAP_NS",
     "MIN_GAP_SECONDS",
+    "AdmissionStatus",
     "AlignmentFailureReason",
     "ByDesignReason",
+    "ClipReport",
     "GateResult",
     "Interval",
+    "OverlapLoss",
     "RecordingLabels",
     "SegmentClass",
     "SegmentOutcome",
@@ -59,9 +76,12 @@ __all__ = [
     "aligned_classes",
     "apply_published_replacement",
     "canonicalize_uncertain",
+    "classify_published_replacement",
     "clip_recording_to_uem",
+    "clip_to_original_support",
     "evaluate_gates",
     "is_subset_of_original",
+    "load_written_recording_labels",
     "map_speakers_by_overlap",
     "measure_tightness",
     "merge_recording",

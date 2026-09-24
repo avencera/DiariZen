@@ -138,6 +138,19 @@ def parse_recording_rttm(
     )
 
 
+def load_written_recording_labels(labels_dir: Path, recording_id: str) -> RecordingLabels:
+    """Parse SPEAKER and UNCERTAIN files written for one recording."""
+
+    rttm_path = labels_dir / f"{recording_id}.rttm"
+    uncertain_path = labels_dir / f"{recording_id}.uncertain.rttm"
+    uncertain_text = uncertain_path.read_text(encoding="utf-8") if uncertain_path.is_file() else ""
+    return parse_recording_rttm(
+        rttm_path.read_text(encoding="utf-8"),
+        recording_id=recording_id,
+        uncertain_text=uncertain_text,
+    )
+
+
 def parse_uem_regions(text: str) -> dict[str, tuple[tuple[int, int], ...]]:
     """Parse Kaldi UEM rows keyed by file id."""
 
