@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -25,7 +26,7 @@ from .intervals import (
 )
 from .mapping import SpeakerMapping
 from .merge import MIN_GAP_NS
-from .subset import recording_is_subset
+from .subset import ClipReport, recording_is_subset, uncertain_is_subset_of_original
 from .tightness import (
     FORCED_AMI_GAPS_0_3_TO_1_PER_MIN,
     FORCED_AMI_GAPS_LE_0_3_PER_MIN,
@@ -43,6 +44,15 @@ PUBLISHED_OUTSIDE_FLAG = 0.05
 TIGHTNESS_SHORT_GAP_MIN = 2.0
 TIGHTNESS_SHORT_GAP_MAX = 12.0
 MIN_SPEAKER_NS_FOR_RETENTION = 1_000_000_000
+GATE_POLICY_VERSION = "validity-v1"
+
+
+class AdmissionStatus(str, Enum):
+    """Whether a tight release may be admitted, needs diagnosis, or is blocked."""
+
+    ADMISSIBLE = "admissible"
+    NEEDS_DIAGNOSIS = "needs_diagnosis"
+    NOT_ADMISSIBLE = "not_admissible"
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,23 +166,91 @@ class RecordingTimeBase:
 
 
 @dataclass(frozen=True, slots=True)
+class OverlapLoss:
+    """Original overlap time split into retained, padded, masked, and unexplained."""
+
+    original_ns: int
+    produced_ns: int
+    retained_ns: int
+    removed_padding_ns: int
+    masked_ns: int
+    unexplained_ns: int
+
+    @property
+    def original_seconds(self) -> float:
+        """Return original overlap time in seconds."""
+
+        return ns_to_seconds(self.original_ns)
+
+    @property
+    def produced_seconds(self) -> float:
+        """Return produced overlap time in seconds."""
+
+        return ns_to_seconds(self.produced_ns)
+
+    @property
+    def retained_seconds(self) -> float:
+        """Return original overlap that remains overlap in seconds."""
+
+        return ns_to_seconds(self.retained_ns)
+
+    @property
+    def removed_padding_seconds(self) -> float:
+        """Return original overlap removed as turn padding in seconds."""
+
+        return ns_to_seconds(self.removed_padding_ns)
+
+    @property
+    def masked_seconds(self) -> float:
+        """Return original overlap covered by UNCERTAIN in seconds."""
+
+        return ns_to_seconds(self.masked_ns)
+
+    @property
+    def unexplained_seconds(self) -> float:
+        """Return original overlap loss that padding and masks do not explain."""
+
+        return ns_to_seconds(self.unexplained_ns)
+
+    def to_json(self) -> dict[str, float]:
+        """Return a JSON-ready overlap-loss record."""
+
+        return {
+            "original_seconds": self.original_seconds,
+            "produced_seconds": self.produced_seconds,
+            "retained_seconds": self.retained_seconds,
+            "removed_padding_seconds": self.removed_padding_seconds,
+            "masked_seconds": self.masked_seconds,
+            "unexplained_seconds": self.unexplained_seconds,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class GateResult:
-    """Pass/fail plus the measurements a report needs."""
+    """Validity, diagnosis triggers, and the measurements a report needs."""
 
     passed: bool
+    validity_ok: bool
     hard_gates_ok: bool
+    diagnosis_required: bool
+    admission_status: AdmissionStatus
     tightness_ok: bool
     speaker_retention_ok: bool
     overlap_retention_ok: bool
     failure_share_ok: bool
     smallest_gap_ok: bool
     subset_ok: bool | None
+    uncertain_subset_ok: bool
+    uncertain_coverage_ok: bool
+    ids_ok: bool
     uem_ok: bool
     unmapped_speakers_ok: bool
+    dropped_speakers_ok: bool
     tightness: TightnessStats
     original_tightness: TightnessStats
     speaker_retention: tuple[SpeakerRetention, ...]
     overlap_retention: float | None
+    overlap_loss: OverlapLoss
     failure_share: float
     failure_share_excluding_by_design: float
     by_design_share: float
@@ -181,6 +259,7 @@ class GateResult:
     uncertain_canonicalization_removed_ns: int
     failure_share_limit: float
     speaker_retention_floor: float
+    gate_policy_version: str
     uncertain_by_recording: tuple[UncertainShare, ...]
     segment_classes: tuple[SegmentClass, ...]
     time_bases: tuple[RecordingTimeBase, ...]
@@ -189,6 +268,8 @@ class GateResult:
     rows_outside_uem: tuple[str, ...]
     dropped_unmapped_seconds: float
     unmapped_published: tuple[str, ...]
+    dropped_speakers: tuple[str, ...]
+    clipped_speech: tuple[ClipReport, ...]
     notes: tuple[str, ...] = field(default_factory=tuple)
 
     def to_json(self) -> dict[str, object]:
@@ -197,15 +278,23 @@ class GateResult:
         ratios = [item.ratio for item in self.speaker_retention if item.original_ns > 0]
         return {
             "passed": self.passed,
+            "validity_ok": self.validity_ok,
             "hard_gates_ok": self.hard_gates_ok,
+            "diagnosis_required": self.diagnosis_required,
+            "admission_status": self.admission_status.value,
+            "gate_policy_version": self.gate_policy_version,
             "tightness_ok": self.tightness_ok,
             "speaker_retention_ok": self.speaker_retention_ok,
             "overlap_retention_ok": self.overlap_retention_ok,
             "failure_share_ok": self.failure_share_ok,
             "smallest_gap_ok": self.smallest_gap_ok,
             "subset_ok": self.subset_ok,
+            "uncertain_subset_ok": self.uncertain_subset_ok,
+            "uncertain_coverage_ok": self.uncertain_coverage_ok,
+            "ids_ok": self.ids_ok,
             "uem_ok": self.uem_ok,
             "unmapped_speakers_ok": self.unmapped_speakers_ok,
+            "dropped_speakers_ok": self.dropped_speakers_ok,
             "tightness": self.tightness.to_json(),
             "original_tightness": self.original_tightness.to_json(),
             "reference_forced_ami": {
@@ -223,7 +312,10 @@ class GateResult:
                 "flagged_below_30pct": len(self.flagged_speakers),
             },
             "overlap_retention": self.overlap_retention,
+            "overlap_loss": self.overlap_loss.to_json(),
             "failure_share": self.failure_share,
+            "failure_share_of_all_original_segments": self.failure_share,
+            "failure_share_of_eligible_segments": self.failure_share_excluding_by_design,
             "failure_share_excluding_by_design": self.failure_share_excluding_by_design,
             "by_design_share": self.by_design_share,
             "uncertain_share": self.uncertain_share,
@@ -259,6 +351,8 @@ class GateResult:
             "rows_outside_uem": list(self.rows_outside_uem),
             "dropped_unmapped_seconds": self.dropped_unmapped_seconds,
             "unmapped_published": list(self.unmapped_published),
+            "dropped_speakers": list(self.dropped_speakers),
+            "clipped_speech": [item.to_json() for item in self.clipped_speech],
             "time_bases": [
                 {
                     "recording_id": item.recording_id,
@@ -269,7 +363,6 @@ class GateResult:
                 }
                 for item in self.time_bases
             ],
-            "keeps_current_labels": not self.passed,
             "notes": list(self.notes),
         }
 
@@ -401,11 +494,121 @@ def _rows_outside_uem(
     return rows
 
 
+def _ids_ok(labels: Sequence[RecordingLabels]) -> bool:
+    for item in labels:
+        if not item.recording_id or item.recording_id in {"<NA>", "NA"}:
+            return False
+        for speaker in item.speakers:
+            if not speaker or speaker in {"<NA>", "NA"}:
+                return False
+    return True
+
+
+def _dropped_speakers(original: RecordingLabels, new: RecordingLabels) -> tuple[str, ...]:
+    original_speakers = {item.speaker for item in original.segments}
+    kept = {item.speaker for item in new.segments}
+    kept.update(item.speaker for item in new.uncertain)
+    return tuple(
+        f"{original.recording_id} {speaker}"
+        for speaker in sorted(original_speakers - kept)
+    )
+
+
+def _failed_segments_have_uncertain(
+    classes: Sequence[SegmentClass],
+    new_by_id: Mapping[str, RecordingLabels],
+) -> bool:
+    unresolved = (SegmentOutcome.ALIGNMENT_FAILURE, SegmentOutcome.BY_DESIGN_UNCERTAIN)
+    for item in classes:
+        if item.outcome not in unresolved:
+            continue
+        produced = new_by_id[item.recording_id]
+        uncovered = subtract_spans(
+            [(item.start_ns, item.end_ns)],
+            produced.segments_for(item.speaker),
+        )
+        uncertain = union_spans(produced.uncertain_for(item.speaker))
+        for span in uncovered:
+            remaining = subtract_spans([span], uncertain)
+            if remaining:
+                return False
+    return True
+
+
+def _overlap_loss(original: RecordingLabels, new: RecordingLabels) -> OverlapLoss:
+    events: list[tuple[int, int, str, str]] = []
+    for segment in original.segments:
+        events.append((segment.start_ns, 1, "orig", segment.speaker))
+        events.append((segment.end_ns, -1, "orig", segment.speaker))
+    for segment in new.segments:
+        events.append((segment.start_ns, 1, "new", segment.speaker))
+        events.append((segment.end_ns, -1, "new", segment.speaker))
+    for region in new.uncertain:
+        events.append((region.start_ns, 1, "unc", region.speaker))
+        events.append((region.end_ns, -1, "unc", region.speaker))
+    if not events:
+        return OverlapLoss(0, 0, 0, 0, 0, 0)
+    events.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+    orig_active: set[str] = set()
+    new_active: set[str] = set()
+    unc_active: set[str] = set()
+    original_ns = 0
+    produced_ns = 0
+    retained_ns = 0
+    masked_ns = 0
+    padding_ns = 0
+    unexplained_ns = 0
+    last = events[0][0]
+    for time_ns, delta, kind, speaker in events:
+        if time_ns > last:
+            width = time_ns - last
+            orig_overlap = len(orig_active) >= 2
+            new_overlap = len(new_active) >= 2
+            if orig_overlap:
+                original_ns += width
+            if new_overlap:
+                produced_ns += width
+            if orig_overlap and new_overlap:
+                retained_ns += width
+            elif orig_overlap:
+                if orig_active & unc_active:
+                    masked_ns += width
+                elif any(name not in new_active and name not in unc_active for name in orig_active):
+                    padding_ns += width
+                else:
+                    unexplained_ns += width
+            last = time_ns
+        bucket = orig_active if kind == "orig" else new_active if kind == "new" else unc_active
+        if delta > 0:
+            bucket.add(speaker)
+        else:
+            bucket.discard(speaker)
+    return OverlapLoss(
+        original_ns,
+        produced_ns,
+        retained_ns,
+        padding_ns,
+        masked_ns,
+        unexplained_ns,
+    )
+
+
+def _sum_overlap_loss(rows: Sequence[OverlapLoss]) -> OverlapLoss:
+    return OverlapLoss(
+        sum(item.original_ns for item in rows),
+        sum(item.produced_ns for item in rows),
+        sum(item.retained_ns for item in rows),
+        sum(item.removed_padding_ns for item in rows),
+        sum(item.masked_ns for item in rows),
+        sum(item.unexplained_ns for item in rows),
+    )
+
+
 def evaluate_gates(
     original: Sequence[RecordingLabels],
     new: Sequence[RecordingLabels],
     *,
-    require_subset: bool = False,
+    require_subset: bool = True,
     min_gap_ns: int = MIN_GAP_NS,
     speaker_retention_floor: float = SPEAKER_RETENTION_FLOOR,
     overlap_retention_floor: float = OVERLAP_RETENTION_FLOOR,
@@ -416,8 +619,9 @@ def evaluate_gates(
     uem_by_recording: Mapping[str, tuple[int, int]] | None = None,
     mappings: Mapping[str, SpeakerMapping] | None = None,
     segment_classes: Sequence[SegmentClass] | None = None,
+    clipped_speech: Sequence[ClipReport] | None = None,
 ) -> GateResult:
-    """Score hard gates, failure share, and report-only tightness and retention."""
+    """Score mandatory validity and reviewable usable-supervision triggers."""
 
     original_by_id = _by_recording(original)
     new_by_id = _by_recording(new)
@@ -428,12 +632,15 @@ def evaluate_gates(
         if segment_classes is None
         else require_segment_classes(original, segment_classes)
     )
+    clip_rows = tuple(clipped_speech or ())
 
     tightness = measure_tightness(new)
     original_tightness = measure_tightness(original)
     retentions: list[SpeakerRetention] = []
     time_bases: list[RecordingTimeBase] = []
     uncertain_rows: list[UncertainShare] = []
+    overlap_rows: list[OverlapLoss] = []
+    dropped: list[str] = []
     original_overlap = 0
     new_overlap = 0
     original_speech_ns = 0
@@ -441,12 +648,15 @@ def evaluate_gates(
     uncertain_excluding_ns = 0
     uncertain_removed_ns = 0
     subset_ok: bool | None = True if require_subset else None
+    uncertain_subset_ok = True
     outside_rows: list[str] = []
     for recording_id in sorted(original_by_id):
         source = original_by_id[recording_id]
         produced = new_by_id[recording_id]
         retentions.extend(_speaker_retention(source, produced))
         time_bases.append(_time_base(source, produced))
+        overlap_rows.append(_overlap_loss(source, produced))
+        dropped.extend(_dropped_speakers(source, produced))
         share = _uncertain_share_row(source, produced, classes)
         uncertain_rows.append(share)
         original_speech_ns += share.original_ns
@@ -457,6 +667,8 @@ def evaluate_gates(
         new_overlap += _overlap_ns(produced)
         if require_subset and not recording_is_subset(produced, source, min_gap_ns=min_gap_ns):
             subset_ok = False
+        if not uncertain_is_subset_of_original(produced, source):
+            uncertain_subset_ok = False
         if uem_by_recording is not None:
             uem_start_ns, uem_end_ns = uem_by_recording[recording_id]
             outside_rows.extend(_rows_outside_uem(produced, uem_start_ns, uem_end_ns))
@@ -470,6 +682,7 @@ def evaluate_gates(
         item.recording_id for item in time_bases if item.new_outside_share > published_outside_flag
     )
     overlap_retention = None if original_overlap <= 0 else new_overlap / original_overlap
+    overlap_loss = _sum_overlap_loss(overlap_rows)
     failure_share, by_design_share, failure_share_excluding_by_design = _segment_shares(classes)
     uncertain_share = 0.0 if original_speech_ns <= 0 else uncertain_ns / original_speech_ns
     uncertain_share_excluding_by_design = (
@@ -484,6 +697,10 @@ def evaluate_gates(
     overlap_retention_ok = overlap_retention is None or overlap_retention >= overlap_retention_floor
     failure_share_ok = failure_share <= failure_share_limit
     uem_ok = not outside_rows
+    ids_ok = _ids_ok(new)
+    dropped_speakers = tuple(dropped)
+    dropped_speakers_ok = not dropped_speakers
+    uncertain_coverage_ok = _failed_segments_have_uncertain(classes, new_by_id)
     unmapped_published: list[str] = []
     dropped_unmapped_ns = 0
     if mappings:
@@ -504,7 +721,7 @@ def evaluate_gates(
     if flagged_speakers:
         notes.append(
             f"{len(flagged_speakers)} speakers keep less than "
-            f"{speaker_retention_floor:.0%} of original speech; reported only"
+            f"{speaker_retention_floor:.0%} of original speech; diagnosis required"
         )
     if flagged_recordings:
         notes.append(
@@ -513,6 +730,14 @@ def evaluate_gates(
         )
     if subset_ok is False:
         notes.append("tight speech is not a subset of the 200 ms-closed original human segments")
+    if not uncertain_subset_ok:
+        notes.append("UNCERTAIN is not a subset of the original same-speaker human support")
+    if not uncertain_coverage_ok:
+        notes.append("a failed or unresolved alignment is missing an UNCERTAIN record")
+    if not dropped_speakers_ok:
+        notes.append(f"{len(dropped_speakers)} original speakers are missing from SPEAKER and UNCERTAIN")
+    if not ids_ok:
+        notes.append("a recording or speaker id is empty or NA")
     if not uem_ok:
         notes.append(f"{len(outside_rows)} SPEAKER or UNCERTAIN rows fall outside the UEM")
     if not unmapped_speakers_ok:
@@ -522,26 +747,50 @@ def evaluate_gates(
         )
     if not failure_share_ok:
         notes.append(
-            f"failure share {failure_share:.4f} is above the {failure_share_limit:.2f} limit"
+            f"failure share {failure_share:.4f} of all original segments is above the "
+            f"{failure_share_limit:.2f} diagnosis trigger"
         )
 
-    hard_gates_ok = smallest_gap_ok and uem_ok and unmapped_speakers_ok and subset_ok is not False
-    passed = hard_gates_ok and failure_share_ok
+    validity_ok = (
+        smallest_gap_ok
+        and uem_ok
+        and unmapped_speakers_ok
+        and dropped_speakers_ok
+        and ids_ok
+        and uncertain_subset_ok
+        and uncertain_coverage_ok
+        and subset_ok is not False
+    )
+    diagnosis_required = validity_ok and (not failure_share_ok or not speaker_retention_ok)
+    if not validity_ok:
+        admission_status = AdmissionStatus.NOT_ADMISSIBLE
+    elif diagnosis_required:
+        admission_status = AdmissionStatus.NEEDS_DIAGNOSIS
+    else:
+        admission_status = AdmissionStatus.ADMISSIBLE
     return GateResult(
-        passed=passed,
-        hard_gates_ok=hard_gates_ok,
+        passed=validity_ok,
+        validity_ok=validity_ok,
+        hard_gates_ok=validity_ok,
+        diagnosis_required=diagnosis_required,
+        admission_status=admission_status,
         tightness_ok=tightness_ok,
         speaker_retention_ok=speaker_retention_ok,
         overlap_retention_ok=overlap_retention_ok,
         failure_share_ok=failure_share_ok,
         smallest_gap_ok=smallest_gap_ok,
         subset_ok=subset_ok,
+        uncertain_subset_ok=uncertain_subset_ok,
+        uncertain_coverage_ok=uncertain_coverage_ok,
+        ids_ok=ids_ok,
         uem_ok=uem_ok,
         unmapped_speakers_ok=unmapped_speakers_ok,
+        dropped_speakers_ok=dropped_speakers_ok,
         tightness=tightness,
         original_tightness=original_tightness,
         speaker_retention=tuple(retentions),
         overlap_retention=overlap_retention,
+        overlap_loss=overlap_loss,
         failure_share=failure_share,
         failure_share_excluding_by_design=failure_share_excluding_by_design,
         by_design_share=by_design_share,
@@ -550,6 +799,7 @@ def evaluate_gates(
         uncertain_canonicalization_removed_ns=uncertain_removed_ns,
         failure_share_limit=failure_share_limit,
         speaker_retention_floor=speaker_retention_floor,
+        gate_policy_version=GATE_POLICY_VERSION,
         uncertain_by_recording=tuple(uncertain_rows),
         segment_classes=classes,
         time_bases=tuple(time_bases),
@@ -558,5 +808,7 @@ def evaluate_gates(
         rows_outside_uem=tuple(outside_rows),
         dropped_unmapped_seconds=ns_to_seconds(dropped_unmapped_ns),
         unmapped_published=tuple(unmapped_published),
+        dropped_speakers=dropped_speakers,
+        clipped_speech=clip_rows,
         notes=tuple(notes),
     )

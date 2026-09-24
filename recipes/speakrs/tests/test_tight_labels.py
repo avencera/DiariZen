@@ -8,7 +8,9 @@ import soundfile as sf
 
 from recipes.speakrs.large.tight_labels import (
     COVERAGE_RATIO,
+    GATE_POLICY_VERSION,
     MIN_GAP_NS,
+    AdmissionStatus,
     AlignmentFailureReason,
     ByDesignReason,
     Interval,
@@ -19,8 +21,10 @@ from recipes.speakrs.large.tight_labels import (
     UncertainInterval,
     apply_published_replacement,
     clip_recording_to_uem,
+    clip_to_original_support,
     evaluate_gates,
     is_subset_of_original,
+    load_written_recording_labels,
     map_speakers_by_overlap,
     measure_tightness,
     merge_short_gaps,
@@ -467,6 +471,8 @@ def test_gates_flag_speakers_below_30_percent_and_outside_speech() -> None:
     assert gate.tightness_ok is False
     assert gate.hard_gates_ok is True
     assert gate.passed is True
+    assert gate.diagnosis_required is True
+    assert gate.admission_status is AdmissionStatus.NEEDS_DIAGNOSIS
 
 
 def test_gates_fail_when_a_row_falls_outside_the_uem() -> None:
@@ -609,6 +615,8 @@ def test_gates_pass_failure_share_at_the_025_limit() -> None:
     assert gate.by_design_share == pytest.approx(0.0)
     assert gate.failure_share_ok is True
     assert gate.passed is True
+    assert gate.diagnosis_required is False
+    assert gate.admission_status is AdmissionStatus.ADMISSIBLE
 
 
 def test_gates_fail_failure_share_above_025() -> None:
@@ -637,7 +645,9 @@ def test_gates_fail_failure_share_above_025() -> None:
     assert 0.0 <= gate.failure_share <= 1.0
     assert gate.failure_share_ok is False
     assert gate.hard_gates_ok is True
-    assert gate.passed is False
+    assert gate.passed is True
+    assert gate.diagnosis_required is True
+    assert gate.admission_status is AdmissionStatus.NEEDS_DIAGNOSIS
 
 
 def test_gates_report_uncertain_share_per_recording() -> None:
@@ -674,7 +684,8 @@ def test_gates_report_uncertain_share_per_recording() -> None:
     assert payload["failure_share_excluding_by_design"] == pytest.approx(0.0)
     assert payload["by_design_share"] == pytest.approx(0.0)
     assert payload["uncertain_canonicalization_removed_seconds"] == pytest.approx(0.0)
-    assert payload["keeps_current_labels"] is False
+    assert payload["admission_status"] == "admissible"
+    assert "keeps_current_labels" not in payload
     assert "uncertain_overlap_ok" not in payload
     assert gate.passed is True
 
@@ -896,12 +907,148 @@ def test_gate_report_uses_failure_share_and_retention_parameters() -> None:
         failure_share_limit=0.4,
         speaker_retention_floor=0.15,
     )
-    text = render_gate_markdown("AMI", "ami-tight-v3", gate, kept_current=False)
+    text = render_gate_markdown("AMI", "ami-tight-v3", gate)
 
-    assert "Failure share ≤ 0.40:" in text
-    assert "excluding by-design" in text
+    assert "Failure share of all original segments ≤ 0.40:" in text
+    assert "Failure share of segments eligible for alignment:" in text
     assert "UNCERTAIN time removed by canonicalization:" in text
     assert "UNCERTAIN overlapping same-speaker speech" not in text
     assert "Flagged speakers below 15% retention:" in text
+    assert "Admission: admissible" in text
+    assert "Label validity (mandatory)" in text
     assert gate.failure_share_limit == pytest.approx(0.4)
     assert gate.speaker_retention_floor == pytest.approx(0.15)
+    assert gate.gate_policy_version == GATE_POLICY_VERSION
+
+
+def test_clip_drops_speech_outside_the_200ms_closed_original() -> None:
+    original = RecordingLabels("rec", (_seg("A", 0.0, 1.0), _seg("A", "1.25", 2.0)))
+    produced = RecordingLabels("rec", (_seg("A", 0.0, 2.0),))
+
+    clipped, report = clip_to_original_support(produced, original)
+
+    assert _spans(clipped.segments) == [_span(0, 1), _span("1.25", 2)]
+    assert report.clipped_speech_seconds == pytest.approx(0.25)
+
+
+def test_clip_keeps_a_bridge_shorter_than_200ms() -> None:
+    original = RecordingLabels("rec", (_seg("A", 0.0, 1.0), _seg("A", "1.04", 2.0)))
+    produced = RecordingLabels("rec", (_seg("A", 0.0, 2.0),))
+
+    clipped, report = clip_to_original_support(produced, original)
+
+    assert _spans(clipped.segments) == [_span(0, 2)]
+    assert report.clipped_speech_ns == 0
+
+
+def test_clip_drops_uncertain_outside_raw_original_support() -> None:
+    original = RecordingLabels("rec", (_seg("A", 0.0, 1.0), _seg("A", "1.25", 2.0)))
+    produced = RecordingLabels("rec", (), (_unc("A", 0.0, 2.0),))
+
+    clipped, report = clip_to_original_support(produced, original)
+
+    assert _spans(clipped.uncertain) == [_span(0, 1), _span("1.25", 2)]
+    assert report.clipped_uncertain_seconds == pytest.approx(0.25)
+
+
+def test_published_replacement_keeps_unmapped_original_as_uncertain() -> None:
+    original = RecordingLabels("rec", (_seg("X", 0, 5), _seg("Y", 6, 8)))
+    published = RecordingLabels("pub", (_seg("A", 0, 4, "pub"),))
+
+    replaced, mapping = apply_published_replacement(original, published)
+
+    assert mapping.as_dict() == {"A": "X"}
+    assert mapping.unmapped_original == ("Y",)
+    assert {item.speaker for item in replaced.segments} == {"X"}
+    assert _spans(replaced.uncertain_for("Y")) == [_span(6, 8)]
+
+
+def test_gates_fail_when_an_original_speaker_is_dropped() -> None:
+    original = [RecordingLabels("rec", (_seg("A", 0, 2), _seg("B", 0, 2)))]
+    new = [RecordingLabels("rec", (_seg("A", 0, 2),))]
+
+    gate = evaluate_gates(original, new)
+
+    assert gate.dropped_speakers_ok is False
+    assert gate.dropped_speakers == ("rec B",)
+    assert gate.passed is False
+    assert gate.admission_status is AdmissionStatus.NOT_ADMISSIBLE
+
+
+def test_gates_fail_when_uncertain_leaves_original_support() -> None:
+    original = [RecordingLabels("rec", (_seg("A", 0, 1),))]
+    new = [RecordingLabels("rec", (), (_unc("A", 0, 2),))]
+
+    gate = evaluate_gates(original, new)
+
+    assert gate.uncertain_subset_ok is False
+    assert gate.passed is False
+    assert gate.admission_status is AdmissionStatus.NOT_ADMISSIBLE
+
+
+def test_gates_fail_when_a_failed_alignment_has_no_uncertain_record() -> None:
+    originals = (_seg("A", 0, 1), _seg("B", 0, 1))
+    original = [RecordingLabels("rec", originals)]
+    new = [RecordingLabels("rec", (_seg("A", 0, 1),))]
+    classes = (
+        _cls(originals[0], SegmentOutcome.ALIGNED),
+        _cls(
+            originals[1],
+            SegmentOutcome.ALIGNMENT_FAILURE,
+            failure_reason=AlignmentFailureReason.ALIGNER_ERROR,
+        ),
+    )
+
+    gate = evaluate_gates(original, new, segment_classes=classes)
+
+    assert gate.uncertain_coverage_ok is False
+    assert gate.dropped_speakers_ok is False
+    assert gate.passed is False
+    assert gate.admission_status is AdmissionStatus.NOT_ADMISSIBLE
+
+
+def test_overlap_loss_splits_padding_and_masked_regions() -> None:
+    original = [
+        RecordingLabels(
+            "rec",
+            (_seg("A", 0, 4), _seg("B", 1, 3), _seg("C", 10, 14), _seg("D", 11, 13)),
+        )
+    ]
+    new = [
+        RecordingLabels(
+            "rec",
+            (_seg("A", 0, 4), _seg("C", 10, 14)),
+            (_unc("B", 1, 3),),
+        )
+    ]
+
+    gate = evaluate_gates(original, new, require_subset=False)
+
+    assert gate.overlap_loss.original_seconds == pytest.approx(4.0)
+    assert gate.overlap_loss.masked_seconds == pytest.approx(2.0)
+    assert gate.overlap_loss.removed_padding_seconds == pytest.approx(2.0)
+    assert gate.overlap_loss.unexplained_seconds == pytest.approx(0.0)
+    payload = gate.to_json()["overlap_loss"]
+    assert payload["masked_seconds"] == pytest.approx(2.0)
+    assert payload["removed_padding_seconds"] == pytest.approx(2.0)
+
+
+def test_gate_metrics_match_labels_reloaded_from_disk(tmp_path: Path) -> None:
+    original = [RecordingLabels("rec", (_seg("A", 0, 4), _seg("B", 0, 4)))]
+    produced = [
+        RecordingLabels(
+            "rec",
+            (_seg("A", 0, 2), _seg("B", 0, 4)),
+            (_unc("A", 2, 4),),
+        )
+    ]
+    write_recording_labels(tmp_path, produced[0])
+    written = [load_written_recording_labels(tmp_path, "rec")]
+    live = evaluate_gates(original, produced)
+    reloaded = evaluate_gates(original, written)
+
+    assert reloaded.uncertain_share == pytest.approx(live.uncertain_share)
+    assert reloaded.failure_share == pytest.approx(live.failure_share)
+    assert reloaded.admission_status is live.admission_status
+    assert _spans(written[0].segments) == _spans(produced[0].segments)
+    assert _spans(written[0].uncertain) == _spans(produced[0].uncertain)
