@@ -17,10 +17,11 @@ import numpy as np
 import pyarrow.parquet as pq
 import soundfile as sf
 
+from ..hashing import sha256_paths
 from ..indic_diarbench import canonical_speaker_id
 from ..jsonio import read_json, write_json
 from ..storage import require_free_gib
-from . import LIBRARY_VERSION
+from . import GATE_POLICY_VERSION, LIBRARY_VERSION
 from .classify import (
     AlignmentFailureReason,
     ByDesignReason,
@@ -58,7 +59,14 @@ from .mms import (
 from .produce import RecordingRef, library_commit, release_id_with_version, render_gate_markdown
 from .tighten import tighten_recording, tighten_segment
 from .time import NANOSECONDS_PER_SECOND, float_bounds_to_rttm_ns, format_ns, ns_to_seconds
-from .writers import parse_speaker_rttm, render_speaker_rttm, rewrite_uem_file_id, uem_bounds, write_recording_labels
+from .writers import (
+    load_written_recording_labels,
+    parse_speaker_rttm,
+    render_speaker_rttm,
+    rewrite_uem_file_id,
+    uem_bounds,
+    write_recording_labels,
+)
 
 
 REPO_DIR = Path(__file__).resolve().parents[4]
@@ -968,19 +976,30 @@ def write_aligned_release(
     refs: Sequence[RecordingRef],
     original: Sequence[RecordingLabels],
     produced: Sequence[RecordingLabels],
-    gate: GateResult,
-    kept_current: bool,
     extra_provenance: Mapping[str, Any],
+    uem_by_recording: Mapping[str, tuple[int, int]],
+    segment_classes: Sequence[SegmentClass] | None,
     release_id: str | None = None,
-) -> Path:
-    """Write one local tight-v1 release directory."""
+) -> tuple[Path, GateResult]:
+    """Write tight labels, then score gates on the files actually written."""
 
     spec = SOURCE_SPECS[source]
     written_release_id = release_id or spec["release_id"]
     release_dir = RELEASE_ROOT / written_release_id
     if release_dir.is_dir() and (release_dir / "provenance.json").is_file():
         _log(f"{source} release exists, skip write {release_dir}")
-        return release_dir
+        labels_dir = release_dir / "labels"
+        written = tuple(
+            load_written_recording_labels(labels_dir, labels.recording_id) for labels in produced
+        )
+        gate = evaluate_gates(
+            original,
+            written,
+            require_subset=spec["require_subset"],
+            uem_by_recording=uem_by_recording,
+            segment_classes=segment_classes,
+        )
+        return release_dir, gate
     if release_dir.exists():
         raise FileExistsError(f"refusing to overwrite existing release {release_dir}")
     staging_dir = release_dir.with_name(release_dir.name + ".partial")
@@ -1006,30 +1025,49 @@ def write_aligned_release(
         all_uem.append(uem_text if uem_text.endswith("\n") else uem_text + "\n")
     (staging_dir / "all.rttm").write_text("".join(all_rttm), encoding="utf-8")
     (staging_dir / "all.uem").write_text("".join(all_uem), encoding="utf-8")
+    written = tuple(
+        load_written_recording_labels(labels_dir, labels.recording_id) for labels in produced
+    )
+    gate = evaluate_gates(
+        original,
+        written,
+        require_subset=spec["require_subset"],
+        uem_by_recording=uem_by_recording,
+        segment_classes=segment_classes,
+    )
+    checksum_paths = [
+        staging_dir / "all.rttm",
+        staging_dir / "all.uem",
+        *sorted(labels_dir.glob("*.rttm")),
+        *sorted(labels_dir.glob("*.uem")),
+    ]
     provenance = {
         "schema": "speakrs-tight-labels-release",
-        "schema_version": 2,
+        "schema_version": 3,
         "release_id": written_release_id,
         "source": spec["source_name"],
-        "method": spec["method"] if not kept_current else "keep-current-labels",
-        "kept_current_labels": kept_current,
+        "method": spec["method"],
+        "kept_current_labels": False,
+        "admission_status": gate.admission_status.value,
+        "gate_policy_version": GATE_POLICY_VERSION,
         "library_version": LIBRARY_VERSION,
         "library_commit": library_commit(),
         "min_gap_seconds": MIN_GAP_SECONDS,
         "min_gap_ns": MIN_GAP_NS,
-        "recording_count": len(produced),
+        "recording_count": len(written),
         "licenses": [spec["license"]],
+        "label_checksums": sha256_paths(checksum_paths, root=staging_dir),
         "gate_results": gate.to_json(),
         **dict(extra_provenance),
     }
     write_json(staging_dir / "provenance.json", provenance)
     write_json(staging_dir / "gate-report.json", gate.to_json())
     (staging_dir / "gate-report.md").write_text(
-        render_gate_markdown(spec["source_name"], written_release_id, gate, kept_current=kept_current),
+        render_gate_markdown(spec["source_name"], written_release_id, gate),
         encoding="utf-8",
     )
     staging_dir.rename(release_dir)
-    return release_dir
+    return release_dir, gate
 
 
 def _summarise_kinds(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
@@ -1252,45 +1290,30 @@ def produce_source(
         for row in results
         for item in row.get("segment_classes") or ()
     )
-    gate = evaluate_gates(
-        original,
-        attempted,
-        require_subset=spec["require_subset"],
-        uem_by_recording=uem_by_recording,
-        segment_classes=segment_classes,
-    )
-    kept_current = not gate.passed
-    written = []
-    for source_labels, attempted_labels in zip(original, attempted, strict=True):
-        if source_labels.recording_id in held_ids:
-            written.append(attempted_labels)
-        elif kept_current:
-            written.append(source_labels)
-        else:
-            written.append(attempted_labels)
     held_out_speech_ns = sum(int(item.get("held_out_speech_ns") or 0) for item in results if item.get("held_out"))
     extra["segment_kinds"] = _summarise_kinds(results)
     extra["coverage_distribution"] = _coverage_stats(results)
-    extra["uncertain_share_of_original_speech"] = gate.uncertain_share
-    extra["uncertain_share_excluding_by_design"] = gate.uncertain_share_excluding_by_design
-    extra["by_design_share"] = gate.by_design_share
     extra["close_talk"] = close_talk_rows
-    extra["failure_share"] = gate.failure_share
     extra["held_out_languages"] = sorted(poor_languages)
     extra["held_out_recordings"] = len(held_ids)
     extra["held_out_speech_seconds"] = ns_to_seconds(held_out_speech_ns)
     extra["held_out_excluded_from_gates"] = False
     extra["gates_scored_on_recordings"] = len(original)
-    release_dir = write_aligned_release(
+    release_dir, gate = write_aligned_release(
         source=source,
         refs=refs,
         original=original,
-        produced=written,
-        gate=gate,
-        kept_current=kept_current,
+        produced=attempted,
         extra_provenance=extra,
+        uem_by_recording=uem_by_recording,
+        segment_classes=segment_classes,
         release_id=written_release_id,
     )
+    extra["uncertain_share_of_original_speech"] = gate.uncertain_share
+    extra["uncertain_share_excluding_by_design"] = gate.uncertain_share_excluding_by_design
+    extra["by_design_share"] = gate.by_design_share
+    extra["failure_share"] = gate.failure_share
+    extra["admission_status"] = gate.admission_status.value
     listening_dir = STAGING_ROOT / "listening-v2" / spec["listening_name"]
     listening = write_listening_pack(
         listening_dir,
@@ -1303,8 +1326,9 @@ def produce_source(
         "source": source,
         "release_id": written_release_id,
         "release_dir": str(release_dir),
-        "recording_count": len(written),
-        "kept_current_labels": kept_current,
+        "recording_count": len(attempted),
+        "kept_current_labels": False,
+        "admission_status": gate.admission_status.value,
         "gate": gate,
         "listening": listening,
         "original": original,
@@ -1331,15 +1355,13 @@ def render_align_report(results: Sequence[Mapping[str, Any]], aligner: MmsAligne
         "",
         "## Sources",
         "",
-        "| Source | Recs | Gaps ≤0.3 s/min orig | Gaps ≤0.3 s/min new | Gaps 0.3–1 s/min orig | Gaps 0.3–1 s/min new | Smallest gap new | Failure share | Uncertain share | Gate | Kept current |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|",
+        "| Source | Recs | Gaps ≤0.3 s/min orig | Gaps ≤0.3 s/min new | Gaps 0.3–1 s/min orig | Gaps 0.3–1 s/min new | Smallest gap new | Failure share | Uncertain share | Admission |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for result in results:
         gate: GateResult = result["gate"]
-        extra = result["extra"]
-        status = "PASS" if gate.passed and not result["kept_current_labels"] else "FAIL"
         lines.append(
-            "| {name} | {recs} | {o_short:.2f} | {n_short:.2f} | {o_mid:.2f} | {n_mid:.2f} | {gap} | {fail:.4f} | {unc:.4f} | {status} | {kept} |".format(
+            "| {name} | {recs} | {o_short:.2f} | {n_short:.2f} | {o_mid:.2f} | {n_mid:.2f} | {gap} | {fail:.4f} | {unc:.4f} | {status} |".format(
                 name=SOURCE_SPECS[result["source"]]["source_name"],
                 recs=result["recording_count"],
                 o_short=gate.original_tightness.gaps_le_0_3_per_min,
@@ -1349,8 +1371,7 @@ def render_align_report(results: Sequence[Mapping[str, Any]], aligner: MmsAligne
                 gap="—" if gate.tightness.smallest_gap_s is None else f"{gate.tightness.smallest_gap_s:.4f}",
                 fail=gate.failure_share,
                 unc=gate.uncertain_share,
-                status=status,
-                kept=result["kept_current_labels"],
+                status=gate.admission_status.value,
             )
         )
     for result in results:
@@ -1368,7 +1389,9 @@ def render_align_report(results: Sequence[Mapping[str, Any]], aligner: MmsAligne
                 f"- Listening seconds: {result['listening']['total_seconds']:.1f}",
                 f"- Coverage: {extra['coverage_distribution']}",
                 f"- Segment kinds: {extra['segment_kinds']}",
-                f"- Failure share: {gate.failure_share:.4f}",
+                f"- Admission: {gate.admission_status.value}",
+                f"- Failure share of all original segments: {gate.failure_share:.4f}",
+                f"- Failure share of eligible segments: {gate.failure_share_excluding_by_design:.4f}",
                 f"- By-design UNCERTAIN share: {gate.by_design_share:.4f}",
                 f"- Uncertain share of original speech: {gate.uncertain_share:.4f}",
                 f"- Uncertain share excluding by-design: {gate.uncertain_share_excluding_by_design:.4f}",
@@ -1460,8 +1483,9 @@ def _source_summary(item: Mapping[str, Any]) -> dict[str, Any]:
         "source": item["source"],
         "release_id": item["release_id"],
         "release_dir": item["release_dir"],
-        "passed": item["gate"].passed and not item["kept_current_labels"],
-        "kept_current_labels": item["kept_current_labels"],
+        "passed": item["gate"].passed,
+        "admission_status": item["admission_status"],
+        "kept_current_labels": False,
         "listening": item["listening"],
         "held_out_languages": item["extra"].get("held_out_languages", []),
         "held_out_recordings": item["extra"].get("held_out_recordings", 0),
