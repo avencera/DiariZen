@@ -48,7 +48,7 @@ from .mms import (
     MmsAligner,
     measure_language_coverage,
 )
-from .produce import RecordingRef, library_commit, render_gate_markdown
+from .produce import RecordingRef, library_commit, release_id_with_version, render_gate_markdown
 from .tighten import tighten_recording, tighten_segment, union_human_segments
 from .time import NANOSECONDS_PER_SECOND, float_bounds_to_rttm_ns, format_ns, ns_to_seconds
 from .writers import parse_speaker_rttm, render_speaker_rttm, rewrite_uem_file_id, uem_bounds, write_recording_labels
@@ -737,8 +737,7 @@ def _tighten(
     kept = _subtract_uncertain(tuple(uncertain) + tuple(extra_uncertain), active)
     tight = RecordingLabels(original.recording_id, tuple(active), kept)
     clipped = clip_recording_to_uem(tight, ref.uem_start_ns, ref.uem_end_ns)
-    humans = original.segments if per_segment else union_human_segments(original.segments)
-    return merge_recording(clipped, min_gap_ns=MIN_GAP_NS, within=humans)
+    return merge_recording(clipped, min_gap_ns=MIN_GAP_NS)
 
 
 def write_aligned_release(
@@ -750,11 +749,13 @@ def write_aligned_release(
     gate: GateResult,
     kept_current: bool,
     extra_provenance: Mapping[str, Any],
+    release_id: str | None = None,
 ) -> Path:
     """Write one local tight-v1 release directory."""
 
     spec = SOURCE_SPECS[source]
-    release_dir = RELEASE_ROOT / spec["release_id"]
+    written_release_id = release_id or spec["release_id"]
+    release_dir = RELEASE_ROOT / written_release_id
     if release_dir.is_dir() and (release_dir / "provenance.json").is_file():
         _log(f"{source} release exists, skip write {release_dir}")
         return release_dir
@@ -786,7 +787,7 @@ def write_aligned_release(
     provenance = {
         "schema": "speakrs-tight-labels-release",
         "schema_version": 2,
-        "release_id": spec["release_id"],
+        "release_id": written_release_id,
         "source": spec["source_name"],
         "method": spec["method"] if not kept_current else "keep-current-labels",
         "kept_current_labels": kept_current,
@@ -802,7 +803,7 @@ def write_aligned_release(
     write_json(staging_dir / "provenance.json", provenance)
     write_json(staging_dir / "gate-report.json", gate.to_json())
     (staging_dir / "gate-report.md").write_text(
-        render_gate_markdown(spec["source_name"], spec["release_id"], gate, kept_current=kept_current),
+        render_gate_markdown(spec["source_name"], written_release_id, gate, kept_current=kept_current),
         encoding="utf-8",
     )
     staging_dir.rename(release_dir)
@@ -845,10 +846,12 @@ def produce_source(
     *,
     limit: int | None = None,
     force: bool = False,
+    release_version: str | None = None,
 ) -> dict[str, Any]:
     """Align one source, score gates, and write the release plus listening pack."""
 
     spec = SOURCE_SPECS[source]
+    written_release_id = release_id_with_version(spec["release_id"], release_version)
     refs = load_indic_refs() if source == "indic-diarbench" else load_lotusdis_refs()
     if limit is not None:
         refs = refs[:limit]
@@ -981,6 +984,7 @@ def produce_source(
                 ),
             )
             from_cache = True
+        labels = merge_recording(labels)
         payload["labels"] = labels
         payload["held_out"] = is_held_out
         payload.setdefault("held_out_speech_ns", duration_ns(source_labels.segments) if is_held_out else 0)
@@ -1052,6 +1056,7 @@ def produce_source(
         gate=gate,
         kept_current=kept_current,
         extra_provenance=extra,
+        release_id=written_release_id,
     )
     listening_dir = STAGING_ROOT / "listening-v2" / spec["listening_name"]
     listening = write_listening_pack(
@@ -1063,7 +1068,7 @@ def produce_source(
     )
     return {
         "source": source,
-        "release_id": spec["release_id"],
+        "release_id": written_release_id,
         "release_dir": str(release_dir),
         "recording_count": len(written),
         "kept_current_labels": kept_current,
@@ -1241,6 +1246,7 @@ def produce(
     output_root: Path | None = None,
     staging_root: Path | None = None,
     work_root: Path | None = None,
+    release_version: str | None = None,
 ) -> dict[str, Any]:
     """Produce the requested MMS source releases and the ALIGN report."""
 
@@ -1258,7 +1264,9 @@ def produce(
     results: list[dict[str, Any]] = []
     try:
         for source in selected:
-            result = produce_source(source, aligner, limit=limit, force=force)
+            result = produce_source(
+                source, aligner, limit=limit, force=force, release_version=release_version
+            )
             results.append(result)
             report_path = _write_source_outputs(results, aligner)
             _log(
@@ -1291,6 +1299,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--staging-root", type=Path, default=None)
     parser.add_argument("--work-root", type=Path, default=None)
+    parser.add_argument(
+        "--release-version",
+        default=None,
+        help="Replace the tight-vN suffix of the release id. Default: keep the current id",
+    )
     args = parser.parse_args(argv)
     _configure_paths(
         output_root=args.output_root,
@@ -1305,6 +1318,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_root=args.output_root,
             staging_root=args.staging_root,
             work_root=args.work_root,
+            release_version=args.release_version,
         )
     except Exception as error:
         _write_terminal_status(f"FAILED {error}")

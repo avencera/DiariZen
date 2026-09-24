@@ -283,3 +283,45 @@ def test_ctc_alignment_fits_counts_blank_between_repeated_tokens() -> None:
 def test_ctc_alignment_fits_counts_repeats_across_word_boundaries() -> None:
     assert not ctc_alignment_fits([[1, 2], [2, 3]], 4)
     assert ctc_alignment_fits([[1, 2], [2, 3]], 5)
+
+
+def test_release_id_with_version_replaces_the_suffix() -> None:
+    from recipes.speakrs.large.tight_labels.produce import release_id_with_version
+
+    assert release_id_with_version("lotusdis-tight-v1", None) == "lotusdis-tight-v1"
+    assert release_id_with_version("lotusdis-tight-v1", "v2") == "lotusdis-tight-v2"
+    assert release_id_with_version("lotusdis-tight-v1", "2") == "lotusdis-tight-v2"
+
+
+def test_mms_tighten_merges_a_40ms_gap_between_human_segments(tmp_path) -> None:
+    from recipes.speakrs.large.tight_labels.mms import AlignedWord
+    from recipes.speakrs.large.tight_labels.produce import RecordingRef
+    from recipes.speakrs.large.tight_labels.produce_mms import _tighten
+
+    original = RecordingLabels(
+        "rec",
+        (
+            SpeakerSegment.from_seconds("rec", "A", 0.0, 1.0),
+            SpeakerSegment.from_seconds("rec", "A", "1.04", 2.0),
+        ),
+    )
+    words = {
+        "A": (
+            AlignedWord(parse_seconds_to_ns(0), parse_seconds_to_ns(1), "a", 1.0),
+            AlignedWord(parse_seconds_to_ns("1.04"), parse_seconds_to_ns(2), "b", 1.0),
+        )
+    }
+    ref = RecordingRef(
+        "rec",
+        tmp_path / "a.wav",
+        tmp_path / "a.uem",
+        parse_seconds_to_ns(3),
+        0,
+        parse_seconds_to_ns(3),
+    )
+
+    tight = _tighten(original, words, ref)
+
+    assert [(item.start_ns, item.end_ns) for item in tight.segments] == [
+        (parse_seconds_to_ns(0), parse_seconds_to_ns(2))
+    ]
