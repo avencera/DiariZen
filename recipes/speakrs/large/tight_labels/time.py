@@ -93,3 +93,21 @@ def coverage_meets(covered_ns: int, total_ns: int, min_coverage: Fraction | str 
         return False
     ratio = as_coverage_ratio(min_coverage)
     return covered_ns * ratio.denominator >= total_ns * ratio.numerator
+
+
+def float_bounds_to_rttm_ns(start: float, end: float) -> tuple[int, int]:
+    """Reproduce parent-preparation RTTM nanosecond bounds from float seconds.
+
+    Preparation writes start and duration with nine decimal places from the
+    original floats, so matching must use that text, not a second float parse.
+    """
+
+    if isinstance(start, bool) or isinstance(end, bool):
+        raise ValueError("bounds must be finite floats")
+    start_value = float(start)
+    end_value = float(end)
+    if start_value != start_value or end_value != end_value or end_value <= start_value:
+        raise ValueError("bounds must be finite and ordered")
+    start_ns = parse_seconds_to_ns(f"{start_value:.9f}")
+    duration_ns = parse_seconds_to_ns(f"{end_value - start_value:.9f}")
+    return start_ns, start_ns + duration_ns

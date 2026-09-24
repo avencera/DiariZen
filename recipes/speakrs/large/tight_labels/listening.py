@@ -53,7 +53,7 @@ class ListeningWindow:
 
 
 def change_spans(original: RecordingLabels, new: RecordingLabels) -> list[tuple[int, int]]:
-    """Return times where any speaker's activity differs."""
+    """Return times where any speaker's activity differs, including UNCERTAIN."""
 
     speakers = original.speakers | new.speakers
     changed: list[tuple[int, int]] = []
@@ -62,6 +62,8 @@ def change_spans(original: RecordingLabels, new: RecordingLabels) -> list[tuple[
         new_union = union_spans(new.segments_for(speaker))
         changed.extend(subtract_spans(original_union, new_union))
         changed.extend(subtract_spans(new_union, original_union))
+        changed.extend((item.start_ns, item.end_ns) for item in new.uncertain_for(speaker))
+        changed.extend((item.start_ns, item.end_ns) for item in original.uncertain_for(speaker))
     return union_spans(changed)
 
 
@@ -159,6 +161,23 @@ def _clip_rows(
                     "audio_end": format_ns(window.end_ns),
                     "label_set": label_set,
                     "speaker": segment.speaker,
+                    "start": format_ns(start_ns - window.start_ns),
+                    "end": format_ns(end_ns - window.start_ns),
+                }
+            )
+        for region in labels.uncertain:
+            start_ns = max(region.start_ns, window.start_ns)
+            end_ns = min(region.end_ns, window.end_ns)
+            if end_ns <= start_ns:
+                continue
+            rows.append(
+                {
+                    "clip_id": clip_id,
+                    "recording_id": window.recording_id,
+                    "audio_start": format_ns(window.start_ns),
+                    "audio_end": format_ns(window.end_ns),
+                    "label_set": f"{label_set}-uncertain",
+                    "speaker": region.speaker,
                     "start": format_ns(start_ns - window.start_ns),
                     "end": format_ns(end_ns - window.start_ns),
                 }
