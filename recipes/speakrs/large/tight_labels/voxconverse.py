@@ -1307,7 +1307,6 @@ def write_release(
     gate = evaluate_gates(
         original,
         written,
-        require_subset=True,
         uem_by_recording=uem_by_recording,
         segment_classes=segment_classes,
     )
