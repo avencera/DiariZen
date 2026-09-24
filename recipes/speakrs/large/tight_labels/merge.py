@@ -50,16 +50,19 @@ def subtract_uncertain_from_active(
     uncertain: Sequence[UncertainInterval],
     active: Sequence[SpeakerSegment],
 ) -> tuple[UncertainInterval, ...]:
-    """Drop uncertain time that overlaps the same speaker's active speech."""
+    """Union overlapping and touching UNCERTAIN per speaker, then drop active speech."""
 
+    grouped: dict[tuple[str, str], list[UncertainInterval]] = defaultdict(list)
+    for region in uncertain:
+        grouped[(region.recording_id, region.speaker)].append(region)
     active_by_speaker: dict[tuple[str, str], list[SpeakerSegment]] = defaultdict(list)
     for segment in active:
         active_by_speaker[(segment.recording_id, segment.speaker)].append(segment)
     remaining: list[UncertainInterval] = []
-    for region in uncertain:
-        cut = active_by_speaker.get((region.recording_id, region.speaker), ())
-        for start_ns, end_ns in subtract_spans([region], cut):
-            remaining.append(UncertainInterval(region.recording_id, region.speaker, start_ns, end_ns))
+    for (recording_id, speaker), regions in grouped.items():
+        cut = active_by_speaker.get((recording_id, speaker), ())
+        for start_ns, end_ns in subtract_spans(union_spans(regions), cut):
+            remaining.append(UncertainInterval(recording_id, speaker, start_ns, end_ns))
     remaining.sort(key=lambda item: (item.start_ns, item.end_ns, item.speaker))
     return tuple(remaining)
 
@@ -73,11 +76,7 @@ def merge_recording(
     """Merge short gaps on a recording and drop overlapping uncertain time."""
 
     merged = merge_short_gaps(labels.segments, min_gap_ns=min_gap_ns, within=within)
-    return RecordingLabels(
-        labels.recording_id,
-        merged,
-        subtract_uncertain_from_active(labels.uncertain, merged),
-    )
+    return RecordingLabels(labels.recording_id, merged, labels.uncertain)
 
 
 __all__ = [
