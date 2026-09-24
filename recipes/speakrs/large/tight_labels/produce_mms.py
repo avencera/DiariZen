@@ -94,7 +94,6 @@ SOURCE_SPECS = {
         "listening_name": "indic-diarbench",
         "license": "CC BY 4.0",
         "method": "mms-fa-uroman",
-        "require_subset": True,
     },
     "lotusdis": {
         "release_id": "lotusdis-tight-v1",
@@ -103,7 +102,6 @@ SOURCE_SPECS = {
         "listening_name": "lotusdis",
         "license": "CC BY-SA 4.0",
         "method": "mms-fa-uroman",
-        "require_subset": True,
     },
 }
 
@@ -1013,7 +1011,6 @@ def write_aligned_release(
         gate = evaluate_gates(
             original,
             written,
-            require_subset=spec["require_subset"],
             uem_by_recording=uem_by_recording,
             segment_classes=segment_classes,
         )
@@ -1049,7 +1046,6 @@ def write_aligned_release(
     gate = evaluate_gates(
         original,
         written,
-        require_subset=spec["require_subset"],
         uem_by_recording=uem_by_recording,
         segment_classes=segment_classes,
     )
