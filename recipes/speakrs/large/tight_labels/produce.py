@@ -224,16 +224,27 @@ def render_gate_markdown(source_name: str, release_id: str, gate: GateResult, *,
         ),
         _tightness_row("p90 segment s", original.p90_segment_s, tightness.p90_segment_s, reference.p90_segment_s),
         "",
-        "## Gates",
+        "## Hard gates",
+        "",
+        "These fail the release. A failed source keeps the current labels only",
+        "when a hard gate or the failure-share limit fails.",
+        "",
+        f"- Rows inside UEM: {_ok(gate.uem_ok)}",
+        f"- Subset of 200 ms-closed original: {_ok(gate.subset_ok)}",
+        f"- Smallest same-speaker gap ≥ 0.200 s: {_ok(gate.smallest_gap_ok)}",
+        f"- Published speakers mapped: {_ok(gate.unmapped_speakers_ok)}",
+        f"- UNCERTAIN overlapping same-speaker speech: {_ok(gate.uncertain_overlap_ok)}",
+        f"- Failure share ≤ 0.25: {_ok(gate.failure_share_ok)} ({gate.failure_share:.4f})",
+        "",
+        "## Reported (do not fail)",
+        "",
+        "Tightness rates are compared with the forced-AMI reference of 4.63",
+        "gaps ≤0.3 s and 17.00 gaps 0.3–1.0 s per speaker-minute.",
         "",
         f"- Tightness band: {_ok(gate.tightness_ok)}",
-        f"- Smallest gap ≥ 0.200 s: {_ok(gate.smallest_gap_ok)}",
         f"- Speaker retention: {_ok(gate.speaker_retention_ok)}",
         f"- Overlap retention: {_ok(gate.overlap_retention_ok)} ({_fmt(gate.overlap_retention)})",
-        f"- Failure share: {_ok(gate.failure_share_ok)} ({gate.failure_share:.4f})",
-        f"- Subset of original: {_ok(gate.subset_ok)}",
-        f"- Rows inside UEM: {_ok(gate.uem_ok)}",
-        f"- Published speakers mapped: {_ok(gate.unmapped_speakers_ok)}",
+        f"- UNCERTAIN share of original speech: {_fmt(gate.uncertain_share)}",
         "",
         f"Flagged speakers below 30% retention: {len(gate.flagged_speakers)}",
         f"Flagged recordings with >5% new speech outside original: {len(gate.flagged_recordings)}",
@@ -242,8 +253,20 @@ def render_gate_markdown(source_name: str, release_id: str, gate: GateResult, *,
         f"Dropped unmapped published speech: {gate.dropped_unmapped_seconds:.3f} s",
         "",
     ]
+    if gate.uncertain_by_recording:
+        lines.append("## UNCERTAIN share by recording")
+        lines.append("")
+        for item in gate.uncertain_by_recording:
+            lines.append(
+                f"- `{item.recording_id}` {item.ratio:.4f} "
+                f"({item.uncertain_seconds:.3f} s of {item.original_seconds:.3f} s)"
+            )
+        lines.append("")
     if kept_current:
-        lines.append("The produced labels are the current labels. The source failed a gate.")
+        lines.append(
+            "The produced labels are the current labels because the source "
+            "failed a hard gate or the failure-share limit."
+        )
         lines.append("")
     if gate.notes:
         lines.append("## Notes")

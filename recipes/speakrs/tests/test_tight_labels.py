@@ -180,17 +180,57 @@ def test_tighten_merges_short_gaps_inside_a_human_segment() -> None:
     assert _spans(result.active) == [_span(0, 2)]
 
 
-def test_tighten_does_not_fill_a_gap_between_human_segments() -> None:
+def test_tighten_merges_a_40ms_gap_between_human_segments() -> None:
     original = RecordingLabels(
         "rec",
-        (_seg("A", 0.0, 1.0), _seg("A", 1.1, 2.0)),
+        (_seg("A", 0.0, 1.0), _seg("A", "1.04", 2.0)),
     )
-    aligned = {"A": (_iv(0.0, 1.0), _iv(1.1, 2.0))}
+    aligned = {"A": (_iv(0.0, 1.0), _iv("1.04", 2.0))}
 
     tight = tighten_recording(original, aligned)
 
-    assert _spans(tight.segments) == [_span(0, 1), _span("1.1", 2)]
+    assert _spans(tight.segments) == [_span(0, 2)]
     assert is_subset_of_original(tight.segments, original.segments, speaker="A")
+
+
+def test_tighten_keeps_a_250ms_gap_between_human_segments() -> None:
+    original = RecordingLabels(
+        "rec",
+        (_seg("A", 0.0, 1.0), _seg("A", "1.25", 2.0)),
+    )
+    aligned = {"A": (_iv(0.0, 1.0), _iv("1.25", 2.0))}
+
+    tight = tighten_recording(original, aligned)
+
+    assert _spans(tight.segments) == [_span(0, 1), _span("1.25", 2)]
+    assert is_subset_of_original(tight.segments, original.segments, speaker="A")
+
+
+def test_tighten_merge_stays_inside_the_200ms_closed_original() -> None:
+    original = RecordingLabels(
+        "rec",
+        (_seg("A", 0.0, 1.0), _seg("A", "1.04", 2.0)),
+    )
+    aligned = {"A": (_iv(0.0, 1.0), _iv("1.04", 2.0))}
+
+    tight = tighten_recording(original, aligned)
+
+    assert _spans(tight.segments) == [_span(0, 2)]
+    assert is_subset_of_original(tight.segments, original.segments, speaker="A")
+    assert not is_subset_of_original((_seg("A", 0.0, "2.1"),), original.segments, speaker="A")
+
+
+def test_tighten_uncertain_does_not_overlap_merged_speech() -> None:
+    original = RecordingLabels(
+        "rec",
+        (_seg("A", 0.0, 1.0), _seg("A", "1.04", "1.12"), _seg("A", "1.16", 2.0)),
+    )
+    aligned = {"A": (_iv(0.0, 1.0), _iv("1.16", 2.0))}
+
+    tight = tighten_recording(original, aligned)
+
+    assert _spans(tight.segments) == [_span(0, 2)]
+    assert tight.uncertain == ()
 
 
 def test_tighten_unions_overlapping_human_segments_before_coverage() -> None:
@@ -225,6 +265,20 @@ def test_subset_check_rejects_speech_outside_the_original_union() -> None:
     tight = (_seg("A", 0.0, 1.1),)
 
     assert is_subset_of_original(original, original, speaker="A")
+    assert not is_subset_of_original(tight, original, speaker="A")
+
+
+def test_subset_check_allows_speech_in_a_40ms_original_gap() -> None:
+    original = (_seg("A", 0.0, 1.0), _seg("A", "1.04", 2.0))
+    tight = (_seg("A", 0.0, 2.0),)
+
+    assert is_subset_of_original(tight, original, speaker="A")
+
+
+def test_subset_check_rejects_speech_in_a_250ms_original_gap() -> None:
+    original = (_seg("A", 0.0, 1.0), _seg("A", "1.25", 2.0))
+    tight = (_seg("A", 0.0, 2.0),)
+
     assert not is_subset_of_original(tight, original, speaker="A")
 
 
@@ -385,6 +439,10 @@ def test_gates_flag_speakers_below_30_percent_and_outside_speech() -> None:
     assert speakers["A"] == pytest.approx(0.2)
     assert "B" not in speakers
     assert "rec" in gate.flagged_recordings
+    assert gate.speaker_retention_ok is False
+    assert gate.tightness_ok is False
+    assert gate.hard_gates_ok is True
+    assert gate.passed is True
 
 
 def test_gates_fail_when_a_row_falls_outside_the_uem() -> None:
@@ -470,3 +528,99 @@ def test_listening_pack_writes_wav_and_csv(tmp_path: Path) -> None:
 def test_format_ns_writes_nine_decimals_from_integers() -> None:
     assert format_ns(MIN_GAP_NS) == "0.200000000"
     assert format_ns(parse_seconds_to_ns("3325.128")) == "3325.128000000"
+
+
+def test_gates_fail_when_smallest_gap_is_below_200ms() -> None:
+    original = [RecordingLabels("rec", (_seg("A", 0.0, 1.0), _seg("A", "1.04", 2.0)))]
+    new = [RecordingLabels("rec", (_seg("A", 0.0, 1.0), _seg("A", "1.04", 2.0)))]
+
+    gate = evaluate_gates(original, new, require_subset=True)
+
+    assert gate.smallest_gap_ok is False
+    assert gate.hard_gates_ok is False
+    assert gate.passed is False
+
+
+def test_gates_fail_subset_outside_the_200ms_closed_original() -> None:
+    original = [RecordingLabels("rec", (_seg("A", 0.0, 1.0), _seg("A", "1.25", 2.0)))]
+    new = [RecordingLabels("rec", (_seg("A", 0.0, 2.0),))]
+
+    gate = evaluate_gates(original, new, require_subset=True)
+
+    assert gate.subset_ok is False
+    assert gate.hard_gates_ok is False
+    assert gate.passed is False
+
+
+def test_gates_pass_failure_share_at_the_025_limit() -> None:
+    original = [
+        RecordingLabels(
+            "rec",
+            (_seg("A", 0, 1), _seg("A", 2, 3), _seg("B", 0, 1), _seg("B", 2, 3)),
+        )
+    ]
+    new = [
+        RecordingLabels(
+            "rec",
+            (_seg("A", 0, 1), _seg("A", 2, 3), _seg("B", 0, 1)),
+            (UncertainInterval.from_seconds("rec", "B", 2, 3),),
+        )
+    ]
+
+    gate = evaluate_gates(original, new)
+
+    assert gate.failure_share == pytest.approx(0.25)
+    assert gate.failure_share_ok is True
+    assert gate.passed is True
+
+
+def test_gates_fail_failure_share_above_025() -> None:
+    original = [RecordingLabels("rec", (_seg("A", 0, 1), _seg("A", 2, 3), _seg("B", 0, 1)))]
+    new = [
+        RecordingLabels(
+            "rec",
+            (_seg("A", 0, 1), _seg("A", 2, 3)),
+            (UncertainInterval.from_seconds("rec", "B", 0, 1),),
+        )
+    ]
+
+    gate = evaluate_gates(original, new)
+
+    assert gate.failure_share == pytest.approx(1 / 3)
+    assert gate.failure_share_ok is False
+    assert gate.hard_gates_ok is True
+    assert gate.passed is False
+
+
+def test_gates_report_uncertain_share_per_recording() -> None:
+    original = [
+        RecordingLabels(
+            "rec",
+            (_seg("A", 0.0, 10.0), _seg("B", 0.0, 10.0), _seg("C", 0.0, 10.0), _seg("D", 0.0, 10.0), _seg("E", 0.0, 10.0)),
+        )
+    ]
+    new = [
+        RecordingLabels(
+            "rec",
+            (
+                _seg("A", 0.0, 6.0),
+                _seg("B", 0.0, 10.0),
+                _seg("C", 0.0, 10.0),
+                _seg("D", 0.0, 10.0),
+                _seg("E", 0.0, 10.0),
+            ),
+            (UncertainInterval.from_seconds("rec", "A", 6.0, 10.0),),
+        )
+    ]
+
+    gate = evaluate_gates(original, new)
+
+    assert gate.uncertain_share == pytest.approx(0.08)
+    assert len(gate.uncertain_by_recording) == 1
+    assert gate.uncertain_by_recording[0].recording_id == "rec"
+    assert gate.uncertain_by_recording[0].ratio == pytest.approx(0.08)
+    assert gate.uncertain_overlap_ok is True
+    payload = gate.to_json()
+    assert payload["uncertain_share"] == pytest.approx(0.08)
+    assert payload["keeps_current_labels"] is False
+    assert gate.passed is True
