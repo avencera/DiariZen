@@ -3,10 +3,24 @@
 from __future__ import annotations
 
 from .domain import Interval, RecordingLabels, SpeakerSegment, UncertainInterval
+from .classify import (
+    AlignmentFailureReason,
+    ByDesignReason,
+    SegmentClass,
+    SegmentOutcome,
+    aligned_classes,
+    require_segment_classes,
+)
 from .gates import GateResult, UncertainShare, evaluate_gates
 from .intervals import clip_recording_to_uem
 from .mapping import SpeakerMapping, apply_published_replacement, map_speakers_by_overlap
-from .merge import MIN_GAP_NS, MIN_GAP_SECONDS, merge_recording, merge_short_gaps
+from .merge import (
+    MIN_GAP_NS,
+    MIN_GAP_SECONDS,
+    merge_recording,
+    merge_short_gaps,
+    subtract_uncertain_from_active,
+)
 from .subset import is_subset_of_original, recording_is_subset
 from .tighten import COVERAGE_RATIO, TightenSegmentResult, tighten_recording, tighten_segment
 from .tightness import FORCED_AMI_REFERENCE, TightnessStats, measure_tightness
@@ -20,7 +34,7 @@ from .writers import (
 )
 
 
-LIBRARY_VERSION = "2"
+LIBRARY_VERSION = "3"
 
 __all__ = [
     "COVERAGE_RATIO",
@@ -28,15 +42,20 @@ __all__ = [
     "LIBRARY_VERSION",
     "MIN_GAP_NS",
     "MIN_GAP_SECONDS",
+    "AlignmentFailureReason",
+    "ByDesignReason",
     "GateResult",
     "Interval",
     "RecordingLabels",
+    "SegmentClass",
+    "SegmentOutcome",
     "SpeakerMapping",
     "SpeakerSegment",
     "TightenSegmentResult",
     "TightnessStats",
     "UncertainInterval",
     "UncertainShare",
+    "aligned_classes",
     "apply_published_replacement",
     "clip_recording_to_uem",
     "evaluate_gates",
@@ -49,6 +68,8 @@ __all__ = [
     "parse_seconds_to_ns",
     "parse_speaker_rttm",
     "recording_is_subset",
+    "require_segment_classes",
+    "subtract_uncertain_from_active",
     "tighten_recording",
     "tighten_segment",
     "write_recording_labels",

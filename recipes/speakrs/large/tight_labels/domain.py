@@ -222,7 +222,6 @@ class RecordingLabels:
         segments = tuple(self.segments)
         uncertain = tuple(self.uncertain)
         object.__setattr__(self, "segments", segments)
-        object.__setattr__(self, "uncertain", uncertain)
         for segment in segments:
             if not isinstance(segment, SpeakerSegment):
                 raise ValueError("segments must contain SpeakerSegment values")
@@ -233,7 +232,11 @@ class RecordingLabels:
                 raise ValueError("uncertain must contain UncertainInterval values")
             if region.recording_id != self.recording_id:
                 raise ValueError("uncertain recording_id must match the recording")
-        self._reject_same_speaker_overlap(segments, uncertain)
+        from .merge import subtract_uncertain_from_active
+
+        canonical = subtract_uncertain_from_active(uncertain, segments)
+        object.__setattr__(self, "uncertain", canonical)
+        self._reject_same_speaker_overlap(segments, canonical)
 
     @staticmethod
     def _reject_same_speaker_overlap(
