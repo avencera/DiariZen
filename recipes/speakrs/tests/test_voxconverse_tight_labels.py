@@ -142,3 +142,45 @@ def test_guarded_segment_becomes_uncertain_inside_the_human_bounds() -> None:
 def test_seconds_to_ns_rounds_aligner_floats() -> None:
     assert seconds_to_ns(0.2) == 200_000_000
     assert seconds_to_ns(1.2345678904) == 1_234_567_890
+
+
+def test_release_id_with_version_replaces_the_suffix() -> None:
+    from recipes.speakrs.large.tight_labels.produce import release_id_with_version
+
+    assert release_id_with_version("voxconverse-tight-v1", None) == "voxconverse-tight-v1"
+    assert release_id_with_version("voxconverse-tight-v1", "v2") == "voxconverse-tight-v2"
+    assert release_id_with_version("voxconverse-tight-v1", "2") == "voxconverse-tight-v2"
+
+
+def test_agent_report_renders_speaker_hours() -> None:
+    from pathlib import Path
+
+    from recipes.speakrs.large.tight_labels.gates import evaluate_gates
+    from recipes.speakrs.large.tight_labels.voxconverse import render_agent_report
+
+    original = [
+        RecordingLabels(
+            "voxconverse::abjxc",
+            (SpeakerSegment.from_seconds("voxconverse::abjxc", "spk00", 0.0, 3600.0),),
+        )
+    ]
+    gate = evaluate_gates(original, original)
+    report = render_agent_report(
+        refs=[],
+        gate=gate,
+        kept_current=False,
+        summary={
+            "unioned_segments": 1,
+            "asr_ok": 1,
+            "asr_coverage": 1.0,
+            "align_ok": 1,
+            "alignment_failure_share": 0.0,
+            "english_oov_words": 0,
+            "language_counts": {},
+            "guard_counts": {},
+        },
+        release_dir=Path("/tmp/voxconverse-tight-v2"),
+        listening={"directory": "/tmp", "clip_count": 0, "total_seconds": 0},
+    )
+    assert "Original speaker hours: 1.000" in report
+    assert "Produced speaker hours: 1.000" in report

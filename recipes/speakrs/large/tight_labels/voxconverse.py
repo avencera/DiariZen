@@ -47,6 +47,7 @@ from .produce import (
     RecordingRef,
     library_commit,
     load_current_labels,
+    release_id_with_version,
     render_gate_markdown,
 )
 from .tighten import tighten_recording, union_human_segments
@@ -1164,10 +1165,12 @@ def write_release(
     gate: GateResult,
     kept_current: bool,
     summary: Mapping[str, Any],
+    *,
+    release_id: str = RELEASE_ID,
 ) -> Path:
     """Write the voxconverse-tight-v1 release directory."""
 
-    release_dir = DV_ROOT / "releases" / RELEASE_ID
+    release_dir = DV_ROOT / "releases" / release_id
     if release_dir.exists():
         raise FileExistsError(f"refusing to overwrite existing release {release_dir}")
     labels_dir = release_dir / "labels"
@@ -1190,7 +1193,7 @@ def write_release(
     provenance = {
         "schema": "speakrs-tight-labels-release",
         "schema_version": 2,
-        "release_id": RELEASE_ID,
+        "release_id": release_id,
         "source": SOURCE_NAME,
         "method": "keep-current-labels" if kept_current else "asr-per-segment-then-forced-alignment",
         "kept_current_labels": kept_current,
@@ -1213,7 +1216,7 @@ def write_release(
     write_json(release_dir / "provenance.json", provenance)
     write_json(release_dir / "gate-report.json", gate.to_json())
     (release_dir / "gate-report.md").write_text(
-        render_gate_markdown(SOURCE_NAME, RELEASE_ID, gate, kept_current=kept_current),
+        render_gate_markdown(SOURCE_NAME, release_id, gate, kept_current=kept_current),
         encoding="utf-8",
     )
     return release_dir
@@ -1264,8 +1267,8 @@ def render_agent_report(
         "",
         f"- Recordings: {len(refs)}",
         f"- Unioned human segments: {summary['unioned_segments']}",
-        f"- Original speaker hours: {original.speaker_hours:.3f}",
-        f"- Produced speaker hours: {tightness.speaker_hours:.3f}",
+        f"- Original speaker hours: {original.speaker_seconds / 3600:.3f}",
+        f"- Produced speaker hours: {tightness.speaker_seconds / 3600:.3f}",
         "",
         "## ASR coverage and language mix",
         "",
@@ -1295,29 +1298,43 @@ def render_agent_report(
         "",
         "## Gates",
         "",
-        f"- Tightness band: {'pass' if gate.tightness_ok else 'fail'}",
-        f"- Smallest gap ≥ 0.200 s: {'pass' if gate.smallest_gap_ok else 'fail'}",
-        f"- Speaker retention: {'pass' if gate.speaker_retention_ok else 'fail'}",
-        f"- Overlap retention: {'pass' if gate.overlap_retention_ok else 'fail'} ({gate.overlap_retention})",
-        f"- Failure share: {'pass' if gate.failure_share_ok else 'fail'} ({gate.failure_share:.4f})",
-        f"- Subset of original: {'pass' if gate.subset_ok else 'fail'}",
         f"- Rows inside UEM: {'pass' if gate.uem_ok else 'fail'}",
+        f"- Subset of 200 ms-closed original: {'pass' if gate.subset_ok else 'fail'}",
+        f"- Smallest same-speaker gap ≥ 0.200 s: {'pass' if gate.smallest_gap_ok else 'fail'}",
+        f"- UNCERTAIN overlapping same-speaker speech: {'pass' if gate.uncertain_overlap_ok else 'fail'}",
+        f"- Failure share ≤ 0.25: {'pass' if gate.failure_share_ok else 'fail'} ({gate.failure_share:.4f})",
+        f"- Tightness band (reported): {'pass' if gate.tightness_ok else 'outside reference'}",
+        f"- Speaker retention (reported): {len(gate.flagged_speakers)} speakers below 30%",
+        f"- Overlap retention (reported): {gate.overlap_retention}",
+        f"- UNCERTAIN share of original speech: {gate.uncertain_share:.4f}",
         f"- Kept current labels: {kept_current}",
         f"- Flagged speakers below 30% retention: {len(gate.flagged_speakers)}",
         "",
-        "## Listening pack",
-        "",
-        f"- Directory: `{listening.get('directory')}`",
-        f"- Clips: {listening.get('clip_count')}",
-        f"- Seconds: {listening.get('total_seconds')}",
-        "",
     ]
+    if kept_current:
+        lines.extend(
+            [
+                "The produced labels are the current labels because the source "
+                "failed a hard gate or the failure-share limit.",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "## Listening pack",
+            "",
+            f"- Directory: `{listening.get('directory')}`",
+            f"- Clips: {listening.get('clip_count')}",
+            f"- Seconds: {listening.get('total_seconds')}",
+            "",
+        ]
+    )
     if gate.notes:
         lines.extend(["## Notes", "", *[f"- {note}" for note in gate.notes], ""])
     return "\n".join(lines)
 
 
-def produce(*, limit: int | None = None, phase: str = "all") -> dict[str, Any]:
+def produce(*, limit: int | None = None, phase: str = "all", release_version: str | None = None) -> dict[str, Any]:
     """Run ASR, alignment, tightening, gates, release, and the agent report."""
 
     require_free_gib(DV_ROOT, MINIMUM_FREE_GIB)
@@ -1367,7 +1384,10 @@ def produce(*, limit: int | None = None, phase: str = "all") -> dict[str, Any]:
     summary["uncertain_share_of_original_speech"] = (uncertain_ns / original_ns) if original_ns else 0.0
     summary["failure_share_gate"] = gate.failure_share
     write_json(WORK_ROOT / "summary.json", {**summary, "gate": gate.to_json(), "kept_current": kept_current})
-    release_dir = write_release(refs, original, produced, gate, kept_current, summary)
+    release_id = release_id_with_version(RELEASE_ID, release_version)
+    release_dir = write_release(
+        refs, original, produced, gate, kept_current, summary, release_id=release_id
+    )
     listening_dir = STAGING_ROOT / "listening-v2" / "voxconverse"
     listening = write_listening_pack(
         listening_dir,
@@ -1411,8 +1431,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="all",
         help="Stop after ASR, after alignment, or run the full release",
     )
+    parser.add_argument(
+        "--release-version",
+        default=None,
+        help="Replace the tight-vN suffix of the release id. Default: keep the current id",
+    )
     args = parser.parse_args(argv)
-    summary = produce(limit=args.limit, phase=args.phase)
+    summary = produce(limit=args.limit, phase=args.phase, release_version=args.release_version)
     json.dump(summary, sys.stdout, indent=2, sort_keys=True, default=str)
     sys.stdout.write("\n")
     return 0

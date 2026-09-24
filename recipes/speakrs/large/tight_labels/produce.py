@@ -102,6 +102,22 @@ class RecordingRef:
         return ns_to_seconds(self.duration_ns)
 
 
+def release_id_with_version(release_id: str, version: str | None) -> str:
+    """Replace the trailing tight-vN suffix when a release version is set."""
+
+    if version is None:
+        return release_id
+    normalized = version.strip()
+    if not normalized:
+        raise ValueError("release version must be a non-empty string")
+    if not normalized.startswith("v"):
+        normalized = f"v{normalized}"
+    prefix, sep, _current = release_id.rpartition("-")
+    if not sep:
+        return f"{release_id}-{normalized}"
+    return f"{prefix}-{normalized}"
+
+
 def library_commit(repo: Path = REPO_DIR) -> str:
     """Return the git commit of the recipe worktree."""
 
