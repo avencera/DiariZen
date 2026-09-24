@@ -59,6 +59,7 @@ DATA_COMMANDS = (
     "bundle-snapshot-restore",
     "dev-bundle",
     "qualification-binding",
+    "acquire-close-talk",
 )
 
 
@@ -334,6 +335,25 @@ def build_parser() -> argparse.ArgumentParser:
     data_binding.add_argument("--authorization-reference", required=True)
     data_binding.add_argument("--config", required=True, type=Path)
     data_binding.add_argument("--output", required=True, type=Path)
+    data_acquire = data_sub.add_parser(
+        "acquire-close-talk",
+        help="stream close-talk audio and aligner models for tight labels",
+    )
+    data_acquire.add_argument(
+        "--source",
+        default="all",
+        help="all, or a comma list of chime-6, aishell-5, icsi, notsofar-real, lotusdis, models",
+    )
+    data_acquire.add_argument(
+        "--dv-root",
+        type=Path,
+        default=Path("/Volumes/CacheDisk/dev-cache/diarization-data-verification"),
+    )
+    data_acquire.add_argument(
+        "--staging-root",
+        type=Path,
+        default=Path("/Volumes/CacheDisk/dev-cache/diarization-data-verification/staging/tight-labels-v1"),
+    )
     return parser
 
 
@@ -380,6 +400,11 @@ def dispatch(args: argparse.Namespace) -> dict:
 
     command = args.command
     if command == "data":
+        if args.data_command == "acquire-close-talk":
+            from .tight_labels_acquire import acquire
+
+            sources = [part.strip() for part in str(args.source).split(",") if part.strip()]
+            return acquire(sources, dv_root=args.dv_root, staging_root=args.staging_root)
         if args.data_command in {
             "bundle-snapshot-publish",
             "bundle-snapshot-verify",
