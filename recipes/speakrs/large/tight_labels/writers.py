@@ -7,41 +7,37 @@ from typing import Iterable, Sequence
 
 from ..jsonio import atomic_write_text
 from .domain import RecordingLabels, SpeakerSegment, UncertainInterval, require_identity
+from .time import format_ns, parse_seconds_to_ns
 
 
-TIME_DECIMALS = 9
+def format_time(value_ns: int) -> str:
+    """Format a nanosecond time as seconds with nine decimal places."""
 
-
-def format_time(value: float) -> str:
-    """Format a time in seconds to nine decimal places."""
-
-    return f"{value:.{TIME_DECIMALS}f}"
+    return format_ns(value_ns)
 
 
 def speaker_rttm_row(segment: SpeakerSegment) -> str:
     """Return one SPEAKER row with nine-decimal times."""
 
-    duration = segment.end - segment.start
     return (
-        f"SPEAKER {segment.recording_id} 1 {format_time(segment.start)} "
-        f"{format_time(duration)} <NA> <NA> {segment.speaker} <NA> <NA>"
+        f"SPEAKER {segment.recording_id} 1 {format_ns(segment.start_ns)} "
+        f"{format_ns(segment.duration_ns)} <NA> <NA> {segment.speaker} <NA> <NA>"
     )
 
 
 def uncertain_rttm_row(region: UncertainInterval) -> str:
     """Return one UNCERTAIN row with the SPEAKER field layout."""
 
-    duration = region.end - region.start
     return (
-        f"UNCERTAIN {region.recording_id} 1 {format_time(region.start)} "
-        f"{format_time(duration)} <NA> <NA> {region.speaker} <NA> <NA>"
+        f"UNCERTAIN {region.recording_id} 1 {format_ns(region.start_ns)} "
+        f"{format_ns(region.duration_ns)} <NA> <NA> {region.speaker} <NA> <NA>"
     )
 
 
 def render_speaker_rttm(segments: Sequence[SpeakerSegment]) -> str:
     """Render SPEAKER rows sorted by onset then speaker."""
 
-    ordered = sorted(segments, key=lambda item: (item.start, item.speaker, item.end))
+    ordered = sorted(segments, key=lambda item: (item.start_ns, item.speaker, item.end_ns))
     if not ordered:
         return ""
     return "\n".join(speaker_rttm_row(item) for item in ordered) + "\n"
@@ -50,7 +46,7 @@ def render_speaker_rttm(segments: Sequence[SpeakerSegment]) -> str:
 def render_uncertain_rttm(regions: Sequence[UncertainInterval]) -> str:
     """Render UNCERTAIN rows; an empty sequence yields an empty file body."""
 
-    ordered = sorted(regions, key=lambda item: (item.start, item.speaker, item.end))
+    ordered = sorted(regions, key=lambda item: (item.start_ns, item.speaker, item.end_ns))
     if not ordered:
         return ""
     return "\n".join(uncertain_rttm_row(item) for item in ordered) + "\n"
@@ -95,12 +91,12 @@ def parse_speaker_rttm(text: str, *, recording_id: str | None = None) -> tuple[S
         file_id = require_identity(fields[1], "recording_id")
         if recording_id is not None:
             file_id = recording_id
-        start = float(fields[3])
-        duration = float(fields[4])
+        start_ns = parse_seconds_to_ns(fields[3])
+        duration_ns = parse_seconds_to_ns(fields[4])
         speaker = fields[7]
         if speaker in {"<NA>", "NA", ""}:
             speaker = fields[8] if len(fields) > 8 else ""
-        segments.append(SpeakerSegment(file_id, speaker, start, start + duration))
+        segments.append(SpeakerSegment(file_id, speaker, start_ns, start_ns + duration_ns))
     return tuple(segments)
 
 
@@ -120,10 +116,10 @@ def parse_uncertain_rttm(text: str, *, recording_id: str | None = None) -> tuple
         file_id = require_identity(fields[1], "recording_id")
         if recording_id is not None:
             file_id = recording_id
-        start = float(fields[3])
-        duration = float(fields[4])
+        start_ns = parse_seconds_to_ns(fields[3])
+        duration_ns = parse_seconds_to_ns(fields[4])
         speaker = fields[7]
-        regions.append(UncertainInterval(file_id, speaker, start, start + duration))
+        regions.append(UncertainInterval(file_id, speaker, start_ns, start_ns + duration_ns))
     return tuple(regions)
 
 
@@ -142,10 +138,10 @@ def parse_recording_rttm(
     )
 
 
-def parse_uem_regions(text: str) -> dict[str, tuple[tuple[float, float], ...]]:
+def parse_uem_regions(text: str) -> dict[str, tuple[tuple[int, int], ...]]:
     """Parse Kaldi UEM rows keyed by file id."""
 
-    regions: dict[str, list[tuple[float, float]]] = {}
+    regions: dict[str, list[tuple[int, int]]] = {}
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -153,10 +149,22 @@ def parse_uem_regions(text: str) -> dict[str, tuple[tuple[float, float], ...]]:
         fields = line.split()
         if len(fields) < 4:
             raise ValueError(f"UEM line is malformed: {line}")
-        start = float(fields[-2])
-        end = float(fields[-1])
-        regions.setdefault(fields[0], []).append((start, end))
+        start_ns = parse_seconds_to_ns(fields[-2])
+        end_ns = parse_seconds_to_ns(fields[-1])
+        regions.setdefault(fields[0], []).append((start_ns, end_ns))
     return {key: tuple(value) for key, value in regions.items()}
+
+
+def uem_bounds(text: str) -> tuple[int, int]:
+    """Return the single UEM span from a one-recording UEM file."""
+
+    regions = parse_uem_regions(text)
+    spans = [span for values in regions.values() for span in values]
+    if not spans:
+        raise ValueError("UEM file has no regions")
+    start_ns = min(span[0] for span in spans)
+    end_ns = max(span[1] for span in spans)
+    return start_ns, end_ns
 
 
 def rewrite_uem_file_id(text: str, recording_id: str) -> str:
@@ -180,10 +188,14 @@ def rewrite_uem_file_id(text: str, recording_id: str) -> str:
     return body
 
 
-def render_uem(recording_id: str, regions: Iterable[tuple[float, float]]) -> str:
+def render_uem(recording_id: str, regions: Iterable[tuple[int, int]]) -> str:
     """Render UEM rows for one recording."""
 
-    rows = [f"{recording_id} 1 {format_time(start)} {format_time(end)}" for start, end in regions if end > start]
+    rows = [
+        f"{recording_id} 1 {format_ns(start_ns)} {format_ns(end_ns)}"
+        for start_ns, end_ns in regions
+        if end_ns > start_ns
+    ]
     if not rows:
         return ""
     return "\n".join(rows) + "\n"

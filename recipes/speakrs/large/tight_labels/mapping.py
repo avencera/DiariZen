@@ -9,8 +9,9 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from .domain import RecordingLabels, SpeakerSegment
-from .intervals import duration, overlap_duration, union_spans
-from .merge import MIN_GAP_SECONDS, merge_recording
+from .intervals import clip_recording_to_uem, duration_ns, overlap_duration_ns, union_spans
+from .merge import MIN_GAP_NS, merge_recording
+from .time import ns_to_seconds
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,17 +20,35 @@ class SpeakerMatch:
 
     published_speaker: str
     original_speaker: str
-    overlap_seconds: float
-    published_seconds: float
-    original_seconds: float
+    overlap_ns: int
+    published_ns: int
+    original_ns: int
+
+    @property
+    def overlap_seconds(self) -> float:
+        """Return overlap in seconds."""
+
+        return ns_to_seconds(self.overlap_ns)
+
+    @property
+    def published_seconds(self) -> float:
+        """Return published speech time in seconds."""
+
+        return ns_to_seconds(self.published_ns)
+
+    @property
+    def original_seconds(self) -> float:
+        """Return original speech time in seconds."""
+
+        return ns_to_seconds(self.original_ns)
 
     @property
     def overlap_ratio(self) -> float:
         """Return overlap divided by published speech time."""
 
-        if self.published_seconds <= 0:
+        if self.published_ns <= 0:
             return 0.0
-        return self.overlap_seconds / self.published_seconds
+        return self.overlap_ns / self.published_ns
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,11 +58,18 @@ class SpeakerMapping:
     matches: tuple[SpeakerMatch, ...]
     unmapped_published: tuple[str, ...]
     unmapped_original: tuple[str, ...]
+    unmapped_published_ns: int = 0
 
     def as_dict(self) -> dict[str, str]:
         """Return published speaker to original speaker."""
 
         return {item.published_speaker: item.original_speaker for item in self.matches}
+
+    @property
+    def unmapped_published_seconds(self) -> float:
+        """Return dropped published speech time in seconds."""
+
+        return ns_to_seconds(self.unmapped_published_ns)
 
     def to_json(self) -> dict[str, object]:
         """Return a JSON-ready record of the assignment."""
@@ -62,13 +88,14 @@ class SpeakerMapping:
             ],
             "unmapped_published": list(self.unmapped_published),
             "unmapped_original": list(self.unmapped_original),
+            "unmapped_published_seconds": self.unmapped_published_seconds,
         }
 
 
-def _speaker_spans(segments: Sequence[SpeakerSegment]) -> dict[str, list[tuple[float, float]]]:
-    grouped: dict[str, list[tuple[float, float]]] = {}
+def _speaker_spans(segments: Sequence[SpeakerSegment]) -> dict[str, list[tuple[int, int]]]:
+    grouped: dict[str, list[tuple[int, int]]] = {}
     for segment in segments:
-        grouped.setdefault(segment.speaker, []).append((segment.start, segment.end))
+        grouped.setdefault(segment.speaker, []).append((segment.start_ns, segment.end_ns))
     return {speaker: union_spans(spans) for speaker, spans in grouped.items()}
 
 
@@ -89,19 +116,20 @@ def map_speakers_by_overlap(
     published_names = tuple(sorted(published_spans))
     original_names = tuple(sorted(original_spans))
     if not published_names or not original_names:
-        return SpeakerMapping((), published_names, original_names)
+        unmapped_ns = sum(duration_ns(published_spans[name]) for name in published_names)
+        return SpeakerMapping((), published_names, original_names, unmapped_ns)
 
-    overlap = np.zeros((len(published_names), len(original_names)), dtype=np.float64)
+    overlap = np.zeros((len(published_names), len(original_names)), dtype=np.int64)
     for i, published_name in enumerate(published_names):
         for j, original_name in enumerate(original_names):
-            overlap[i, j] = overlap_duration(published_spans[published_name], original_spans[original_name])
+            overlap[i, j] = overlap_duration_ns(published_spans[published_name], original_spans[original_name])
     rows, cols = linear_sum_assignment(-overlap)
     used_published: set[str] = set()
     used_original: set[str] = set()
     matches: list[SpeakerMatch] = []
     for row, col in zip(rows, cols, strict=True):
-        seconds = float(overlap[row, col])
-        if seconds <= 0:
+        seconds_ns = int(overlap[row, col])
+        if seconds_ns <= 0:
             continue
         published_name = published_names[row]
         original_name = original_names[col]
@@ -111,16 +139,19 @@ def map_speakers_by_overlap(
             SpeakerMatch(
                 published_speaker=published_name,
                 original_speaker=original_name,
-                overlap_seconds=seconds,
-                published_seconds=duration(published_spans[published_name]),
-                original_seconds=duration(original_spans[original_name]),
+                overlap_ns=seconds_ns,
+                published_ns=duration_ns(published_spans[published_name]),
+                original_ns=duration_ns(original_spans[original_name]),
             )
         )
     matches.sort(key=lambda item: item.original_speaker)
+    unmapped_published = tuple(name for name in published_names if name not in used_published)
+    unmapped_ns = sum(duration_ns(published_spans[name]) for name in unmapped_published)
     return SpeakerMapping(
         tuple(matches),
-        tuple(name for name in published_names if name not in used_published),
+        unmapped_published,
         tuple(name for name in original_names if name not in used_original),
+        unmapped_ns,
     )
 
 
@@ -128,10 +159,17 @@ def apply_published_replacement(
     original: RecordingLabels,
     published: RecordingLabels,
     *,
-    min_gap: float = MIN_GAP_SECONDS,
+    min_gap_ns: int = MIN_GAP_NS,
+    uem: tuple[int, int] | None = None,
 ) -> tuple[RecordingLabels, SpeakerMapping]:
-    """Map published speakers onto original identities and merge short gaps."""
+    """Map published speakers onto original identities and merge short gaps.
 
-    mapping = map_speakers_by_overlap(published, original)
-    relabeled = published.with_recording_id(original.recording_id).map_speakers(mapping.as_dict())
-    return merge_recording(relabeled, min_gap=min_gap), mapping
+    When uem is set, published rows are clipped to it before mapping and merge.
+    """
+
+    source = published
+    if uem is not None:
+        source = clip_recording_to_uem(published, uem[0], uem[1])
+    mapping = map_speakers_by_overlap(source, original)
+    relabeled = source.with_recording_id(original.recording_id).map_speakers(mapping.as_dict())
+    return merge_recording(relabeled, min_gap_ns=min_gap_ns), mapping

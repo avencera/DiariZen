@@ -13,7 +13,7 @@ import soundfile as sf
 from ..jsonio import atomic_write_text
 from .domain import RecordingLabels
 from .intervals import subtract_spans, union_spans
-from .writers import format_time
+from .time import NANOSECONDS_PER_SECOND, format_ns, parse_seconds_to_ns
 
 
 MAX_PACK_SECONDS = 300.0
@@ -29,16 +29,34 @@ class ListeningWindow:
     """A source-audio interval chosen for a listening clip."""
 
     recording_id: str
-    start: float
-    end: float
-    change_seconds: float
+    start_ns: int
+    end_ns: int
+    change_ns: int
+
+    @property
+    def start(self) -> float:
+        """Return clip start in seconds."""
+
+        return self.start_ns / NANOSECONDS_PER_SECOND
+
+    @property
+    def end(self) -> float:
+        """Return clip end in seconds."""
+
+        return self.end_ns / NANOSECONDS_PER_SECOND
+
+    @property
+    def change_seconds(self) -> float:
+        """Return changed speech time in seconds."""
+
+        return self.change_ns / NANOSECONDS_PER_SECOND
 
 
-def change_spans(original: RecordingLabels, new: RecordingLabels) -> list[tuple[float, float]]:
+def change_spans(original: RecordingLabels, new: RecordingLabels) -> list[tuple[int, int]]:
     """Return times where any speaker's activity differs."""
 
     speakers = original.speakers | new.speakers
-    changed: list[tuple[float, float]] = []
+    changed: list[tuple[int, int]] = []
     for speaker in speakers:
         original_union = union_spans(original.segments_for(speaker))
         new_union = union_spans(new.segments_for(speaker))
@@ -51,7 +69,7 @@ def select_listening_windows(
     original: Sequence[RecordingLabels],
     new: Sequence[RecordingLabels],
     *,
-    duration_by_recording: Mapping[str, float],
+    duration_by_recording: Mapping[str, int | float],
     max_pack_seconds: float = MAX_PACK_SECONDS,
     max_clip_seconds: float = MAX_CLIP_SECONDS,
     min_clip_seconds: float = MIN_CLIP_SECONDS,
@@ -60,53 +78,64 @@ def select_listening_windows(
 ) -> tuple[ListeningWindow, ...]:
     """Choose the most-changed regions up to the pack budget."""
 
+    max_pack_ns = parse_seconds_to_ns(max_pack_seconds)
+    max_clip_ns = parse_seconds_to_ns(max_clip_seconds)
+    min_clip_ns = parse_seconds_to_ns(min_clip_seconds)
+    pad_ns = parse_seconds_to_ns(pad_seconds)
     new_by_id = {item.recording_id: item for item in new}
     candidates: list[ListeningWindow] = []
     for source in original:
         produced = new_by_id[source.recording_id]
-        audio_end = duration_by_recording[source.recording_id]
+        audio_end = _duration_ns(duration_by_recording[source.recording_id])
         per_recording = 0
         regions = sorted(change_spans(source, produced), key=lambda span: span[1] - span[0], reverse=True)
-        for start, end in regions:
+        for start_ns, end_ns in regions:
             if per_recording >= max_clips_per_recording:
                 break
-            change = end - start
-            if change <= 0:
+            change_ns = end_ns - start_ns
+            if change_ns <= 0:
                 continue
-            clip_start = max(0.0, start - pad_seconds)
-            clip_end = min(audio_end, end + pad_seconds)
-            if clip_end - clip_start > max_clip_seconds:
-                # keep the start of the changed region when the run is long
-                clip_end = min(audio_end, max(start, clip_start) + max_clip_seconds)
-            if clip_end - clip_start < min_clip_seconds:
-                extra = min_clip_seconds - (clip_end - clip_start)
-                clip_start = max(0.0, clip_start - extra / 2)
-                clip_end = min(audio_end, clip_start + min_clip_seconds)
+            clip_start = max(0, start_ns - pad_ns)
+            clip_end = min(audio_end, end_ns + pad_ns)
+            if clip_end - clip_start > max_clip_ns:
+                clip_end = min(audio_end, max(start_ns, clip_start) + max_clip_ns)
+            if clip_end - clip_start < min_clip_ns:
+                extra = min_clip_ns - (clip_end - clip_start)
+                clip_start = max(0, clip_start - extra // 2)
+                clip_end = min(audio_end, clip_start + min_clip_ns)
             if clip_end <= clip_start:
                 continue
-            candidates.append(ListeningWindow(source.recording_id, clip_start, clip_end, change))
+            candidates.append(ListeningWindow(source.recording_id, clip_start, clip_end, change_ns))
             per_recording += 1
-    candidates.sort(key=lambda item: item.change_seconds, reverse=True)
+    candidates.sort(key=lambda item: item.change_ns, reverse=True)
     chosen: list[ListeningWindow] = []
-    used = 0.0
+    used = 0
     for window in candidates:
-        length = window.end - window.start
-        if used + length > max_pack_seconds:
-            remaining = max_pack_seconds - used
-            if remaining < min_clip_seconds:
+        length = window.end_ns - window.start_ns
+        if used + length > max_pack_ns:
+            remaining = max_pack_ns - used
+            if remaining < min_clip_ns:
                 continue
             window = ListeningWindow(
                 window.recording_id,
-                window.start,
-                window.start + remaining,
-                window.change_seconds,
+                window.start_ns,
+                window.start_ns + remaining,
+                window.change_ns,
             )
             length = remaining
         chosen.append(window)
         used += length
-        if used >= max_pack_seconds - 1e-9:
+        if used >= max_pack_ns:
             break
     return tuple(chosen)
+
+
+def _duration_ns(value: int | float) -> int:
+    if isinstance(value, bool):
+        raise ValueError("duration must be nanoseconds or seconds")
+    if isinstance(value, int) and value > 10_000:
+        return value
+    return parse_seconds_to_ns(value)
 
 
 def _clip_rows(
@@ -118,20 +147,20 @@ def _clip_rows(
     rows: list[dict[str, str]] = []
     for label_set, labels in (("original", original), ("new", new)):
         for segment in labels.segments:
-            start = max(segment.start, window.start)
-            end = min(segment.end, window.end)
-            if end <= start:
+            start_ns = max(segment.start_ns, window.start_ns)
+            end_ns = min(segment.end_ns, window.end_ns)
+            if end_ns <= start_ns:
                 continue
             rows.append(
                 {
                     "clip_id": clip_id,
                     "recording_id": window.recording_id,
-                    "audio_start": format_time(window.start),
-                    "audio_end": format_time(window.end),
+                    "audio_start": format_ns(window.start_ns),
+                    "audio_end": format_ns(window.end_ns),
                     "label_set": label_set,
                     "speaker": segment.speaker,
-                    "start": format_time(start - window.start),
-                    "end": format_time(end - window.start),
+                    "start": format_ns(start_ns - window.start_ns),
+                    "end": format_ns(end_ns - window.start_ns),
                 }
             )
     return rows
@@ -143,7 +172,7 @@ def write_listening_pack(
     original: Sequence[RecordingLabels],
     new: Sequence[RecordingLabels],
     audio_by_recording: Mapping[str, Path],
-    duration_by_recording: Mapping[str, float],
+    duration_by_recording: Mapping[str, int | float],
 ) -> dict[str, object]:
     """Cut WAV clips and write a CSV of original and new labels."""
 
@@ -172,8 +201,8 @@ def write_listening_pack(
         clip_id = f"clip-{index:04d}"
         wav_path = directory / f"{clip_id}.wav"
         audio_path = audio_by_recording[window.recording_id]
-        start_frame = int(round(window.start * SAMPLE_RATE))
-        stop_frame = int(round(window.end * SAMPLE_RATE))
+        start_frame = (window.start_ns * SAMPLE_RATE) // NANOSECONDS_PER_SECOND
+        stop_frame = (window.end_ns * SAMPLE_RATE) // NANOSECONDS_PER_SECOND
         if stop_frame <= start_frame:
             continue
         samples, sample_rate = sf.read(

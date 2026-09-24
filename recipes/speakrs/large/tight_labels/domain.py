@@ -2,23 +2,22 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
+from .time import SecondsLike, ns_to_seconds, parse_seconds_to_ns
 
-def require_finite_bounds(start: float, end: float, *, allow_zero_start: bool = True) -> None:
-    """Reject non-finite or reversed interval bounds."""
 
-    if isinstance(start, bool) or isinstance(end, bool):
-        raise ValueError("interval bounds must be real numbers")
-    if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
-        raise ValueError("interval bounds must be real numbers")
-    if not math.isfinite(start) or not math.isfinite(end):
-        raise ValueError("interval bounds must be finite")
-    if allow_zero_start and start < 0:
+def require_ns_bounds(start_ns: int, end_ns: int) -> None:
+    """Reject non-integer or reversed nanosecond bounds."""
+
+    if isinstance(start_ns, bool) or isinstance(end_ns, bool):
+        raise ValueError("interval bounds must be integers")
+    if not isinstance(start_ns, int) or not isinstance(end_ns, int):
+        raise ValueError("interval bounds must be integers")
+    if start_ns < 0:
         raise ValueError("interval start must be non-negative")
-    if end <= start:
+    if end_ns <= start_ns:
         raise ValueError("interval end must be greater than start")
 
 
@@ -32,28 +31,52 @@ def require_identity(value: str, label: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class Interval:
-    """A half-open time span in seconds."""
+    """A half-open time span in nanoseconds."""
 
-    start: float
-    end: float
+    start_ns: int
+    end_ns: int
 
     def __post_init__(self) -> None:
-        require_finite_bounds(self.start, self.end)
+        require_ns_bounds(self.start_ns, self.end_ns)
+
+    @classmethod
+    def from_seconds(cls, start: SecondsLike, end: SecondsLike) -> Interval:
+        """Build an interval from second counts."""
+
+        return cls(parse_seconds_to_ns(start), parse_seconds_to_ns(end))
+
+    @property
+    def start(self) -> float:
+        """Return start in seconds."""
+
+        return ns_to_seconds(self.start_ns)
+
+    @property
+    def end(self) -> float:
+        """Return end in seconds."""
+
+        return ns_to_seconds(self.end_ns)
+
+    @property
+    def duration_ns(self) -> int:
+        """Return end minus start in nanoseconds."""
+
+        return self.end_ns - self.start_ns
 
     @property
     def duration(self) -> float:
-        """Return end minus start."""
+        """Return end minus start in seconds."""
 
-        return self.end - self.start
+        return ns_to_seconds(self.duration_ns)
 
     def intersection(self, other: Interval) -> Interval | None:
         """Return the overlapping span, if it has positive duration."""
 
-        start = max(self.start, other.start)
-        end = min(self.end, other.end)
-        if end <= start:
+        start_ns = max(self.start_ns, other.start_ns)
+        end_ns = min(self.end_ns, other.end_ns)
+        if end_ns <= start_ns:
             return None
-        return Interval(start, end)
+        return Interval(start_ns, end_ns)
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,35 +85,65 @@ class SpeakerSegment:
 
     recording_id: str
     speaker: str
-    start: float
-    end: float
+    start_ns: int
+    end_ns: int
 
     def __post_init__(self) -> None:
         require_identity(self.recording_id, "recording_id")
         require_identity(self.speaker, "speaker")
-        require_finite_bounds(self.start, self.end)
+        require_ns_bounds(self.start_ns, self.end_ns)
+
+    @classmethod
+    def from_seconds(
+        cls,
+        recording_id: str,
+        speaker: str,
+        start: SecondsLike,
+        end: SecondsLike,
+    ) -> SpeakerSegment:
+        """Build a segment from second counts."""
+
+        return cls(recording_id, speaker, parse_seconds_to_ns(start), parse_seconds_to_ns(end))
+
+    @property
+    def start(self) -> float:
+        """Return start in seconds."""
+
+        return ns_to_seconds(self.start_ns)
+
+    @property
+    def end(self) -> float:
+        """Return end in seconds."""
+
+        return ns_to_seconds(self.end_ns)
+
+    @property
+    def duration_ns(self) -> int:
+        """Return end minus start in nanoseconds."""
+
+        return self.end_ns - self.start_ns
 
     @property
     def duration(self) -> float:
-        """Return end minus start."""
+        """Return end minus start in seconds."""
 
-        return self.end - self.start
+        return ns_to_seconds(self.duration_ns)
 
     @property
     def bounds(self) -> Interval:
         """Return the unlabelled time span."""
 
-        return Interval(self.start, self.end)
+        return Interval(self.start_ns, self.end_ns)
 
     def with_speaker(self, speaker: str) -> SpeakerSegment:
         """Return a copy with a replacement speaker identity."""
 
-        return SpeakerSegment(self.recording_id, speaker, self.start, self.end)
+        return SpeakerSegment(self.recording_id, speaker, self.start_ns, self.end_ns)
 
     def with_recording_id(self, recording_id: str) -> SpeakerSegment:
         """Return a copy with a replacement recording identity."""
 
-        return SpeakerSegment(recording_id, self.speaker, self.start, self.end)
+        return SpeakerSegment(recording_id, self.speaker, self.start_ns, self.end_ns)
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,31 +152,61 @@ class UncertainInterval:
 
     recording_id: str
     speaker: str
-    start: float
-    end: float
+    start_ns: int
+    end_ns: int
 
     def __post_init__(self) -> None:
         require_identity(self.recording_id, "recording_id")
         require_identity(self.speaker, "speaker")
-        require_finite_bounds(self.start, self.end)
+        require_ns_bounds(self.start_ns, self.end_ns)
+
+    @classmethod
+    def from_seconds(
+        cls,
+        recording_id: str,
+        speaker: str,
+        start: SecondsLike,
+        end: SecondsLike,
+    ) -> UncertainInterval:
+        """Build an uncertain interval from second counts."""
+
+        return cls(recording_id, speaker, parse_seconds_to_ns(start), parse_seconds_to_ns(end))
+
+    @property
+    def start(self) -> float:
+        """Return start in seconds."""
+
+        return ns_to_seconds(self.start_ns)
+
+    @property
+    def end(self) -> float:
+        """Return end in seconds."""
+
+        return ns_to_seconds(self.end_ns)
+
+    @property
+    def duration_ns(self) -> int:
+        """Return end minus start in nanoseconds."""
+
+        return self.end_ns - self.start_ns
 
     @property
     def duration(self) -> float:
-        """Return end minus start."""
+        """Return end minus start in seconds."""
 
-        return self.end - self.start
+        return ns_to_seconds(self.duration_ns)
 
     @property
     def bounds(self) -> Interval:
         """Return the unlabelled time span."""
 
-        return Interval(self.start, self.end)
+        return Interval(self.start_ns, self.end_ns)
 
 
-def _overlap_seconds(left: Interval, right: Interval) -> float:
-    start = max(left.start, right.start)
-    end = min(left.end, right.end)
-    return max(0.0, end - start)
+def _overlap_ns(left: Interval, right: Interval) -> int:
+    start_ns = max(left.start_ns, right.start_ns)
+    end_ns = min(left.end_ns, right.end_ns)
+    return max(0, end_ns - start_ns)
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,7 +246,7 @@ class RecordingLabels:
         for region in uncertain:
             active = by_speaker.get(region.speaker, ())
             for interval in active:
-                if _overlap_seconds(region.bounds, interval) > 1e-12:
+                if _overlap_ns(region.bounds, interval) > 0:
                     raise ValueError("uncertain regions must not overlap active speech of the same speaker")
 
     @property
@@ -190,7 +273,9 @@ class RecordingLabels:
         return RecordingLabels(
             recording_id,
             tuple(item.with_recording_id(recording_id) for item in self.segments),
-            tuple(UncertainInterval(recording_id, item.speaker, item.start, item.end) for item in self.uncertain),
+            tuple(
+                UncertainInterval(recording_id, item.speaker, item.start_ns, item.end_ns) for item in self.uncertain
+            ),
         )
 
     def map_speakers(self, speaker_map: Mapping[str, str]) -> RecordingLabels:
@@ -203,8 +288,8 @@ class RecordingLabels:
             UncertainInterval(
                 self.recording_id,
                 speaker_map[item.speaker],
-                item.start,
-                item.end,
+                item.start_ns,
+                item.end_ns,
             )
             for item in self.uncertain
             if item.speaker in speaker_map
@@ -215,8 +300,8 @@ class RecordingLabels:
 def segments_from_pairs(
     recording_id: str,
     speaker: str,
-    spans: Iterable[tuple[float, float]],
+    spans: Iterable[tuple[int, int]],
 ) -> tuple[SpeakerSegment, ...]:
-    """Build validated segments from raw time pairs."""
+    """Build validated segments from nanosecond start/end pairs."""
 
-    return tuple(SpeakerSegment(recording_id, speaker, start, end) for start, end in spans)
+    return tuple(SpeakerSegment(recording_id, speaker, start_ns, end_ns) for start_ns, end_ns in spans)

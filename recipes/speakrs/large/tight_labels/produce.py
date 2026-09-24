@@ -1,4 +1,4 @@
-"""Produce tight-v1 label releases for AMI, AliMeeting, and AVA-AVD."""
+"""Produce tight-v2 label releases for AMI, AliMeeting, and AVA-AVD."""
 
 from __future__ import annotations
 
@@ -16,14 +16,17 @@ from ..storage import require_free_gib
 from . import LIBRARY_VERSION
 from .domain import RecordingLabels, SpeakerSegment
 from .gates import GateResult, evaluate_gates
+from .intervals import clip_recording_to_uem
 from .listening import write_listening_pack
 from .mapping import SpeakerMapping, apply_published_replacement
-from .merge import MIN_GAP_SECONDS, merge_recording
+from .merge import MIN_GAP_NS, MIN_GAP_SECONDS, merge_recording
 from .tightness import FORCED_AMI_REFERENCE, TightnessStats
+from .time import NANOSECONDS_PER_SECOND, ns_to_seconds
 from .writers import (
     parse_speaker_rttm,
     render_speaker_rttm,
     rewrite_uem_file_id,
+    uem_bounds,
     write_recording_labels,
 )
 
@@ -38,11 +41,16 @@ PUBLISHED_COMMIT = "9527b7c64846fb38316a610f32e9d3466bd6d8b7"
 STAGING_ROOT = DV_ROOT / "staging/tight-labels-v1"
 MINIMUM_FREE_GIB = 120.0
 SAMPLE_RATE = 16_000
+V1_RELEASES = {
+    "ami": "ami-tight-v1",
+    "alimeeting": "alimeeting-tight-v1",
+    "ava-avd": "ava-avd-tight-v1",
+}
 
 SOURCE_SPECS = {
     "ami": {
         "component": "ami",
-        "release_id": "ami-tight-v1",
+        "release_id": "ami-tight-v2",
         "source_name": "AMI",
         "prefix": "ami::",
         "method": "replace-published-forced-alignment",
@@ -53,7 +61,7 @@ SOURCE_SPECS = {
     },
     "alimeeting": {
         "component": "alimeeting",
-        "release_id": "alimeeting-tight-v1",
+        "release_id": "alimeeting-tight-v2",
         "source_name": "AliMeeting",
         "prefix": "alimeeting::",
         "method": "replace-published-forced-alignment",
@@ -64,7 +72,7 @@ SOURCE_SPECS = {
     },
     "ava-avd": {
         "component": "ava-avd",
-        "release_id": "ava-avd-tight-v1",
+        "release_id": "ava-avd-tight-v2",
         "source_name": "AVA-AVD",
         "prefix": "ava-avd::",
         "method": "merge-short-gaps",
@@ -83,7 +91,15 @@ class RecordingRef:
     recording_id: str
     audio_path: Path
     uem_path: Path
-    duration_seconds: float
+    duration_ns: int
+    uem_start_ns: int
+    uem_end_ns: int
+
+    @property
+    def duration_seconds(self) -> float:
+        """Return audio duration in seconds."""
+
+        return ns_to_seconds(self.duration_ns)
 
 
 def library_commit(repo: Path = REPO_DIR) -> str:
@@ -126,12 +142,18 @@ def load_component_refs(source: str) -> tuple[RecordingRef, ...]:
     refs: list[RecordingRef] = []
     for record in payload["records"]:
         recording_id = record["recording_id"]
+        uem_path = Path(record["uem"]["source_absolute_path"])
+        uem_start_ns, uem_end_ns = uem_bounds(uem_path.read_text(encoding="utf-8"))
+        duration_samples = int(record["duration_samples"])
+        duration_ns = duration_samples * NANOSECONDS_PER_SECOND // SAMPLE_RATE
         refs.append(
             RecordingRef(
                 recording_id=recording_id,
                 audio_path=Path(record["audio"]["source_absolute_path"]),
-                uem_path=Path(record["uem"]["source_absolute_path"]),
-                duration_seconds=record["duration_samples"] / SAMPLE_RATE,
+                uem_path=uem_path,
+                duration_ns=duration_ns,
+                uem_start_ns=uem_start_ns,
+                uem_end_ns=uem_end_ns,
             )
         )
     refs.sort(key=lambda item: item.recording_id)
@@ -210,9 +232,14 @@ def render_gate_markdown(source_name: str, release_id: str, gate: GateResult, *,
         f"- Overlap retention: {_ok(gate.overlap_retention_ok)} ({_fmt(gate.overlap_retention)})",
         f"- Failure share: {_ok(gate.failure_share_ok)} ({gate.failure_share:.4f})",
         f"- Subset of original: {_ok(gate.subset_ok)}",
+        f"- Rows inside UEM: {_ok(gate.uem_ok)}",
+        f"- Published speakers mapped: {_ok(gate.unmapped_speakers_ok)}",
         "",
         f"Flagged speakers below 30% retention: {len(gate.flagged_speakers)}",
         f"Flagged recordings with >5% new speech outside original: {len(gate.flagged_recordings)}",
+        f"Rows outside UEM: {len(gate.rows_outside_uem)}",
+        f"Unmapped published speakers: {len(gate.unmapped_published)}",
+        f"Dropped unmapped published speech: {gate.dropped_unmapped_seconds:.3f} s",
         "",
     ]
     if kept_current:
@@ -227,6 +254,11 @@ def render_gate_markdown(source_name: str, release_id: str, gate: GateResult, *,
         lines.append("## Flagged recordings")
         lines.append("")
         lines.extend(f"- `{item}`" for item in gate.flagged_recordings)
+        lines.append("")
+    if gate.unmapped_published:
+        lines.append("## Unmapped published speakers")
+        lines.append("")
+        lines.extend(f"- `{item}`" for item in gate.unmapped_published)
         lines.append("")
     if gate.flagged_speakers:
         lines.append("## Flagged speakers")
@@ -267,7 +299,7 @@ def write_release(
     kept_current: bool,
     published_used: dict[str, Any] | None,
 ) -> Path:
-    """Write one local tight-v1 release directory."""
+    """Write one local tight-v2 release directory."""
 
     spec = SOURCE_SPECS[source]
     release_dir = DV_ROOT / "releases" / spec["release_id"]
@@ -291,7 +323,7 @@ def write_release(
     (release_dir / "all.uem").write_text("".join(all_uem), encoding="utf-8")
     provenance = {
         "schema": "speakrs-tight-labels-release",
-        "schema_version": 1,
+        "schema_version": 2,
         "release_id": spec["release_id"],
         "source": spec["source_name"],
         "method": spec["method"] if not kept_current else "keep-current-labels",
@@ -299,6 +331,8 @@ def write_release(
         "library_version": LIBRARY_VERSION,
         "library_commit": library_commit(),
         "min_gap_seconds": MIN_GAP_SECONDS,
+        "min_gap_ns": MIN_GAP_NS,
+        "supersedes": V1_RELEASES[source],
         "recording_count": len(produced),
         "licenses": [spec["license"]],
         "published_labels": published_used,
@@ -325,6 +359,7 @@ def produce_source(
     original: list[RecordingLabels] = []
     produced: list[RecordingLabels] = []
     mappings: dict[str, SpeakerMapping] = {}
+    uem_by_recording: dict[str, tuple[int, int]] = {}
     published_used: dict[str, Any] | None = None
     if spec["published_split"]:
         commit = published_commit()
@@ -339,20 +374,29 @@ def produce_source(
     for ref in refs:
         source_labels = current_recording(ref.recording_id, current_by_id[ref.recording_id])
         original.append(source_labels)
+        uem = (ref.uem_start_ns, ref.uem_end_ns)
+        uem_by_recording[ref.recording_id] = uem
         if spec["method"] == "merge-short-gaps":
-            produced.append(merge_recording(source_labels))
+            clipped = clip_recording_to_uem(source_labels, ref.uem_start_ns, ref.uem_end_ns)
+            produced.append(merge_recording(clipped))
             continue
         parent = published_parent_id(ref.recording_id, source)
         published_path = PUBLISHED_ROOT / spec["published_split"] / f"{parent}.rttm"
         if not published_path.is_file():
             raise FileNotFoundError(f"missing published train labels: {published_path}")
         published = load_published_labels(published_path, ref.recording_id)
-        replaced, mapping = apply_published_replacement(source_labels, published)
+        replaced, mapping = apply_published_replacement(source_labels, published, uem=uem)
         produced.append(replaced)
         mappings[ref.recording_id] = mapping
 
     attempted = list(produced)
-    gate = evaluate_gates(original, attempted, require_subset=spec["require_subset"])
+    gate = evaluate_gates(
+        original,
+        attempted,
+        require_subset=spec["require_subset"],
+        uem_by_recording=uem_by_recording,
+        mappings=mappings or None,
+    )
     kept_current = not gate.passed
     written = list(original) if kept_current else attempted
 
@@ -366,13 +410,13 @@ def produce_source(
         kept_current=kept_current,
         published_used=published_used,
     )
-    listening_dir = STAGING_ROOT / "listening" / spec["listening_name"]
+    listening_dir = STAGING_ROOT / "listening-v2" / spec["listening_name"]
     listening = write_listening_pack(
         listening_dir,
         original=original,
         new=attempted,
         audio_by_recording={item.recording_id: item.audio_path for item in refs},
-        duration_by_recording={item.recording_id: item.duration_seconds for item in refs},
+        duration_by_recording={item.recording_id: item.duration_ns for item in refs},
     )
     return {
         "source": source,
@@ -388,12 +432,25 @@ def produce_source(
 
 
 def render_core_report(results: Sequence[Mapping[str, Any]]) -> str:
-    """Render the cross-source CORE-REPORT."""
+    """Render the cross-source CORE-REPORT for v2."""
 
     lines = [
-        "# Tight labels v1 core report",
+        "# Tight labels v2 core report",
         "",
-        "This report records tightness before and after the first tight-label",
+        "v1 is superseded. The v1 releases kept published rows that ran past",
+        "the UEM, and float `start + duration` merged same-speaker gaps of",
+        "exactly 200 ms. v2 clips every produced row to the UEM before merge,",
+        "does interval arithmetic in nanoseconds, and fails a release when a",
+        "row falls outside the UEM or a published speaker is unmapped.",
+        "",
+        "v1 paths remain on disk and are not modified:",
+        "",
+        "- `/Volumes/CacheDisk/dev-cache/diarization-data-verification/releases/ami-tight-v1`",
+        "- `/Volumes/CacheDisk/dev-cache/diarization-data-verification/releases/alimeeting-tight-v1`",
+        "- `/Volumes/CacheDisk/dev-cache/diarization-data-verification/releases/ava-avd-tight-v1`",
+        "- `/Volumes/CacheDisk/dev-cache/diarization-data-verification/staging/tight-labels-v1/listening/`",
+        "",
+        "This report records tightness before and after the v2 tight-label",
         "wave (AMI, AliMeeting, AVA-AVD) next to the published forced-AMI",
         "reference. Human listening of the clip packs is still required.",
         "",
@@ -434,12 +491,16 @@ def render_core_report(results: Sequence[Mapping[str, Any]]) -> str:
         lines.append(f"### {spec['source_name']}")
         lines.append("")
         lines.append(f"- Release: `{result['release_dir']}`")
+        lines.append(f"- Supersedes: `{(DV_ROOT / 'releases' / V1_RELEASES[result['source']])}`")
         lines.append(f"- Listening pack: `{result['listening']['directory']}`")
         lines.append(f"- Listening clips: {result['listening']['clip_count']}")
         lines.append(f"- Listening seconds: {result['listening']['total_seconds']:.1f}")
         lines.append(f"- Kept current labels: {result['kept_current_labels']}")
         lines.append(f"- Flagged recordings: {len(gate.flagged_recordings)}")
         lines.append(f"- Flagged speakers below 30% retention: {len(gate.flagged_speakers)}")
+        lines.append(f"- Rows outside UEM: {len(gate.rows_outside_uem)}")
+        lines.append(f"- Unmapped published speakers: {len(gate.unmapped_published)}")
+        lines.append(f"- Dropped unmapped published speech: {gate.dropped_unmapped_seconds:.3f} s")
         if gate.flagged_recordings:
             lines.append("- Flagged recording ids:")
             lines.extend(f"  - `{item}`" for item in gate.flagged_recordings)
@@ -500,14 +561,14 @@ def produce(sources: Sequence[str] | None = None) -> dict[str, Any]:
             for item in results
         ],
     }
-    write_json(STAGING_ROOT / "produce-summary.json", summary)
+    write_json(STAGING_ROOT / "produce-summary-v2.json", summary)
     return summary
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run production from the command line."""
 
-    parser = argparse.ArgumentParser(description="Produce tight-v1 label releases")
+    parser = argparse.ArgumentParser(description="Produce tight-v2 label releases")
     parser.add_argument(
         "--source",
         action="append",

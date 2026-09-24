@@ -9,7 +9,7 @@ from .domain import RecordingLabels, SpeakerSegment
 from .intervals import span_is_subset, union_spans
 
 
-def speaker_union(segments: Sequence[SpeakerSegment], speaker: str) -> list[tuple[float, float]]:
+def speaker_union(segments: Sequence[SpeakerSegment], speaker: str) -> list[tuple[int, int]]:
     """Return the merged original union for one speaker."""
 
     return union_spans(item for item in segments if item.speaker == speaker)
@@ -20,7 +20,7 @@ def is_subset_of_original(
     original: Sequence[SpeakerSegment],
     *,
     speaker: str | None = None,
-    tolerance: float = 1e-9,
+    tolerance_ns: int = 0,
 ) -> bool:
     """Return True when every tight interval lies inside the original union."""
 
@@ -35,7 +35,7 @@ def is_subset_of_original(
     for name, pieces in grouped.items():
         outer = union_spans(originals.get(name, ()))
         for piece in pieces:
-            if not span_is_subset((piece.start, piece.end), outer, tolerance=tolerance):
+            if not span_is_subset((piece.start_ns, piece.end_ns), outer, tolerance_ns=tolerance_ns):
                 return False
     return True
 
@@ -44,7 +44,7 @@ def recording_is_subset(
     tight: RecordingLabels,
     original: RecordingLabels,
     *,
-    tolerance: float = 1e-9,
+    tolerance_ns: int = 0,
 ) -> bool:
     """Return True when every speaker of tight is a subset of original."""
 
@@ -53,5 +53,5 @@ def recording_is_subset(
     return is_subset_of_original(
         tight.segments,
         original.segments,
-        tolerance=tolerance,
+        tolerance_ns=tolerance_ns,
     )

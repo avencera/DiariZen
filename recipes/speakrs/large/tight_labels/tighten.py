@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Mapping, Sequence
 
 from .domain import Interval, RecordingLabels, SpeakerSegment, UncertainInterval
-from .intervals import duration, intersect_spans
-from .merge import MIN_GAP_SECONDS, merge_short_gaps
-
-
-COVERAGE_RATIO = 0.30
+from .intervals import duration_ns, intersect_spans, subtract_spans, union_spans
+from .merge import MIN_GAP_NS, merge_short_gaps
+from .time import COVERAGE_RATIO, coverage_meets
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,13 +23,27 @@ class TightenSegmentResult:
     fallback: bool
 
 
+def union_human_segments(segments: Sequence[SpeakerSegment]) -> tuple[SpeakerSegment, ...]:
+    """Union overlapping or touching human segments of the same speaker."""
+
+    grouped: dict[tuple[str, str], list[SpeakerSegment]] = defaultdict(list)
+    for segment in segments:
+        grouped[(segment.recording_id, segment.speaker)].append(segment)
+    unioned: list[SpeakerSegment] = []
+    for (recording_id, speaker), group in grouped.items():
+        for start_ns, end_ns in union_spans(group):
+            unioned.append(SpeakerSegment(recording_id, speaker, start_ns, end_ns))
+    unioned.sort(key=lambda item: (item.start_ns, item.end_ns, item.speaker))
+    return tuple(unioned)
+
+
 def tighten_segment(
     human: SpeakerSegment,
-    aligned: Sequence[Interval | SpeakerSegment | tuple[float, float]],
+    aligned: Sequence[Interval | SpeakerSegment | tuple[int, int]],
     *,
     alignment_failed: bool = False,
-    min_coverage: float = COVERAGE_RATIO,
-    min_gap: float = MIN_GAP_SECONDS,
+    min_coverage: Fraction | str | float = COVERAGE_RATIO,
+    min_gap_ns: int = MIN_GAP_NS,
 ) -> TightenSegmentResult:
     """Keep aligned speech that lies inside the human segment.
 
@@ -38,42 +52,60 @@ def tighten_segment(
     on the kept pieces of this segment only.
     """
 
-    if min_coverage < 0 or min_coverage > 1:
-        raise ValueError("min_coverage must be in [0, 1]")
-    human_duration = human.duration
+    human_duration_ns = human.duration_ns
     inside = intersect_spans([human.bounds], aligned)
-    covered = duration(inside)
-    coverage = covered / human_duration if human_duration > 0 else 0.0
-    fallback = bool(alignment_failed) or coverage < min_coverage
+    covered_ns = duration_ns(inside)
+    coverage = (covered_ns / human_duration_ns) if human_duration_ns > 0 else 0.0
+    fallback = bool(alignment_failed) or not coverage_meets(covered_ns, human_duration_ns, min_coverage)
     if fallback:
-        uncertain = UncertainInterval(human.recording_id, human.speaker, human.start, human.end)
+        uncertain = UncertainInterval(human.recording_id, human.speaker, human.start_ns, human.end_ns)
         return TightenSegmentResult((), (uncertain,), coverage, True)
-    pieces = [SpeakerSegment(human.recording_id, human.speaker, start, end) for start, end in inside]
-    active = merge_short_gaps(pieces, min_gap=min_gap, within=(human,))
+    pieces = [SpeakerSegment(human.recording_id, human.speaker, start_ns, end_ns) for start_ns, end_ns in inside]
+    active = merge_short_gaps(pieces, min_gap_ns=min_gap_ns, within=(human,))
     return TightenSegmentResult(active, (), coverage, False)
+
+
+def _subtract_uncertain_from_active(
+    uncertain: Sequence[UncertainInterval],
+    active: Sequence[SpeakerSegment],
+) -> tuple[UncertainInterval, ...]:
+    """Drop uncertain time that overlaps the same speaker's active speech."""
+
+    active_by_speaker: dict[tuple[str, str], list[SpeakerSegment]] = defaultdict(list)
+    for segment in active:
+        active_by_speaker[(segment.recording_id, segment.speaker)].append(segment)
+    remaining: list[UncertainInterval] = []
+    for region in uncertain:
+        cut = active_by_speaker.get((region.recording_id, region.speaker), ())
+        for start_ns, end_ns in subtract_spans([region], cut):
+            remaining.append(UncertainInterval(region.recording_id, region.speaker, start_ns, end_ns))
+    remaining.sort(key=lambda item: (item.start_ns, item.end_ns, item.speaker))
+    return tuple(remaining)
 
 
 def tighten_recording(
     original: RecordingLabels,
-    aligned_by_speaker: Mapping[str, Sequence[Interval | SpeakerSegment | tuple[float, float]]],
+    aligned_by_speaker: Mapping[str, Sequence[Interval | SpeakerSegment | tuple[int, int]]],
     *,
     failed_speakers: frozenset[str] = frozenset(),
-    min_coverage: float = COVERAGE_RATIO,
-    min_gap: float = MIN_GAP_SECONDS,
+    min_coverage: Fraction | str | float = COVERAGE_RATIO,
+    min_gap_ns: int = MIN_GAP_NS,
 ) -> RecordingLabels:
     """Tighten every original human segment, then merge short gaps inside them."""
 
+    humans = union_human_segments(original.segments)
     active: list[SpeakerSegment] = []
     uncertain: list[UncertainInterval] = []
-    for segment in original.segments:
+    for segment in humans:
         result = tighten_segment(
             segment,
             aligned_by_speaker.get(segment.speaker, ()),
             alignment_failed=segment.speaker in failed_speakers,
             min_coverage=min_coverage,
-            min_gap=min_gap,
+            min_gap_ns=min_gap_ns,
         )
         active.extend(result.active)
         uncertain.extend(result.uncertain)
-    merged = merge_short_gaps(active, min_gap=min_gap, within=original.segments)
-    return RecordingLabels(original.recording_id, merged, tuple(uncertain))
+    merged = merge_short_gaps(active, min_gap_ns=min_gap_ns, within=humans)
+    kept_uncertain = _subtract_uncertain_from_active(uncertain, merged)
+    return RecordingLabels(original.recording_id, merged, kept_uncertain)
