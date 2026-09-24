@@ -17,6 +17,7 @@ from .mapping import SpeakerMapping, apply_published_replacement, map_speakers_b
 from .merge import (
     MIN_GAP_NS,
     MIN_GAP_SECONDS,
+    canonicalize_uncertain,
     merge_recording,
     merge_short_gaps,
     subtract_uncertain_from_active,
@@ -57,6 +58,7 @@ __all__ = [
     "UncertainShare",
     "aligned_classes",
     "apply_published_replacement",
+    "canonicalize_uncertain",
     "clip_recording_to_uem",
     "evaluate_gates",
     "is_subset_of_original",
