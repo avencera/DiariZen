@@ -17,6 +17,7 @@ from .classify import (
 )
 from .domain import RecordingLabels, SpeakerSegment, UncertainInterval
 from .intervals import (
+    clip_span,
     duration_ns,
     overlap_duration_ns,
     overlap_timeline_ns,
@@ -44,7 +45,8 @@ PUBLISHED_OUTSIDE_FLAG = 0.05
 TIGHTNESS_SHORT_GAP_MIN = 2.0
 TIGHTNESS_SHORT_GAP_MAX = 12.0
 MIN_SPEAKER_NS_FOR_RETENTION = 1_000_000_000
-GATE_POLICY_VERSION = "validity-v1"
+GATE_POLICY_VERSION = "validity-v2"
+OVERLAP_TURN_PADDING_WINDOW_NS = 500_000_000
 
 
 class AdmissionStatus(str, Enum):
@@ -239,10 +241,11 @@ class GateResult:
     overlap_retention_ok: bool
     failure_share_ok: bool
     smallest_gap_ok: bool
-    subset_ok: bool | None
+    subset_ok: bool
     uncertain_subset_ok: bool
     uncertain_coverage_ok: bool
     ids_ok: bool
+    same_speaker_uncertain_overlap_ok: bool
     uem_ok: bool
     unmapped_speakers_ok: bool
     dropped_speakers_ok: bool
@@ -292,6 +295,7 @@ class GateResult:
             "uncertain_subset_ok": self.uncertain_subset_ok,
             "uncertain_coverage_ok": self.uncertain_coverage_ok,
             "ids_ok": self.ids_ok,
+            "same_speaker_uncertain_overlap_ok": self.same_speaker_uncertain_overlap_ok,
             "uem_ok": self.uem_ok,
             "unmapped_speakers_ok": self.unmapped_speakers_ok,
             "dropped_speakers_ok": self.dropped_speakers_ok,
@@ -312,6 +316,7 @@ class GateResult:
                 "flagged_below_30pct": len(self.flagged_speakers),
             },
             "overlap_retention": self.overlap_retention,
+            "overlap_turn_padding_window_seconds": ns_to_seconds(OVERLAP_TURN_PADDING_WINDOW_NS),
             "overlap_loss": self.overlap_loss.to_json(),
             "failure_share": self.failure_share,
             "failure_share_of_all_original_segments": self.failure_share,
@@ -517,14 +522,21 @@ def _dropped_speakers(original: RecordingLabels, new: RecordingLabels) -> tuple[
 def _failed_segments_have_uncertain(
     classes: Sequence[SegmentClass],
     new_by_id: Mapping[str, RecordingLabels],
+    uem_by_recording: Mapping[str, tuple[int, int]] | None,
 ) -> bool:
     unresolved = (SegmentOutcome.ALIGNMENT_FAILURE, SegmentOutcome.BY_DESIGN_UNCERTAIN)
     for item in classes:
         if item.outcome not in unresolved:
             continue
         produced = new_by_id[item.recording_id]
+        span = (item.start_ns, item.end_ns)
+        if uem_by_recording is not None:
+            uem_start_ns, uem_end_ns = uem_by_recording[item.recording_id]
+            span = clip_span(*span, uem_start_ns, uem_end_ns)
+            if span is None:
+                continue
         uncovered = subtract_spans(
-            [(item.start_ns, item.end_ns)],
+            [span],
             produced.segments_for(item.speaker),
         )
         uncertain = union_spans(produced.uncertain_for(item.speaker))
@@ -537,21 +549,60 @@ def _failed_segments_have_uncertain(
 
 def _overlap_loss(original: RecordingLabels, new: RecordingLabels) -> OverlapLoss:
     events: list[tuple[int, int, str, str]] = []
+    original_by_speaker: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    new_by_speaker: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    uncertain_by_speaker: dict[str, list[tuple[int, int]]] = defaultdict(list)
     for segment in original.segments:
-        events.append((segment.start_ns, 1, "orig", segment.speaker))
-        events.append((segment.end_ns, -1, "orig", segment.speaker))
+        original_by_speaker[segment.speaker].append((segment.start_ns, segment.end_ns))
     for segment in new.segments:
-        events.append((segment.start_ns, 1, "new", segment.speaker))
-        events.append((segment.end_ns, -1, "new", segment.speaker))
+        new_by_speaker[segment.speaker].append((segment.start_ns, segment.end_ns))
     for region in new.uncertain:
-        events.append((region.start_ns, 1, "unc", region.speaker))
-        events.append((region.end_ns, -1, "unc", region.speaker))
+        uncertain_by_speaker[region.speaker].append((region.start_ns, region.end_ns))
+
+    edge_by_speaker: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    for segment in original.segments:
+        edge_by_speaker[segment.speaker].append(
+            (
+                segment.start_ns,
+                min(segment.end_ns, segment.start_ns + OVERLAP_TURN_PADDING_WINDOW_NS),
+            )
+        )
+        edge_by_speaker[segment.speaker].append(
+            (
+                max(segment.start_ns, segment.end_ns - OVERLAP_TURN_PADDING_WINDOW_NS),
+                segment.end_ns,
+            )
+        )
+
+    for speaker, spans in original_by_speaker.items():
+        for start_ns, end_ns in union_spans(spans):
+            events.append((start_ns, 1, "orig", speaker))
+            events.append((end_ns, -1, "orig", speaker))
+    for speaker, spans in new_by_speaker.items():
+        for start_ns, end_ns in union_spans(spans):
+            events.append((start_ns, 1, "new", speaker))
+            events.append((end_ns, -1, "new", speaker))
+    for speaker, spans in uncertain_by_speaker.items():
+        for start_ns, end_ns in union_spans(spans):
+            events.append((start_ns, 1, "unc", speaker))
+            events.append((end_ns, -1, "unc", speaker))
+    for speaker, spans in edge_by_speaker.items():
+        for start_ns, end_ns in union_spans(spans):
+            events.append((start_ns, 1, "edge", speaker))
+            events.append((end_ns, -1, "edge", speaker))
     if not events:
         return OverlapLoss(0, 0, 0, 0, 0, 0)
     events.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
     orig_active: set[str] = set()
     new_active: set[str] = set()
     unc_active: set[str] = set()
+    edge_active: set[str] = set()
+    active_by_kind = {
+        "orig": orig_active,
+        "new": new_active,
+        "unc": unc_active,
+        "edge": edge_active,
+    }
     original_ns = 0
     produced_ns = 0
     retained_ns = 0
@@ -573,12 +624,12 @@ def _overlap_loss(original: RecordingLabels, new: RecordingLabels) -> OverlapLos
             elif orig_overlap:
                 if orig_active & unc_active:
                     masked_ns += width
-                elif any(name not in new_active and name not in unc_active for name in orig_active):
+                elif (orig_active - new_active) and (orig_active - new_active) <= edge_active:
                     padding_ns += width
                 else:
                     unexplained_ns += width
             last = time_ns
-        bucket = orig_active if kind == "orig" else new_active if kind == "new" else unc_active
+        bucket = active_by_kind[kind]
         if delta > 0:
             bucket.add(speaker)
         else:
@@ -608,7 +659,6 @@ def evaluate_gates(
     original: Sequence[RecordingLabels],
     new: Sequence[RecordingLabels],
     *,
-    require_subset: bool = True,
     min_gap_ns: int = MIN_GAP_NS,
     speaker_retention_floor: float = SPEAKER_RETENTION_FLOOR,
     overlap_retention_floor: float = OVERLAP_RETENTION_FLOOR,
@@ -647,7 +697,7 @@ def evaluate_gates(
     uncertain_ns = 0
     uncertain_excluding_ns = 0
     uncertain_removed_ns = 0
-    subset_ok: bool | None = True if require_subset else None
+    subset_ok = True
     uncertain_subset_ok = True
     outside_rows: list[str] = []
     for recording_id in sorted(original_by_id):
@@ -665,7 +715,7 @@ def evaluate_gates(
         uncertain_removed_ns += share.canonicalization_removed_ns
         original_overlap += _overlap_ns(source)
         new_overlap += _overlap_ns(produced)
-        if require_subset and not recording_is_subset(produced, source, min_gap_ns=min_gap_ns):
+        if not recording_is_subset(produced, source, min_gap_ns=min_gap_ns):
             subset_ok = False
         if not uncertain_is_subset_of_original(produced, source):
             uncertain_subset_ok = False
@@ -698,9 +748,10 @@ def evaluate_gates(
     failure_share_ok = failure_share <= failure_share_limit
     uem_ok = not outside_rows
     ids_ok = _ids_ok(new)
+    same_speaker_uncertain_overlap_ok = not any(item.same_speaker_uncertain_overlap for item in new)
     dropped_speakers = tuple(dropped)
     dropped_speakers_ok = not dropped_speakers
-    uncertain_coverage_ok = _failed_segments_have_uncertain(classes, new_by_id)
+    uncertain_coverage_ok = _failed_segments_have_uncertain(classes, new_by_id, uem_by_recording)
     unmapped_published: list[str] = []
     dropped_unmapped_ns = 0
     if mappings:
@@ -728,7 +779,7 @@ def evaluate_gates(
             f"{len(flagged_recordings)} recordings have more than "
             f"{published_outside_flag:.0%} new speech outside the original union"
         )
-    if subset_ok is False:
+    if not subset_ok:
         notes.append("tight speech is not a subset of the 200 ms-closed original human segments")
     if not uncertain_subset_ok:
         notes.append("UNCERTAIN is not a subset of the original same-speaker human support")
@@ -738,6 +789,8 @@ def evaluate_gates(
         notes.append(f"{len(dropped_speakers)} original speakers are missing from SPEAKER and UNCERTAIN")
     if not ids_ok:
         notes.append("a recording or speaker id is empty or NA")
+    if not same_speaker_uncertain_overlap_ok:
+        notes.append("SPEAKER and UNCERTAIN rows overlap for the same speaker")
     if not uem_ok:
         notes.append(f"{len(outside_rows)} SPEAKER or UNCERTAIN rows fall outside the UEM")
     if not unmapped_speakers_ok:
@@ -759,7 +812,8 @@ def evaluate_gates(
         and ids_ok
         and uncertain_subset_ok
         and uncertain_coverage_ok
-        and subset_ok is not False
+        and same_speaker_uncertain_overlap_ok
+        and subset_ok
     )
     diagnosis_required = validity_ok and (not failure_share_ok or not speaker_retention_ok)
     if not validity_ok:
@@ -783,6 +837,7 @@ def evaluate_gates(
         uncertain_subset_ok=uncertain_subset_ok,
         uncertain_coverage_ok=uncertain_coverage_ok,
         ids_ok=ids_ok,
+        same_speaker_uncertain_overlap_ok=same_speaker_uncertain_overlap_ok,
         uem_ok=uem_ok,
         unmapped_speakers_ok=unmapped_speakers_ok,
         dropped_speakers_ok=dropped_speakers_ok,

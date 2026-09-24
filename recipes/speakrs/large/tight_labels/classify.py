@@ -26,6 +26,7 @@ class AlignmentFailureReason(Enum):
     MARKER_ONLY = "marker_only"
     EMPTY_TEXT = "empty_text"
     EMPTY_ROMANIZATION = "empty_romanization"
+    NO_PUBLISHED_COVERAGE = "no_published_coverage"
     LOW_COVERAGE = "low_coverage"
     ALIGNER_ERROR = "aligner_error"
     SILENCE = "silence"
