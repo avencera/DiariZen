@@ -19,9 +19,10 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import soundfile as sf
 
+from ..hashing import sha256_paths
 from ..jsonio import read_json, write_json
 from ..storage import require_free_gib
-from . import LIBRARY_VERSION
+from . import GATE_POLICY_VERSION, LIBRARY_VERSION
 from .classify import (
     AlignmentFailureReason,
     SegmentClass,
@@ -65,6 +66,7 @@ from .produce import (
 from .tighten import COVERAGE_RATIO, tighten_recording, union_human_segments
 from .time import NANOSECONDS_PER_SECOND, coverage_meets, ns_to_seconds
 from .writers import (
+    load_written_recording_labels,
     render_speaker_rttm,
     rewrite_uem_file_id,
     write_recording_labels,
@@ -1272,13 +1274,13 @@ def write_release(
     refs: Sequence[RecordingRef],
     original: Sequence[RecordingLabels],
     produced: Sequence[RecordingLabels],
-    gate: GateResult,
-    kept_current: bool,
     summary: Mapping[str, Any],
     *,
     release_id: str = RELEASE_ID,
-) -> Path:
-    """Write the voxconverse-tight-v1 release directory."""
+    uem_by_recording: Mapping[str, tuple[int, int]],
+    segment_classes: Sequence[SegmentClass] | None,
+) -> tuple[Path, GateResult]:
+    """Write tight labels, then score gates on the files actually written."""
 
     release_dir = DV_ROOT / "releases" / release_id
     if release_dir.exists():
@@ -1286,10 +1288,9 @@ def write_release(
     labels_dir = release_dir / "labels"
     labels_dir.mkdir(parents=True)
     uem_by_id = {item.recording_id: item.uem_path for item in refs}
-    written = original if kept_current else produced
     all_rttm: list[str] = []
     all_uem: list[str] = []
-    for labels in written:
+    for labels in produced:
         write_recording_labels(labels_dir, labels)
         uem_text = rewrite_uem_file_id(
             uem_by_id[labels.recording_id].read_text(encoding="utf-8"),
@@ -1300,13 +1301,31 @@ def write_release(
         all_uem.append(uem_text if uem_text.endswith("\n") else uem_text + "\n")
     (release_dir / "all.rttm").write_text("".join(all_rttm), encoding="utf-8")
     (release_dir / "all.uem").write_text("".join(all_uem), encoding="utf-8")
+    written = tuple(
+        load_written_recording_labels(labels_dir, labels.recording_id) for labels in produced
+    )
+    gate = evaluate_gates(
+        original,
+        written,
+        require_subset=True,
+        uem_by_recording=uem_by_recording,
+        segment_classes=segment_classes,
+    )
+    checksum_paths = [
+        release_dir / "all.rttm",
+        release_dir / "all.uem",
+        *sorted(labels_dir.glob("*.rttm")),
+        *sorted(labels_dir.glob("*.uem")),
+    ]
     provenance = {
         "schema": "speakrs-tight-labels-release",
-        "schema_version": 2,
+        "schema_version": 3,
         "release_id": release_id,
         "source": SOURCE_NAME,
-        "method": "keep-current-labels" if kept_current else "asr-per-segment-then-forced-alignment",
-        "kept_current_labels": kept_current,
+        "method": "asr-per-segment-then-forced-alignment",
+        "kept_current_labels": False,
+        "admission_status": gate.admission_status.value,
+        "gate_policy_version": GATE_POLICY_VERSION,
         "library_version": LIBRARY_VERSION,
         "library_commit": library_commit(),
         "min_gap_seconds": MIN_GAP_SECONDS,
@@ -1321,22 +1340,22 @@ def write_release(
             "guard_rules": _guard_rules_json(),
         },
         "asr_alignment_summary": dict(summary),
+        "label_checksums": sha256_paths(checksum_paths, root=release_dir),
         "gate_results": gate.to_json(),
     }
     write_json(release_dir / "provenance.json", provenance)
     write_json(release_dir / "gate-report.json", gate.to_json())
     (release_dir / "gate-report.md").write_text(
-        render_gate_markdown(SOURCE_NAME, release_id, gate, kept_current=kept_current),
+        render_gate_markdown(SOURCE_NAME, release_id, gate),
         encoding="utf-8",
     )
-    return release_dir
+    return release_dir, gate
 
 
 def render_agent_report(
     *,
     refs: Sequence[RecordingRef],
     gate: GateResult,
-    kept_current: bool,
     summary: Mapping[str, Any],
     release_dir: Path,
     listening: Mapping[str, Any],
@@ -1353,11 +1372,11 @@ def render_agent_report(
         f"| `{name}` | {count} | {guard_rule_text(name)} |"
         for name, count in sorted((summary.get("guard_counts") or {}).items(), key=lambda item: (-item[1], item[0]))
     )
-    status = "PASS" if gate.passed and not kept_current else "FAIL"
     lines = [
         "# VoxConverse tight labels (ALIGN-VOXCONVERSE)",
         "",
-        f"Status: {status}",
+        f"Admission: {gate.admission_status.value}",
+        f"Gate policy: {gate.gate_policy_version}",
         f"Library commit: `{library_commit()}`",
         f"Release: `{release_dir}`",
         "",
@@ -1406,38 +1425,44 @@ def render_agent_report(
         f"| Smallest gap s | {original.smallest_gap_s} | {tightness.smallest_gap_s} | 0.200 |",
         f"| Median segment s | {original.median_segment_s} | {tightness.median_segment_s} | 0.970 |",
         "",
-        "## Gates",
+        "## Label validity (mandatory)",
         "",
         f"- Rows inside UEM: {'pass' if gate.uem_ok else 'fail'}",
         f"- Subset of 200 ms-closed original: {'pass' if gate.subset_ok else 'fail'}",
+        f"- UNCERTAIN inside original support: {'pass' if gate.uncertain_subset_ok else 'fail'}",
         f"- Smallest same-speaker gap ≥ 0.200 s: {'pass' if gate.smallest_gap_ok else 'fail'}",
+        f"- Failed alignments have UNCERTAIN records: {'pass' if gate.uncertain_coverage_ok else 'fail'}",
+        "",
+        "## Usable supervision (diagnosis triggers)",
+        "",
         (
-            f"- Failure share ≤ {gate.failure_share_limit:.2f}: "
-            f"{'pass' if gate.failure_share_ok else 'fail'} ({gate.failure_share:.4f}; "
-            f"excluding by-design {gate.failure_share_excluding_by_design:.4f})"
+            f"- Failure share of all original segments ≤ {gate.failure_share_limit:.2f}: "
+            f"{'pass' if gate.failure_share_ok else 'fail'} ({gate.failure_share:.4f})"
+        ),
+        f"- Failure share of eligible segments: {gate.failure_share_excluding_by_design:.4f}",
+        f"- By-design exclusions: {gate.by_design_share:.4f}",
+        (
+            f"- Speaker retention floor {gate.speaker_retention_floor:.0%}: "
+            f"{len(gate.flagged_speakers)} speakers below floor"
+        ),
+        (
+            "- Overlap loss: padding "
+            f"{gate.overlap_loss.removed_padding_seconds:.3f} s, masked "
+            f"{gate.overlap_loss.masked_seconds:.3f} s, unexplained "
+            f"{gate.overlap_loss.unexplained_seconds:.3f} s"
         ),
         f"- Tightness band (reported): {'pass' if gate.tightness_ok else 'outside reference'}",
-        f"- Speaker retention (reported): {len(gate.flagged_speakers)} speakers below {gate.speaker_retention_floor:.0%}",
         f"- Overlap retention (reported): {gate.overlap_retention}",
         f"- UNCERTAIN share of original speech: {gate.uncertain_share:.4f}",
         f"- UNCERTAIN share excluding by-design: {gate.uncertain_share_excluding_by_design:.4f}",
-        f"- By-design UNCERTAIN share of original segments: {gate.by_design_share:.4f}",
         (
             "- UNCERTAIN time removed by canonicalization: "
             f"{ns_to_seconds(gate.uncertain_canonicalization_removed_ns):.3f} s"
         ),
-        f"- Kept current labels: {kept_current}",
+        "- Kept current labels: False",
         f"- Flagged speakers below {gate.speaker_retention_floor:.0%} retention: {len(gate.flagged_speakers)}",
         "",
     ]
-    if kept_current:
-        lines.extend(
-            [
-                "The produced labels are the current labels because the source "
-                "failed a hard gate or the failure-share limit.",
-                "",
-            ]
-        )
     lines.extend(
         [
             "## Listening pack",
@@ -1491,24 +1516,23 @@ def produce(*, limit: int | None = None, phase: str = "all", release_version: st
     original, produced = labels_from_alignment(refs, current_by_id, align_rows)
     uem_by_recording = {ref.recording_id: (ref.uem_start_ns, ref.uem_end_ns) for ref in refs}
     segment_classes = classify_voxconverse_jobs(original, produced, jobs, asr_rows, align_rows)
-    gate = evaluate_gates(
+    summary = summarize_pass(jobs, asr_rows, align_rows)
+    release_id = release_id_with_version(RELEASE_ID, release_version)
+    release_dir, gate = write_release(
+        refs,
         original,
         produced,
-        require_subset=True,
+        summary,
+        release_id=release_id,
         uem_by_recording=uem_by_recording,
         segment_classes=segment_classes,
     )
-    kept_current = not gate.passed
-    summary = summarize_pass(jobs, asr_rows, align_rows)
     summary["uncertain_share_of_original_speech"] = gate.uncertain_share
     summary["uncertain_share_excluding_by_design"] = gate.uncertain_share_excluding_by_design
     summary["by_design_share"] = gate.by_design_share
     summary["failure_share_gate"] = gate.failure_share
-    write_json(WORK_ROOT / "summary.json", {**summary, "gate": gate.to_json(), "kept_current": kept_current})
-    release_id = release_id_with_version(RELEASE_ID, release_version)
-    release_dir = write_release(
-        refs, original, produced, gate, kept_current, summary, release_id=release_id
-    )
+    summary["admission_status"] = gate.admission_status.value
+    write_json(WORK_ROOT / "summary.json", {**summary, "gate": gate.to_json(), "kept_current": False})
     listening_dir = STAGING_ROOT / "listening-v2" / "voxconverse"
     listening = write_listening_pack(
         listening_dir,
@@ -1520,7 +1544,6 @@ def produce(*, limit: int | None = None, phase: str = "all", release_version: st
     report = render_agent_report(
         refs=refs,
         gate=gate,
-        kept_current=kept_current,
         summary=summary,
         release_dir=release_dir,
         listening=listening,
@@ -1528,11 +1551,12 @@ def produce(*, limit: int | None = None, phase: str = "all", release_version: st
     report_path = STAGING_ROOT / "ALIGN-VOXCONVERSE-REPORT.md"
     report_path.write_text(report, encoding="utf-8")
     result = {
-        "ok": gate.passed and not kept_current,
+        "ok": gate.passed,
         "release_dir": str(release_dir),
         "report": str(report_path),
         "listening": listening,
-        "kept_current_labels": kept_current,
+        "kept_current_labels": False,
+        "admission_status": gate.admission_status.value,
         "gate_passed": gate.passed,
         "summary": summary,
     }

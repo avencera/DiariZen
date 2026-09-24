@@ -199,7 +199,6 @@ def test_agent_report_renders_speaker_hours() -> None:
     report = render_agent_report(
         refs=[],
         gate=gate,
-        kept_current=False,
         summary={
             "unioned_segments": 1,
             "asr_ok": 1,
